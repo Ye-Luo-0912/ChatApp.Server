@@ -1,0 +1,184 @@
+﻿using ChatApp.Core.Interfaces;
+using Core.Interfaces;
+using Infrastructure.Data.Repositories;
+using Infrastructure.Data.Repositories.Login;
+using Infrastructure.Exceptions;
+using Infrastructure.Identity;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging;
+
+namespace Core.Services;
+
+public class UserManageServices(
+    UserManager<ApplicationUser> userManager,
+    IJwtTokenService tokenService,
+    ILogger<UserManageServices> logger,
+    ServerEndPoint? serverEndPoint = null) : IUserManage
+{
+    private readonly ServerEndPoint _tcpServer = serverEndPoint ?? new ServerEndPoint
+    {
+        Host = "127.0.0.1",
+        Port = 8888,
+        Name = "ChatApp.TcpServer",
+    };
+
+    public async Task<LoginResult> LoginAsync(string username, string password)
+    {
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            return LoginResult.Fail("用户名和密码不能为空！");
+
+        try
+        {
+            var user = await userManager.FindByNameAsync(username);
+            if (user == null)
+            {
+                logger.LogWarning("用户 {Username} 不存在", username);
+                return LoginResult.Fail("请检查用户名！");
+            }
+
+            if (!await userManager.CheckPasswordAsync(user, password))
+            {
+                logger.LogWarning("用户 {Username} 密码错误", username);
+                return LoginResult.Fail("密码错误！");
+            }
+
+            if (await userManager.IsLockedOutAsync(user))
+            {
+                logger.LogWarning("用户 {Username} 账户已被锁定", username);
+                return LoginResult.Fail("账户已被锁定！");
+            }
+
+            var roles = await userManager.GetRolesAsync(user);
+            var accessToken = tokenService.GenerateAccessToken(user, roles);
+            var refreshToken = tokenService.GenerateRefreshToken();
+
+            await tokenService.StoreRefreshTokenAsync(user.Id.ToString(), refreshToken, TimeSpan.FromDays(2));
+            logger.LogInformation("用户 {Username} 登录成功", username);
+
+            return LoginResult.Success(accessToken, refreshToken, ref _tcpServer);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "用户 {Username} 登录时发生异常", username);
+            throw new IdentityException("登录过程中发生错误", ex);
+        }
+    }
+
+    public async Task LogoutAsync(string userId, string refreshToken)
+    {
+        await tokenService.RevokeRefreshTokenAsync(userId, refreshToken);
+    }
+
+    public async Task<ApplicationUser?> FindByUserNameAsync(string username)
+    {
+        try
+        {
+            return await userManager.FindByNameAsync(username);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "查找用户 {Username} 时发生异常", username);
+            throw new IdentityException("用户查询失败", ex);
+        }
+    }
+
+    public async Task<ApplicationUser?> FindByIdAsync(long userId)
+    {
+        try
+        {
+            return await userManager.FindByIdAsync(userId.ToString());
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "查找用户 ID {UserId} 时发生异常", userId);
+            throw new IdentityException("用户查询失败", ex);
+        }
+    }
+
+    public async Task<bool> CheckPasswordAsync(ApplicationUser user, string password)
+    {
+        try
+        {
+            return await userManager.CheckPasswordAsync(user, password);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "验证用户 {UserId} 密码时发生异常", user.Id);
+            throw new IdentityException("密码验证失败", ex);
+        }
+    }
+
+    public async Task<IdentityResult> CreateUserAsync(ApplicationUser user, string password)
+    {
+        try
+        {
+            var result = await userManager.CreateAsync(user, password);
+
+            if (result.Succeeded) logger.LogInformation("成功创建用户 {UserId}", user.Id);
+            //TODO 邮箱验证
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "创建用户时发生异常");
+            throw new IdentityException("用户创建失败", ex);
+        }
+    }
+
+    public async Task<IdentityResult> UpdateUserAsync(ApplicationUser user)
+    {
+        try
+        {
+            var result = await userManager.UpdateAsync(user);
+            if (result.Succeeded) logger.LogInformation("成功更新用户 {UserId}", user.Id);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "更新用户 {UserId} 时发生异常", user.Id);
+            throw new IdentityException("用户更新失败", ex);
+        }
+    }
+
+    public async Task<IdentityResult> DeleteUserAsync(ApplicationUser user)
+    {
+        try
+        {
+            var result = await userManager.DeleteAsync(user);
+            if (result.Succeeded) logger.LogInformation("成功删除用户 {UserId}", user.Id);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "删除用户 {UserId} 时发生异常", user.Id);
+            throw new IdentityException("用户删除失败", ex);
+        }
+    }
+
+    public async Task<IdentityResult> ChangePasswordAsync(ApplicationUser user, string currentPassword, string newPassword)
+    {
+        try
+        {
+            var result = await userManager.ChangePasswordAsync(user, currentPassword, newPassword);
+
+            if (!result.Succeeded) return result;
+            logger.LogInformation("用户 {UserId} 密码修改成功", user.Id);
+            await userManager.ResetAccessFailedCountAsync(user);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "修改用户 {UserId} 密码时发生异常", user.Id);
+            throw new IdentityException("密码修改失败", ex);
+        }
+    }
+
+    public async Task<TokenPairResult> RefreshLoginAsync(string userId, string refreshToken)
+    {
+        if (string.IsNullOrEmpty(refreshToken))
+            return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
+        
+        return await tokenService.RefreshTokensAsync(userId, refreshToken);
+    }
+}

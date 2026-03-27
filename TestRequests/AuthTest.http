@@ -1,0 +1,34 @@
+@HostAddress = https://127.0.0.1:5001
+
+### 1. 发送注册验证码
+POST {{HostAddress}}/api/auth/send-register-code
+Content-Type: application/json
+
+{
+  "email": "你的测试邮箱@qq.com"
+}
+
+
+### 2. 测试冷却期防刷 (连点上面的请求后，应该返回稍后再试)
+
+
+### 3. 校验验证码并注册 (等收到邮件后，把真正的 6 位数填到 code 里)
+POST {{HostAddress}}/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "你的测试邮箱@qq.com",
+  "code": "123456",
+  "password": "Password123!",
+  "username": "Ye_Luo"
+}
+
+
+### 4. 登录测试
+POST {{HostAddress}}/api/auth/login
+Content-Type: application/json
+
+{
+  "account": "你的测试邮箱@qq.com",
+  "password": "Password123!"
+}

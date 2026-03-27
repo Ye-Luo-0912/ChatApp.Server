@@ -1,0 +1,64 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <NoDefaultLaunchSettingsFile>True</NoDefaultLaunchSettingsFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <Folder Include="Configuration\" />
+      <Folder Include="Extensions\" />
+      <Folder Include="Filters\" />
+      <Folder Include="Hubs\" />
+      <Folder Include="Services\" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Compile Remove="Infrastructure\**" />
+      <Compile Remove="Core\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <EmbeddedResource Remove="Infrastructure\**" />
+      <EmbeddedResource Remove="Core\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Content Remove="Infrastructure\**" />
+      <Content Include="Core\Core.csproj" />
+      <Content Include="Core\obj\Core.csproj.nuget.g.props" />
+      <Content Include="Core\obj\Core.csproj.nuget.g.targets" />
+      <Content Include="Core\obj\Debug\net9.0\Core.AssemblyInfoInputs.cache" />
+      <Content Include="Core\obj\Debug\net9.0\Core.assets.cache" />
+      <Content Include="Core\obj\Debug\net9.0\Core.csproj.AssemblyReference.cache" />
+      <Content Include="Core\obj\Debug\net9.0\Core.GeneratedMSBuildEditorConfig.editorconfig" />
+      <Content Include="Core\obj\project.nuget.cache" />
+      <Content Include="Core\obj\rider.project.model.nuget.info" />
+      <Content Include="Core\obj\rider.project.restore.info" />
+      <Content Remove="Core\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Remove="Infrastructure\**" />
+      <None Remove="Core\**" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <_ContentIncludedByDefault Remove="Infrastructure\bin\Debug\net9.0\Infrastructure.deps.json" />
+      <_ContentIncludedByDefault Remove="Infrastructure\obj\Infrastructure.csproj.nuget.dgspec.json" />
+      <_ContentIncludedByDefault Remove="Infrastructure\obj\project.assets.json" />
+      <_ContentIncludedByDefault Remove="Infrastructure\obj\project.packagespec.json" />
+      <_ContentIncludedByDefault Remove="Core\obj\Core.csproj.nuget.dgspec.json" />
+      <_ContentIncludedByDefault Remove="Core\obj\project.assets.json" />
+      <_ContentIncludedByDefault Remove="Core\obj\project.packagespec.json" />
+      <_ContentIncludedByDefault Remove="Core\bin\Debug\net9.0\Core.deps.json" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="Core\Core.csproj" />
+      <ProjectReference Include="Infrastructure\Infrastructure.csproj" />
+    </ItemGroup>
+
+</Project>

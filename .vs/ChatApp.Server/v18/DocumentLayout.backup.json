@@ -1,0 +1,929 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\emailverificationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\emailverificationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\iemailsender.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\iemailsender.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\emailservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\emailservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\jwttokenservices.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\jwttokenservices.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\emailcodepurpose.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\emailcodepurpose.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\iemailverificationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\iemailverificationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\applicationuserconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\applicationuserconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\itokenservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\itokenservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\itsidgenerator.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\itsidgenerator.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\iusermanage.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\iusermanage.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\ideviceinfo.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\ideviceinfo.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\interfaces\\ifriendshipservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\interfaces\\ifriendshipservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\controllers\\usercontrollers.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:controllers\\usercontrollers.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\emailresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\emailresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\emailconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\emailconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\deviceinfoservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\deviceinfoservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\controllers\\friendshipcontrollers.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:controllers\\friendshipcontrollers.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\controllers\\baseapicontroller.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:controllers\\baseapicontroller.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\friendshipservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\friendshipservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\friendship.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\friendship.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:program.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\friendshipstatus.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\friendshipstatus.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\friendgroup.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\friendgroup.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\friendrequest.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\friendrequest.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\friendgroupmapping.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\friendgroupmapping.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\extensions\\addservices.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\extensions\\addservices.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\middlewares\\exceptionhandlingmiddleware.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:middlewares\\exceptionhandlingmiddleware.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\dbcontext\\userdbcontextfactory.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\dbcontext\\userdbcontextfactory.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\configservicelibrary\\data\\configdbcontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:configservicelibrary\\data\\configdbcontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\dbcontext\\userdbcontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\dbcontext\\userdbcontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\chatapp.server.csproj||{FA3CD31E-987B-443A-9B81-186104E8DAC1}|",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:chatapp.server.csproj||{FA3CD31E-987B-443A-9B81-186104E8DAC1}|"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\configservicelibrary\\models\\configitem.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:configservicelibrary\\models\\configitem.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\configservicelibrary\\services\\configservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:configservicelibrary\\services\\configservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\docker-compose.yml||{06C066C6-04A2-4E5D-8202-439FD4234EF1}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:docker-compose.yml||{06C066C6-04A2-4E5D-8202-439FD4234EF1}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\services\\geolocationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\services\\geolocationservice.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\serializer\\myjsonserializeroptions.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\serializer\\myjsonserializeroptions.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\serializer\\appjsoncontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\serializer\\appjsoncontext.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\exceptions\\cacheunavailableexception.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\exceptions\\cacheunavailableexception.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\extensions\\infrastructureextensions.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\extensions\\infrastructureextensions.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\friendshipconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\friendshipconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\friendrequestconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\friendrequestconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\friendgroupconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\friendgroupconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\friendgroupmapping.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\friendgroupmapping.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\infrastructure\\models\\config\\blockrecordconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{360C41C8-E3D0-4373-AC08-920757229777}|Infrastructure\\Infrastructure.csproj|solutionrelative:infrastructure\\models\\config\\blockrecordconfig.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\models\\request\\request.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{EF83D3EF-E1C0-4A0A-882C-AE1B787ABCD1}|ChatApp.Server.csproj|solutionrelative:models\\request\\request.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\identity\\applicationuser.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\identity\\applicationuser.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\friend\\blockrecord.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\friend\\blockrecord.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\paginatedlist.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\paginatedlist.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\login\\loginresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\login\\loginresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\login\\refreshtoken.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\login\\refreshtoken.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\auth\\tokenresponse.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\auth\\tokenresponse.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\auth\\autherrortype.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\auth\\autherrortype.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|d:\\users\\ye_lu\\riderprojects\\chatapp.server\\core\\models\\dtos\\auth\\tokenissueresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}",
+      "RelativeMoniker": "D:0:0:{825A09D2-CDF7-406C-B818-B40BA49A3ACC}|Core\\Core.csproj|solutionrelative:core\\models\\dtos\\auth\\tokenissueresult.cs||{A6C744A8-0E4A-4FC6-886A-064283054674}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 2,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{aa2115a1-9712-457b-9047-dbb71ca2cdd2}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "EmailVerificationService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\EmailVerificationService.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\EmailVerificationService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\EmailVerificationService.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\EmailVerificationService.cs",
+              "ViewState": "AgIAAFMAAAAAAAAAAAAqwF4AAAAJAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:43:21.308Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 3,
+              "Title": "JwtTokenServices.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\JwtTokenServices.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\JwtTokenServices.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\JwtTokenServices.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\JwtTokenServices.cs",
+              "ViewState": "AgIAAHcAAAAAAAAAAAAEwIgAAAAWAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T11:03:11.193Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "IEmailSender.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IEmailSender.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\IEmailSender.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IEmailSender.cs",
+              "RelativeToolTip": "Core\\Interfaces\\IEmailSender.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAuwA4AAAAWAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:13:19.755Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 4,
+              "Title": "EmailCodePurpose.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\EmailCodePurpose.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\EmailCodePurpose.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\EmailCodePurpose.cs",
+              "RelativeToolTip": "Core\\Models\\EmailCodePurpose.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAsAAAAIAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:37:14.772Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 2,
+              "Title": "EmailService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\EmailService.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\EmailService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\EmailService.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\EmailService.cs",
+              "ViewState": "AgIAABYAAAAAAAAAAAD4vyYAAAARAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:40:16.761Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 5,
+              "Title": "IEmailVerificationService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IEmailVerificationService.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\IEmailVerificationService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IEmailVerificationService.cs",
+              "RelativeToolTip": "Core\\Interfaces\\IEmailVerificationService.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAoAAAAiAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:32:18.922Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 6,
+              "Title": "ApplicationUserConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\ApplicationUserConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\ApplicationUserConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\ApplicationUserConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\ApplicationUserConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABAAAAAsAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:47:19.659Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 8,
+              "Title": "ITsidGenerator.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\ITsidGenerator.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\ITsidGenerator.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\ITsidGenerator.cs",
+              "RelativeToolTip": "Core\\Interfaces\\ITsidGenerator.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvwcAAAAKAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T14:49:13.586Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 7,
+              "Title": "ITokenService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\ITokenService.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\ITokenService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\ITokenService.cs",
+              "RelativeToolTip": "Core\\Interfaces\\ITokenService.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAsAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T14:53:50.579Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 9,
+              "Title": "IUserManage.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IUserManage.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\IUserManage.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IUserManage.cs",
+              "RelativeToolTip": "Core\\Interfaces\\IUserManage.cs",
+              "ViewState": "AgIAAE8AAAAAAAAAAADgv1wAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:01:48.495Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 10,
+              "Title": "IDeviceInfo.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IDeviceInfo.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\IDeviceInfo.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IDeviceInfo.cs",
+              "RelativeToolTip": "Core\\Interfaces\\IDeviceInfo.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAA8AAAAaAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T14:55:53.035Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 11,
+              "Title": "IFriendshipService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IFriendshipService.cs",
+              "RelativeDocumentMoniker": "Core\\Interfaces\\IFriendshipService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Interfaces\\IFriendshipService.cs",
+              "RelativeToolTip": "Core\\Interfaces\\IFriendshipService.cs",
+              "ViewState": "AgIAAB4AAAAAAAAAAAAnwDQAAAAKAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T14:19:03.954Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 12,
+              "Title": "UserControllers.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\UserControllers.cs",
+              "RelativeDocumentMoniker": "Controllers\\UserControllers.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\UserControllers.cs",
+              "RelativeToolTip": "Controllers\\UserControllers.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAA8AAAAjAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T10:08:42.649Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 14,
+              "Title": "EmailConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\EmailConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\EmailConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\EmailConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\EmailConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAuwAgAAAAIAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-25T09:24:22.289Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 15,
+              "Title": "DeviceInfoService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\DeviceInfoService.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\DeviceInfoService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\DeviceInfoService.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\DeviceInfoService.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAIMAAAAlAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T14:55:07.04Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 13,
+              "Title": "EmailResult.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\EmailResult.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\EmailResult.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\EmailResult.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\EmailResult.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAuwAQAAAAQAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:10:51.798Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 16,
+              "Title": "FriendshipControllers.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\FriendshipControllers.cs",
+              "RelativeDocumentMoniker": "Controllers\\FriendshipControllers.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\FriendshipControllers.cs",
+              "RelativeToolTip": "Controllers\\FriendshipControllers.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAJkAAAAFAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T07:13:01.189Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 17,
+              "Title": "BaseApiController.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\BaseApiController.cs",
+              "RelativeDocumentMoniker": "Controllers\\BaseApiController.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Controllers\\BaseApiController.cs",
+              "RelativeToolTip": "Controllers\\BaseApiController.cs",
+              "ViewState": "AgIAAAkAAAAAAAAAAADwvwAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T09:11:27.036Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 18,
+              "Title": "FriendshipService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\FriendshipService.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\FriendshipService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\FriendshipService.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\FriendshipService.cs",
+              "ViewState": "AgIAADEBAAAAAAAAAAAewD0BAABpAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T15:47:30.495Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 19,
+              "Title": "Friendship.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\Friendship.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\Friendship.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\Friendship.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\Friendship.cs",
+              "ViewState": "AgIAAAUAAAAAAAAAAIA6wBMAAAAcAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:43:08.423Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 23,
+              "Title": "FriendRequest.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendRequest.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\FriendRequest.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendRequest.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\FriendRequest.cs",
+              "ViewState": "AgIAACUAAAAAAAAAAAAuwEAAAAA0AAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:37:53.477Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 20,
+              "Title": "Program.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Program.cs",
+              "RelativeDocumentMoniker": "Program.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Program.cs",
+              "RelativeToolTip": "Program.cs",
+              "ViewState": "AgIAAEsAAAAAAAAAAADgv10AAAAyAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T15:03:32.49Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 24,
+              "Title": "FriendGroupMapping.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendGroupMapping.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\FriendGroupMapping.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendGroupMapping.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\FriendGroupMapping.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvwAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:48:58.568Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 22,
+              "Title": "FriendGroup.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendGroup.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\FriendGroup.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendGroup.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\FriendGroup.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAkAAAAwAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:45:44.554Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 21,
+              "Title": "FriendshipStatus.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendshipStatus.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\FriendshipStatus.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\FriendshipStatus.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\FriendshipStatus.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAuwBMAAAAQAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-23T09:07:04.185Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 25,
+              "Title": "AddServices.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Extensions\\AddServices.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Extensions\\AddServices.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Extensions\\AddServices.cs",
+              "RelativeToolTip": "Infrastructure\\Extensions\\AddServices.cs",
+              "ViewState": "AgIAAAUAAAAAAAAAAAAtwBYAAAAnAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:47:52.739Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 28,
+              "Title": "ConfigDbContext.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Data\\ConfigDbContext.cs",
+              "RelativeDocumentMoniker": "ConfigServiceLibrary\\Data\\ConfigDbContext.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Data\\ConfigDbContext.cs",
+              "RelativeToolTip": "ConfigServiceLibrary\\Data\\ConfigDbContext.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAuwAcAAAANAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T09:50:11.428Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 29,
+              "Title": "UserDbContext.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\DbContext\\UserDbContext.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\DbContext\\UserDbContext.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\DbContext\\UserDbContext.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\DbContext\\UserDbContext.cs",
+              "ViewState": "AgIAABUAAAAAAAAAAAAYwBIAAAAEAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:49:35.802Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 26,
+              "Title": "ExceptionHandlingMiddleware.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Middlewares\\ExceptionHandlingMiddleware.cs",
+              "RelativeDocumentMoniker": "Middlewares\\ExceptionHandlingMiddleware.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Middlewares\\ExceptionHandlingMiddleware.cs",
+              "RelativeToolTip": "Middlewares\\ExceptionHandlingMiddleware.cs",
+              "ViewState": "AgIAAA4AAAAAAAAAAADwvxoAAAAlAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T09:43:55.958Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 27,
+              "Title": "UserDbContextFactory.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\DbContext\\UserDbContextFactory.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\DbContext\\UserDbContextFactory.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\DbContext\\UserDbContextFactory.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\DbContext\\UserDbContextFactory.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvwkAAAAFAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T10:14:38.067Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 32,
+              "Title": "ConfigService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Services\\ConfigService.cs",
+              "RelativeDocumentMoniker": "ConfigServiceLibrary\\Services\\ConfigService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Services\\ConfigService.cs",
+              "RelativeToolTip": "ConfigServiceLibrary\\Services\\ConfigService.cs",
+              "ViewState": "AgIAADgAAAAAAAAAAAAgwAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T09:52:11.291Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 31,
+              "Title": "ConfigItem.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Models\\ConfigItem.cs",
+              "RelativeDocumentMoniker": "ConfigServiceLibrary\\Models\\ConfigItem.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ConfigServiceLibrary\\Models\\ConfigItem.cs",
+              "RelativeToolTip": "ConfigServiceLibrary\\Models\\ConfigItem.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvwAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T09:52:32.629Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 30,
+              "Title": "ChatApp.Server.csproj",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ChatApp.Server.csproj",
+              "RelativeDocumentMoniker": "ChatApp.Server.csproj",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\ChatApp.Server.csproj",
+              "RelativeToolTip": "ChatApp.Server.csproj",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvxUAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000758|",
+              "WhenOpened": "2026-03-20T09:22:31.323Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 34,
+              "Title": "GeoLocationService.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\GeoLocationService.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Services\\GeoLocationService.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Services\\GeoLocationService.cs",
+              "RelativeToolTip": "Infrastructure\\Services\\GeoLocationService.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvw8AAAAZAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T15:47:34.854Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 33,
+              "Title": "docker-compose.yml",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\docker-compose.yml",
+              "RelativeDocumentMoniker": "docker-compose.yml",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\docker-compose.yml",
+              "RelativeToolTip": "docker-compose.yml",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABMAAAAiAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.003775|",
+              "WhenOpened": "2026-03-20T09:54:50.318Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 35,
+              "Title": "MyJsonSerializerOptions.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Serializer\\MyJsonSerializerOptions.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Serializer\\MyJsonSerializerOptions.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Serializer\\MyJsonSerializerOptions.cs",
+              "RelativeToolTip": "Infrastructure\\Serializer\\MyJsonSerializerOptions.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAADwvwAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T08:42:55.16Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 37,
+              "Title": "CacheUnavailableException.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Exceptions\\CacheUnavailableException.cs",
+              "RelativeDocumentMoniker": "Core\\Exceptions\\CacheUnavailableException.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Exceptions\\CacheUnavailableException.cs",
+              "RelativeToolTip": "Core\\Exceptions\\CacheUnavailableException.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAgAAAAtAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-21T08:40:10.176Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 36,
+              "Title": "AppJsonContext.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Serializer\\AppJsonContext.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Serializer\\AppJsonContext.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Serializer\\AppJsonContext.cs",
+              "RelativeToolTip": "Infrastructure\\Serializer\\AppJsonContext.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAgAAAABAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:50:17.956Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 39,
+              "Title": "FriendshipConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendshipConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\FriendshipConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendshipConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\FriendshipConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAASAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:49:31.126Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 40,
+              "Title": "FriendRequestConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendRequestConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\FriendRequestConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendRequestConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\FriendRequestConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABoAAAAvAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:49:15.558Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 41,
+              "Title": "FriendGroupConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendGroupConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\FriendGroupConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendGroupConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\FriendGroupConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABQAAAAeAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:48:25.747Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 42,
+              "Title": "FriendGroupMapping.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendGroupMapping.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\FriendGroupMapping.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\FriendGroupMapping.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\FriendGroupMapping.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAASAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:48:41.785Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 43,
+              "Title": "BlockRecordConfig.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\BlockRecordConfig.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Models\\Config\\BlockRecordConfig.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Models\\Config\\BlockRecordConfig.cs",
+              "RelativeToolTip": "Infrastructure\\Models\\Config\\BlockRecordConfig.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABcAAAAQAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:14:20.6Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 44,
+              "Title": "Request.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Models\\Request\\Request.cs",
+              "RelativeDocumentMoniker": "Models\\Request\\Request.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Models\\Request\\Request.cs",
+              "RelativeToolTip": "Models\\Request\\Request.cs",
+              "ViewState": "AgIAACkAAAAAAAAAAADwvxMAAAAgAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:50:31.701Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 45,
+              "Title": "ApplicationUser.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Identity\\ApplicationUser.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Identity\\ApplicationUser.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Identity\\ApplicationUser.cs",
+              "RelativeToolTip": "Core\\Models\\Identity\\ApplicationUser.cs",
+              "ViewState": "AgIAAAsAAAAAAAAAAAAAwA8AAAARAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:47:36.578Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 46,
+              "Title": "BlockRecord.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\BlockRecord.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\Friend\\BlockRecord.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\Friend\\BlockRecord.cs",
+              "RelativeToolTip": "Core\\Models\\Friend\\BlockRecord.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAQAAAAYAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:45:33.597Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 38,
+              "Title": "InfrastructureExtensions.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Extensions\\InfrastructureExtensions.cs",
+              "RelativeDocumentMoniker": "Infrastructure\\Extensions\\InfrastructureExtensions.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Infrastructure\\Extensions\\InfrastructureExtensions.cs",
+              "RelativeToolTip": "Infrastructure\\Extensions\\InfrastructureExtensions.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAB0AAAAJAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T15:04:05.997Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 47,
+              "Title": "PaginatedList.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\PaginatedList.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\PaginatedList.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\PaginatedList.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\PaginatedList.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAYAAAAmAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:09:04.243Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 48,
+              "Title": "LoginResult.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Login\\LoginResult.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\Login\\LoginResult.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Login\\LoginResult.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\Login\\LoginResult.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAIAAAAfAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:11:01.312Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 49,
+              "Title": "RefreshToken.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Login\\RefreshToken.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\Login\\RefreshToken.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Login\\RefreshToken.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\Login\\RefreshToken.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAUAAAARAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:11:23.401Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 50,
+              "Title": "TokenResponse.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\TokenResponse.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\Auth\\TokenResponse.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\TokenResponse.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\Auth\\TokenResponse.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABcAAAAFAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:11:57.975Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 51,
+              "Title": "AuthErrorType.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\AuthErrorType.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\Auth\\AuthErrorType.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\AuthErrorType.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\Auth\\AuthErrorType.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAABQAAAABAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:09:13.854Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 52,
+              "Title": "TokenIssueResult.cs",
+              "DocumentMoniker": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\TokenIssueResult.cs",
+              "RelativeDocumentMoniker": "Core\\Models\\DTOs\\Auth\\TokenIssueResult.cs",
+              "ToolTip": "D:\\Users\\Ye_Lu\\RiderProjects\\ChatApp.Server\\Core\\Models\\DTOs\\Auth\\TokenIssueResult.cs",
+              "RelativeToolTip": "Core\\Models\\DTOs\\Auth\\TokenIssueResult.cs",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000738|",
+              "WhenOpened": "2026-03-20T16:11:43.822Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,189 @@
+﻿using ChatApp.Core.Interfaces;
+using Core.Interfaces;
+using Infrastructure.Data.Repositories;
+using Infrastructure.Data.Repositories.Login;
+using Infrastructure.Exceptions;
+using Infrastructure.Identity;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Logging;
+
+namespace Core.Services;
+
+public class UserManageServices(
+    UserManager<ApplicationUser> userManager,
+    IJwtTokenService tokenService,
+    ILogger<UserManageServices> logger,
+    ServerEndPoint? serverEndPoint = null) : IUserManage
+{
+    private ServerEndPoint _tcpServer = serverEndPoint ?? new ServerEndPoint
+    {
+        Host = "127.0.0.1",
+        Port = 8888,
+        Name = "ChatApp.TcpServer",
+    };
+
+    public async Task<LoginResult> LoginAsync(string username, string password)
+    {
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            return LoginResult.Fail("用户名和密码不能为空！");
+
+        try
+        {
+            var user = await userManager.FindByNameAsync(username);
+            if (user == null)
+            {
+                logger.LogWarning("用户 {Username} 不存在", username);
+                return LoginResult.Fail("请检查用户名！");
+            }
+
+            if (!await userManager.CheckPasswordAsync(user, password))
+            {
+                logger.LogWarning("用户 {Username} 密码错误", username);
+                return LoginResult.Fail("密码错误！");
+            }
+
+            if (await userManager.IsLockedOutAsync(user))
+            {
+                logger.LogWarning("用户 {Username} 账户已被锁定", username);
+                return LoginResult.Fail("账户已被锁定！");
+            }
+
+            var roles = await userManager.GetRolesAsync(user);
+            var accessToken = tokenService.GenerateAccessToken(user, roles);
+            var refreshToken = tokenService.GenerateRefreshToken();
+
+            await tokenService.StoreRefreshTokenAsync(user.Id.ToString(), refreshToken, TimeSpan.FromDays(2));
+            logger.LogInformation("用户 {Username} 登录成功", username);
+
+            return LoginResult.Success(accessToken, refreshToken, ref _tcpServer);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "用户 {Username} 登录时发生异常", username);
+            throw new IdentityException("登录过程中发生错误", ex);
+        }
+    }
+
+    public async Task LogoutAsync(string userId, string refreshToken)
+    {
+        await ExecuteAsync(
+            () => tokenService.RevokeRefreshTokenAsync(userId, refreshToken),
+            "注销用户");
+    }
+
+    public async Task<ApplicationUser?> FindByUserNameAsync(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+            return null;
+
+        return await ExecuteAsync(
+            () => userManager.FindByNameAsync(username),
+            $"查找用户 {username}");
+    }
+
+    public async Task<ApplicationUser?> FindByIdAsync(long userId)
+    {
+        return await ExecuteAsync(
+            () => userManager.FindByIdAsync(userId.ToString()),
+            $"查找用户 ID {userId}");
+    }
+
+    public async Task<bool> CheckPasswordAsync(ApplicationUser user, string password)
+    {
+        if (user == null || string.IsNullOrWhiteSpace(password))
+            return false;
+
+        return await ExecuteAsync(
+            () => userManager.CheckPasswordAsync(user, password),
+            $"验证用户 {user.Id} 密码");
+    }
+
+    public async Task<IdentityResult> CreateUserAsync(ApplicationUser user, string password)
+    {
+        return await ExecuteAsync(
+            async () =>
+            {
+                var result = await userManager.CreateAsync(user, password);
+                if (result.Succeeded)
+                    logger.LogInformation("成功创建用户 {UserId}", user.Id);
+                return result;
+            },
+            "创建用户");
+    }
+
+    public async Task<IdentityResult> UpdateUserAsync(ApplicationUser user)
+    {
+        return await ExecuteAsync(
+            async () =>
+            {
+                var result = await userManager.UpdateAsync(user);
+                if (result.Succeeded)
+                    logger.LogInformation("成功更新用户 {UserId}", user.Id);
+                return result;
+            },
+            $"更新用户 {user.Id}");
+    }
+
+    public async Task<IdentityResult> DeleteUserAsync(ApplicationUser user)
+    {
+        return await ExecuteAsync(
+            async () =>
+            {
+                var result = await userManager.DeleteAsync(user);
+                if (result.Succeeded)
+                    logger.LogInformation("成功删除用户 {UserId}", user.Id);
+                return result;
+            },
+            $"删除用户 {user.Id}");
+    }
+
+    public async Task<IdentityResult> ChangePasswordAsync(ApplicationUser user, string currentPassword, string newPassword)
+    {
+        return await ExecuteAsync(
+            async () =>
+            {
+                var result = await userManager.ChangePasswordAsync(user, currentPassword, newPassword);
+                if (result.Succeeded)
+                {
+                    logger.LogInformation("用户 {UserId} 密码修改成功", user.Id);
+                    await userManager.ResetAccessFailedCountAsync(user);
+                }
+                return result;
+            },
+            $"修改用户 {user.Id} 密码");
+    }
+
+    public async Task<TokenPairResult> RefreshLoginAsync(string userId, string refreshToken)
+    {
+        if (string.IsNullOrEmpty(refreshToken))
+            return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
+
+        return await tokenService.RefreshTokensAsync(userId, refreshToken);
+    }
+
+    private async Task<T> ExecuteAsync<T>(Func<Task<T>> operation, string operationName)
+    {
+        try
+        {
+            return await operation();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "{OperationName} 时发生异常", operationName);
+            throw new IdentityException($"{operationName}失败", ex);
+        }
+    }
+
+    private async Task ExecuteAsync(Func<Task> operation, string operationName)
+    {
+        try
+        {
+            await operation();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "{OperationName} 时发生异常", operationName);
+            throw new IdentityException($"{operationName}失败", ex);
+        }
+    }
+}
