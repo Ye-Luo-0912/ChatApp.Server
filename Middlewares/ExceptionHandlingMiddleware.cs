@@ -1,6 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.Net;
 using System.Security.Claims;
+using Core.Exceptions;
 
 namespace ChatApp.Server.Middlewares
 {
@@ -47,6 +48,11 @@ namespace ChatApp.Server.Middlewares
                 logger.LogWarning(ex, "参数错误");
                 await HandleExceptionAsync(context, HttpStatusCode.BadRequest, ex);
             }
+            catch (CacheUnavailableException ex)
+            {
+                logger.LogError(ex, "缓存不可用");
+                await HandleExceptionAsync(context, HttpStatusCode.ServiceUnavailable, ex);
+            }
             catch (Exception ex)
             {
                 logger.LogError(ex,
@@ -79,9 +85,10 @@ namespace ChatApp.Server.Middlewares
                 error = (int)statusCode,
                 message = statusCode switch
                 {
-                    HttpStatusCode.BadRequest => exception.Message, // 业务错误，可以给前端看
+                    HttpStatusCode.BadRequest => exception.Message,
                     HttpStatusCode.Unauthorized => "未授权访问",
                     HttpStatusCode.NotFound => "资源不存在",
+                    HttpStatusCode.ServiceUnavailable => "服务暂时不可用，请稍后重试",
                     _ => "服务器内部错误"
                 },
 #if DEBUG

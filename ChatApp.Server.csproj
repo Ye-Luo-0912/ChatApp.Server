@@ -18,15 +18,19 @@
     <ItemGroup>
       <Compile Remove="Infrastructure\**" />
       <Compile Remove="Core\**" />
+      <Compile Remove="ConfigServiceLibrary\**" />
+      <Compile Remove="tests\**" />
     </ItemGroup>
 
     <ItemGroup>
       <EmbeddedResource Remove="Infrastructure\**" />
       <EmbeddedResource Remove="Core\**" />
+      <EmbeddedResource Remove="ConfigServiceLibrary\**" />
     </ItemGroup>
 
     <ItemGroup>
       <Content Remove="Infrastructure\**" />
+      <Content Remove="ConfigServiceLibrary\**" />
       <Content Include="Core\Core.csproj" />
       <Content Include="Core\obj\Core.csproj.nuget.g.props" />
       <Content Include="Core\obj\Core.csproj.nuget.g.targets" />
@@ -43,6 +47,7 @@
     <ItemGroup>
       <None Remove="Infrastructure\**" />
       <None Remove="Core\**" />
+      <None Remove="ConfigServiceLibrary\**" />
     </ItemGroup>
 
     <ItemGroup>
@@ -59,6 +64,16 @@
     <ItemGroup>
       <ProjectReference Include="Core\Core.csproj" />
       <ProjectReference Include="Infrastructure\Infrastructure.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="AspNetCore.HealthChecks.NpgSql" Version="9.0.0" />
+      <PackageReference Include="AspNetCore.HealthChecks.Redis" Version="9.0.0" />
+      <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.14.0" />
+      <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.14.0" />
+      <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.14.0" />
+      <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.14.0" />
+      <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" Version="1.14.0" />
     </ItemGroup>
 
 </Project>

@@ -1,8 +1,7 @@
 ﻿using Core.Exceptions;
 using Core.Interfaces;
-using Core.Models.DTOs.User;
-using Core.Models.Identity;
-using Microsoft.AspNetCore.Identity;
+using Core.Models.Auth;
+using Core.Models.User;
 using Microsoft.Extensions.Logging;
 
 namespace Core.Services;
@@ -11,7 +10,8 @@ namespace Core.Services;
 /// 处理用户资料查询、更新、删除和密码修改。
 /// </summary>
 public class UserAccountService(
-    UserManager<ApplicationUser> userManager,
+    IUserRepository userRepository,
+    IPasswordHasher passwordHasher,
     ILogger<UserAccountService> logger) : IUserAccountService
 {
     /// <summary>
@@ -21,8 +21,8 @@ public class UserAccountService(
     {
         try
         {
-            var user = await userManager.FindByIdAsync(userId.ToString());
-            return user is null ? null : MapProfile(user);
+            var user = await userRepository.FindByIdAsync(userId);
+            return user is null ? null : UserProfileResponse.FromUser(user);
         }
         catch (Exception ex)
         {
@@ -38,8 +38,8 @@ public class UserAccountService(
     {
         try
         {
-            var user = await userManager.FindByNameAsync(username);
-            return user is null ? null : MapPublic(user);
+            var user = await userRepository.FindByNameAsync(username);
+            return user is null ? null : PublicUserResponse.FromUser(user);
         }
         catch (Exception ex)
         {
@@ -51,24 +51,28 @@ public class UserAccountService(
     /// <summary>
     /// 更新用户的邮箱和手机号等基础资料。
     /// </summary>
-    public async Task<IdentityResult?> UpdateAsync(long userId, string? email, string? phoneNumber)
+    public async Task<AuthOperationResult?> UpdateAsync(long userId, string? email, string? phoneNumber)
     {
         try
         {
-            var user = await userManager.FindByIdAsync(userId.ToString());
+            var user = await userRepository.FindByIdAsync(userId);
             if (user is null)
                 return null;
 
-            user.Email = email ?? user.Email;
-            user.PhoneNumber = phoneNumber ?? user.PhoneNumber;
-
-            var result = await userManager.UpdateAsync(user);
-            if (result.Succeeded)
+            if (email is not null)
             {
-                logger.LogInformation("成功更新用户 {UserId}", userId);
+                user.Email = email;
+                user.NormalizedEmail = email.Trim().ToUpperInvariant();
             }
 
-            return result;
+            user.PhoneNumber = phoneNumber ?? user.PhoneNumber;
+
+            var ok = await userRepository.UpdateAsync(user);
+            if (ok) logger.LogInformation("成功更新用户 {UserId}", userId);
+
+            return ok
+                ? AuthOperationResult.Success()
+                : AuthOperationResult.Fail("UpdateFailed", "用户信息更新失败");
         }
         catch (Exception ex)
         {
@@ -80,21 +84,20 @@ public class UserAccountService(
     /// <summary>
     /// 删除指定用户。
     /// </summary>
-    public async Task<IdentityResult?> DeleteAsync(long userId)
+    public async Task<AuthOperationResult?> DeleteAsync(long userId)
     {
         try
         {
-            var user = await userManager.FindByIdAsync(userId.ToString());
+            var user = await userRepository.FindByIdAsync(userId);
             if (user is null)
                 return null;
 
-            var result = await userManager.DeleteAsync(user);
-            if (result.Succeeded)
-            {
-                logger.LogInformation("成功删除用户 {UserId}", userId);
-            }
+            var ok = await userRepository.DeleteAsync(user);
+            if (ok) logger.LogInformation("成功删除用户 {UserId}", userId);
 
-            return result;
+            return ok
+                ? AuthOperationResult.Success()
+                : AuthOperationResult.Fail("DeleteFailed", "用户删除失败");
         }
         catch (Exception ex)
         {
@@ -106,21 +109,28 @@ public class UserAccountService(
     /// <summary>
     /// 修改指定用户密码。
     /// </summary>
-    public async Task<IdentityResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword)
+    public async Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword)
     {
         try
         {
-            var user = await userManager.FindByIdAsync(userId.ToString());
+            var user = await userRepository.FindByIdAsync(userId);
             if (user is null)
                 return null;
 
-            var result = await userManager.ChangePasswordAsync(user, currentPassword, newPassword);
-            if (!result.Succeeded)
-                return result;
+            if (string.IsNullOrEmpty(user.PasswordHash)
+                || !passwordHasher.VerifyPassword(currentPassword, user.PasswordHash))
+                return AuthOperationResult.Fail("PasswordMismatch", "当前密码不正确");
 
-            await userManager.ResetAccessFailedCountAsync(user);
-            logger.LogInformation("用户 {UserId} 密码修改成功", userId);
-            return result;
+            user.PasswordHash = passwordHasher.HashPassword(newPassword);
+            user.SecurityStamp = Guid.NewGuid().ToString();
+            user.AccessFailedCount = 0;
+
+            var ok = await userRepository.UpdateAsync(user);
+            if (ok) logger.LogInformation("用户 {UserId} 密码修改成功", userId);
+
+            return ok
+                ? AuthOperationResult.Success()
+                : AuthOperationResult.Fail("UpdateFailed", "密码修改失败");
         }
         catch (Exception ex)
         {
@@ -129,41 +139,4 @@ public class UserAccountService(
         }
     }
 
-    
-    
-    
-    
-    
-
-    /// <summary>
-    /// 将实体映射成完整用户资料响应。
-    /// </summary>
-    private static UserProfileResponse MapProfile(ApplicationUser user) => new()
-    {
-        Id = user.Id,
-        UserName = user.UserName,
-        Email = user.Email,
-        EmailConfirmed = user.EmailConfirmed,
-        PhoneNumber = user.PhoneNumber,
-        AvatarUrl = user.AvatarUrl,
-        Gender = user.Gender,
-        Signature = user.Signature,
-        Region = user.Region,
-        Birthday = user.Birthday,
-        Status = user.Status,
-        CreatedDate = user.CreatedDate,
-        LastLoginDate = user.LastLoginDate
-    };
-
-    /// <summary>
-    /// 将实体映射成公开用户资料响应。
-    /// </summary>
-    private static PublicUserResponse MapPublic(ApplicationUser user) => new()
-    {
-        Id = user.Id,
-        UserName = user.UserName,
-        AvatarUrl = user.AvatarUrl,
-        Signature = user.Signature,
-        Status = user.Status
-    };
 }

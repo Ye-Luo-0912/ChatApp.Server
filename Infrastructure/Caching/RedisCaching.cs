@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.Text.Json;
+using Core.Caching;
 using Core.Exceptions;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
@@ -15,7 +17,9 @@ namespace Infrastructure.Caching;
 /// </summary>
 public class RedisCaching : ICacheProvider
 {
+    /// Redis 数据库实例
     private readonly IDatabase _db;
+    // redis 连接实例，主要用于健康检查和获取服务器信息等操作，实际读写通过 IDatabase 完成
     private readonly IConnectionMultiplexer _redis;
     private readonly ISerializer _serializer;
     private readonly ILogger<RedisCaching> _logger;
@@ -23,14 +27,20 @@ public class RedisCaching : ICacheProvider
     private readonly Counter<int> _cacheHits;
     private readonly Counter<int> _cacheMisses;
     private readonly Histogram<double> _operationDuration;
+    
+    private const string RedisGetName = "Redis.Get";
 
-    private const string NullValueMarker = "__NULL__";
+    // 字段名与标记常量统一来自 Core.Caching.CacheConstants，便于跨项目共享
+    private static readonly string ValueField              = CacheConstants.ValueField;
+    private static readonly string AbsoluteExpirationField = CacheConstants.AbsoluteExpirationField;
+    private static readonly string SlidingExpirationField  = CacheConstants.SlidingExpirationField;
+    private static readonly string NullValueMarker         = CacheConstants.NullValueMarker;
     private static readonly Meter Meter = new("Infrastructure.Caching");
     // 添加 ActivitySource
     private static readonly ActivitySource ActivitySource = new("Infrastructure.Caching.Redis");
     public bool IsHealthy => _redis.IsConnected;
 
-    private string NormalizeKey(string key) => _options.KeyPrefix + key;
+    private string NormalizeKey(string key) => CacheKeyBuilder.WithPrefix(_options.KeyPrefix, key);
 
     /// <summary>
     /// 初始化 Redis 缓存服务
@@ -69,7 +79,7 @@ public class RedisCaching : ICacheProvider
             return default;
         }
 
-        using var activity = ActivitySource.StartActivity("Redis.Get");
+        using var activity = ActivitySource.StartActivity(RedisGetName);
         var stopwatch = Stopwatch.StartNew();
         var fullKey = NormalizeKey(key);
 
@@ -77,7 +87,7 @@ public class RedisCaching : ICacheProvider
         try
         {
             // 获取缓存值
-            var redisValue = await ExecuteWithRetry(() => _db.HashGetAllAsync(fullKey), cancellationToken);
+            var redisValue = await ExecuteWithRetry(() => _db.HashGetAllAsync(fullKey), cancellationToken).ConfigureAwait(false);
 
             if (redisValue.Length > 0)
             {
@@ -89,14 +99,14 @@ public class RedisCaching : ICacheProvider
             if (valueFactory == null) return default;
 
             // 获取分布式锁，防止缓存击穿
-            var lockKey = $"lock:{fullKey}";
+            var lockKey = CacheKeyBuilder.LockKey(fullKey);
             var lockValue = Guid.CreateVersion7().ToString("N");
-            if (await AcquireLockAsync(lockKey, lockValue, cancellationToken))
+            if (await AcquireLockAsync(lockKey, lockValue, cancellationToken).ConfigureAwait(false))
             {
                 try
                 {
                     // 双重检查
-                    var recheckValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey,"value"), cancellationToken);
+                    var recheckValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey, ValueField), cancellationToken).ConfigureAwait(false);
                     if (!recheckValue.IsNullOrEmpty)
                     {
                         if (recheckValue != NullValueMarker) 
@@ -108,23 +118,23 @@ public class RedisCaching : ICacheProvider
                     }
 
                     // 生成实际值
-                    var value = await valueFactory();
+                    var value = await valueFactory().ConfigureAwait(false);
                     var expiration = CalculateExpiration(slidingExpiration, absoluteExpiration);
 
                     if (value is null)
                     {
                         // 空值缓存
-                        await SetHashNullValueAsync(fullKey, expiration, cancellationToken);
+                        await SetHashNullValueAsync(fullKey, expiration, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        await SetValueAsync(fullKey, value, slidingExpiration, absoluteExpiration, cancellationToken);
+                        await SetValueAsync(fullKey, value, slidingExpiration, absoluteExpiration, cancellationToken).ConfigureAwait(false);
                     }
                     return value;
                 }
                 finally
                 {
-                    await ReleaseLockAsync(lockKey, lockValue,cancellationToken);
+                    await ReleaseLockAsync(lockKey, lockValue, cancellationToken).ConfigureAwait(false);
                 }
             }
             else
@@ -132,13 +142,13 @@ public class RedisCaching : ICacheProvider
                 // 等待锁释放后重试获取缓存
                 for (var i = 0; i < 3; i++)
                 {
-                    await Task.Delay(50, cancellationToken);
-                    var retryValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey, "value"), cancellationToken);
+                    await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+                    var retryValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey, ValueField), cancellationToken).ConfigureAwait(false);
                     
                     if (!retryValue.HasValue) 
                         continue;
                     
-                    return retryValue == NullValueMarker ? default : _serializer.Deserialize<CacheEnvelope<T>>(retryValue).Value;
+                    return retryValue == NullValueMarker ? default : _serializer.Deserialize<T>((byte[])retryValue!);
                 }
             }
         }
@@ -185,7 +195,7 @@ public class RedisCaching : ICacheProvider
         activity?.AddTag("cache.full_key", fullKey);
         try
         {
-            var redisValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken);
+            var redisValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken).ConfigureAwait(false);
 
             if (redisValue.HasValue)
             {
@@ -206,14 +216,14 @@ public class RedisCaching : ICacheProvider
             if (valueFactory == null) return null;
 
             // 获取分布式锁，防止缓存击穿
-            var lockKey = $"lock:{fullKey}";
+            var lockKey = CacheKeyBuilder.LockKey(fullKey);
             var lockValue = Guid.CreateVersion7().ToString("N");
-            if (await AcquireLockAsync(lockKey,lockValue, cancellationToken))
+            if (await AcquireLockAsync(lockKey, lockValue, cancellationToken).ConfigureAwait(false))
             {
                 try
                 {
                     // 双重检查
-                    var recheckValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken);
+                    var recheckValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken).ConfigureAwait(false);
                     if (recheckValue.HasValue)
                     {
                         if(recheckValue == NullValueMarker)
@@ -224,23 +234,23 @@ public class RedisCaching : ICacheProvider
                         
 
                     // 生成实际值
-                    var value = await valueFactory();
+                    var value = await valueFactory().ConfigureAwait(false);
                     var expiration = CalculateExpiration(null, absoluteExpiration);
 
                     if (value == null)
                     {
-                        await SetNullValueAsync(fullKey, expiration, cancellationToken);
+                        await SetNullValueAsync(fullKey, expiration, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        await _db.StringSetAsync(fullKey, value,  expiration);
+                        await _db.StringSetAsync(fullKey, value, expiration).ConfigureAwait(false);
                     }
 
                     return value;
                 }
                 finally
                 {
-                    await ReleaseLockAsync(lockKey, lockValue,cancellationToken);
+                    await ReleaseLockAsync(lockKey, lockValue, cancellationToken).ConfigureAwait(false);
                 }
             }
             else
@@ -248,8 +258,8 @@ public class RedisCaching : ICacheProvider
                 // 等待锁释放后重试获取缓存
                 for (int i = 0; i < 3; i++)
                 {
-                    await Task.Delay(50, cancellationToken);
-                    var retryValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken);
+                    await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+                    var retryValue = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken).ConfigureAwait(false);
                     if (retryValue.HasValue)
                     {
                         if (retryValue == NullValueMarker)
@@ -354,7 +364,7 @@ public class RedisCaching : ICacheProvider
 
         try
         {
-            await _db.StringSetAsync(fullKey, value, expiration).WaitAsync(cancellationToken);
+            await _db.StringSetAsync(fullKey, value, expiration).WaitAsync(cancellationToken).ConfigureAwait(false);
             _logger.LogDebug("缓存设置成功: {Key} (过期时间: {Expiration})", key, expiration);
         }
         catch (RedisConnectionException ex)
@@ -365,6 +375,92 @@ public class RedisCaching : ICacheProvider
         finally
         {
             _operationDuration.Record(stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> StringSetIfNotExistsAsync(
+        string key,
+        string value,
+        TimeSpan? absoluteExpiration = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+        {
+            _logger.LogWarning("尝试 SET NX 时使用了空键");
+            return false;
+        }
+
+        var fullKey = NormalizeKey(key);
+        var expiration = absoluteExpiration ?? _options.DefaultSlidingExpiration;
+
+        try
+        {
+            return await ExecuteWithRetry(
+                    () => _db.StringSetAsync(fullKey, value, expiration, When.NotExists),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（SET NX）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> TryStringCompareAndDeleteAsync(
+        string key,
+        string expectedValue,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return false;
+
+        var fullKey = NormalizeKey(key);
+
+        try
+        {
+            var tran = _db.CreateTransaction();
+            tran.AddCondition(Condition.StringEqual(fullKey, expectedValue));
+            _ = tran.KeyDeleteAsync(fullKey);
+            return await tran.ExecuteAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（compare-and-delete）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<long> StringIncrementAsync(
+        string key,
+        TimeSpan? absoluteExpirationWhenCreate = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            throw new ArgumentException("键不能为空", nameof(key));
+
+        var fullKey = NormalizeKey(key);
+
+        try
+        {
+            var value = await ExecuteWithRetry(() => _db.StringIncrementAsync(fullKey), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (value == 1 && absoluteExpirationWhenCreate is { } ttl)
+            {
+                await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, ttl), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            return value;
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（INCR）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
         }
     }
 
@@ -386,7 +482,7 @@ public class RedisCaching : ICacheProvider
         try
         {
             // 删除本身是幂等操作，键不存在也按正常路径结束。
-            var deleted = await ExecuteWithRetry(() => _db.KeyDeleteAsync(fullKey), cancellationToken);
+            var deleted = await ExecuteWithRetry(() => _db.KeyDeleteAsync(fullKey), cancellationToken).ConfigureAwait(false);
             _logger.LogDebug(deleted ? "缓存删除成功: {Key}" : "键不存在: {Key}", key);
         }
         catch (RedisConnectionException ex)
@@ -414,7 +510,7 @@ public class RedisCaching : ICacheProvider
         try
         {
             // 先读出绝对过期时间，避免滑动续期把键延长到上限之外。
-            var absExpValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey, "absExp"), cancellationToken);
+            var absExpValue = await ExecuteWithRetry(() => _db.HashGetAsync(fullKey, AbsoluteExpirationField), cancellationToken).ConfigureAwait(false);
 
             var newTtl = slidingExpiration;
 
@@ -427,7 +523,7 @@ public class RedisCaching : ICacheProvider
                 if (maxRemaining <= TimeSpan.Zero)
                 {
                     // 已经过了绝对过期点时，直接清掉这个键，避免继续续期。
-                    await _db.KeyDeleteAsync(fullKey);
+                    await _db.KeyDeleteAsync(fullKey).ConfigureAwait(false);
                     return;
                 }
 
@@ -436,7 +532,7 @@ public class RedisCaching : ICacheProvider
             }
 
 
-            await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, newTtl), cancellationToken);
+            await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, newTtl), cancellationToken).ConfigureAwait(false);
         }
         catch (RedisConnectionException ex)
         {
@@ -497,6 +593,154 @@ public class RedisCaching : ICacheProvider
         return await _db.KeyExistsAsync(NormalizeKey(key));
     }
 
+    /// <inheritdoc />
+    public async Task<AtomicConsumeResult<TResult>> TryAtomicConsumeAsync<T, TResult>(
+        string consumeKey,
+        Func<T, AtomicConsumePlan<TResult>?> createPlan,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(createPlan);
+
+        if (string.IsNullOrEmpty(consumeKey))
+        {
+            _logger.LogWarning("尝试原子消费时使用了空键");
+            return AtomicConsumeResult<TResult>.Fail();
+        }
+
+        using var activity = ActivitySource.StartActivity("Redis.AtomicConsume");
+        var stopwatch = Stopwatch.StartNew();
+        var fullKey = NormalizeKey(consumeKey);
+        activity?.AddTag("cache.full_key", fullKey);
+
+        try
+        {
+            // 先读取信封，做过期与业务校验；真正的互斥由下方 HashEqual CAS 保证。
+            var hashEntries = await ExecuteWithRetry(
+                () => _db.HashGetAllAsync(fullKey), cancellationToken).ConfigureAwait(false);
+
+            if (hashEntries.Length == 0)
+                return AtomicConsumeResult<TResult>.Fail();
+
+            var valueEntry = hashEntries.FirstOrDefault(x => x.Name == ValueField).Value;
+            var absExpEntry = hashEntries.FirstOrDefault(x => x.Name == AbsoluteExpirationField).Value;
+
+            if (!valueEntry.HasValue || valueEntry == NullValueMarker)
+                return AtomicConsumeResult<TResult>.Fail();
+
+            if (absExpEntry.HasValue && absExpEntry.TryParse(out long absTicks))
+            {
+                var absTime = new DateTimeOffset(absTicks, TimeSpan.Zero);
+                if (DateTimeOffset.UtcNow > absTime)
+                {
+                    await ExecuteWithRetry(() => _db.KeyDeleteAsync(fullKey), cancellationToken)
+                        .ConfigureAwait(false);
+                    return AtomicConsumeResult<TResult>.Fail();
+                }
+            }
+
+            var current = SmartDeserialize<T>(valueEntry);
+            if (current is null)
+                return AtomicConsumeResult<TResult>.Fail();
+
+            var plan = createPlan(current);
+            if (plan is null)
+                return AtomicConsumeResult<TResult>.Fail();
+
+            var preparedWrites = new List<PreparedHashWrite>(plan.Writes.Count);
+            foreach (var write in plan.Writes)
+            {
+                if (string.IsNullOrEmpty(write.Key))
+                    throw new ArgumentException("原子写入条目的键不能为空", nameof(createPlan));
+
+                preparedWrites.Add(PrepareHashWrite(write));
+            }
+
+            var tran = _db.CreateTransaction();
+            // 仅当 value 仍等于读取时的原始字节时才提交，保证并发下只有一个消费者成功。
+            tran.AddCondition(Condition.HashEqual(fullKey, ValueField, valueEntry));
+
+            _ = tran.KeyDeleteAsync(fullKey);
+            foreach (var deleteKey in plan.AdditionalKeysToDelete)
+            {
+                if (string.IsNullOrEmpty(deleteKey))
+                    continue;
+                _ = tran.KeyDeleteAsync(NormalizeKey(deleteKey));
+            }
+
+            foreach (var write in preparedWrites)
+            {
+                _ = tran.HashSetAsync(write.FullKey, write.Entries);
+                _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+            }
+
+            var committed = await tran.ExecuteAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!committed)
+            {
+                _logger.LogDebug("原子消费 CAS 失败（已被并发消费）: {Key}", fullKey);
+                return AtomicConsumeResult<TResult>.Fail();
+            }
+
+            _logger.LogDebug(
+                "原子消费成功: {Key}, Deletes={DeleteCount}, Writes={WriteCount}",
+                fullKey, plan.AdditionalKeysToDelete.Count + 1, preparedWrites.Count);
+
+            return AtomicConsumeResult<TResult>.Ok(plan.Result);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（原子消费）: {Key}", consumeKey);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "反序列化失败（原子消费）: {Key}", consumeKey);
+            throw new CacheCorruptedException("缓存数据损坏", ex);
+        }
+        finally
+        {
+            _operationDuration.Record(stopwatch.ElapsedMilliseconds);
+        }
+    }
+
+    private PreparedHashWrite PrepareHashWrite(CacheSetRequest request)
+    {
+        var fullKey = NormalizeKey(request.Key);
+        var entries = new List<HashEntry>(3);
+        var data = request.Value;
+
+        if (data is string s)
+        {
+            entries.Add(new HashEntry(ValueField, s));
+        }
+        else
+        {
+            var type = data.GetType();
+            if (type.IsPrimitive || type.IsValueType)
+                entries.Add(new HashEntry(ValueField, data.ToString()!));
+            else
+                entries.Add(new HashEntry(ValueField, _serializer.Serialize(data)));
+        }
+
+        if (request.AbsoluteExpiration.HasValue)
+        {
+            entries.Add(new HashEntry(
+                AbsoluteExpirationField,
+                DateTimeOffset.UtcNow.Add(request.AbsoluteExpiration.Value).Ticks));
+        }
+
+        if (request.SlidingExpiration.HasValue)
+        {
+            entries.Add(new HashEntry(
+                SlidingExpirationField,
+                request.SlidingExpiration.Value.Ticks));
+        }
+
+        var ttl = CalculateExpiration(request.SlidingExpiration, request.AbsoluteExpiration);
+        return new PreparedHashWrite(fullKey, entries.ToArray(), ttl);
+    }
+
+    private readonly record struct PreparedHashWrite(string FullKey, HashEntry[] Entries, TimeSpan Ttl);
+
     /// <summary>
     /// 计算最终的过期时间，考虑滑动过期、绝对过期和默认值，并添加随机抖动以防止缓存雪崩
     /// </summary>
@@ -549,43 +793,37 @@ public class RedisCaching : ICacheProvider
 
             if (typeof(T) == typeof(string))
             {
-                var val = (string)(object)data;
-                entries.Add(new("value", val));
-
+                entries.Add(new HashEntry(ValueField, (string)(object)data!));
             }
             else if (typeof(T).IsPrimitive || typeof(T).IsValueType)
             {
-                var val = data!.ToString()!;
-                entries.Add(new("value", val));
+                entries.Add(new HashEntry(ValueField, data!.ToString()!));
             }
             else
             {
-                entries.Add(new("value", _serializer.Serialize(data)));
+                entries.Add(new HashEntry(ValueField, _serializer.Serialize(data)));
             }
 
             if (absoluteExpiration.HasValue)
-            {
-                var absTicks = DateTimeOffset.UtcNow.Add(absoluteExpiration.Value).Ticks;
-                entries.Add(new("absExp", absTicks));
-            }
+                entries.Add(new HashEntry(AbsoluteExpirationField, DateTimeOffset.UtcNow.Add(absoluteExpiration.Value).Ticks));
+
             if (slidingExpiration.HasValue)
-            {
-                var slidExp = slidingExpiration.Value.Ticks;
-                entries.Add(new HashEntry("slidExp", slidExp));
-            }
+                entries.Add(new HashEntry(SlidingExpirationField, slidingExpiration.Value.Ticks));
 
-            
-            await ExecuteWithRetry(()=> _db.HashSetAsync(fullKey, [.. entries]), ct);
-
-            //
             var redisTtl = CalculateExpiration(slidingExpiration, absoluteExpiration);
-            await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, redisTtl), ct);
 
-
+            // 使用 IBatch 将 HashSet 与 KeyExpire 合并为单次网络往返，减少延迟
+            await ExecuteWithRetry(async () =>
+            {
+                var batch = _db.CreateBatch();
+                var hashTask   = batch.HashSetAsync(fullKey, [.. entries]);
+                var expireTask = batch.KeyExpireAsync(fullKey, redisTtl);
+                batch.Execute();
+                await Task.WhenAll(hashTask, expireTask).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
         }
         catch (Exception e)
         {
-
             _logger.LogError(e, "序列化失败: {Key}", fullKey);
             throw new CacheSerializationException("对象序列化失败", e);
         }
@@ -595,14 +833,20 @@ public class RedisCaching : ICacheProvider
     /// 设置空值缓存
     private async Task SetNullValueAsync(string fullKey, TimeSpan expiration, CancellationToken ct)
     {
-        await ExecuteWithRetry(() => _db.StringSetAsync(fullKey, NullValueMarker, expiration), ct);
+        await ExecuteWithRetry(() => _db.StringSetAsync(fullKey, NullValueMarker, expiration), ct).ConfigureAwait(false);
     }
 
-    private async Task SetHashNullValueAsync(string fullkey, TimeSpan expiration, CancellationToken ct)
+    private async Task SetHashNullValueAsync(string fullKey, TimeSpan expiration, CancellationToken ct)
     {
-        await ExecuteWithRetry(() => _db.HashSetAsync(fullkey, [new HashEntry("value", NullValueMarker) ]), ct);
-
-        await ExecuteWithRetry(() => _db.KeyExpireAsync(fullkey, expiration), ct);
+        // 使用 IBatch 将 HashSet 与 KeyExpire 合并为单次网络往返
+        await ExecuteWithRetry(async () =>
+        {
+            var batch = _db.CreateBatch();
+            var hashTask   = batch.HashSetAsync(fullKey, [new HashEntry(ValueField, NullValueMarker)]);
+            var expireTask = batch.KeyExpireAsync(fullKey, expiration);
+            batch.Execute();
+            await Task.WhenAll(hashTask, expireTask).ConfigureAwait(false);
+        }, ct).ConfigureAwait(false);
     }
 
 
@@ -664,16 +908,16 @@ public class RedisCaching : ICacheProvider
         // 这里不使用环境变量作为锁值，而是传入一个唯一值（比如 GUID），以支持同一进程内的重入锁和更安全的锁释放
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(_options.LockTimeout);
-        expiry = expiry ?? _options.DefaultLockExpiry;
+        expiry ??= _options.DefaultLockExpiry;
 
         // 注意：StackExchange.Redis 的 LockTakeAsync 方法会自动处理锁的过期和安全释放，所以我们不需要在这里实现复杂的锁续期逻辑
-        return await ExecuteWithRetry(() => _db.LockTakeAsync(lockKey, lockValue, expiry.Value), cts.Token);
+        return await ExecuteWithRetry(() => _db.LockTakeAsync(lockKey, lockValue, expiry.Value), cts.Token).ConfigureAwait(false);
     }
 
     private async Task ReleaseLockAsync(string lockKey, string lockValue, CancellationToken ct)
     {
         // 释放锁时必须提供相同的 lockValue，确保只有持有锁的实例才能释放锁，防止误删他人锁
-        await ExecuteWithRetry(() => _db.LockReleaseAsync(lockKey, lockValue), ct);
+        await ExecuteWithRetry(() => _db.LockReleaseAsync(lockKey, lockValue), ct).ConfigureAwait(false);
     }
 
 
@@ -688,9 +932,9 @@ public class RedisCaching : ICacheProvider
     private async Task<T?> ProcessEnvelopeHitAsync<T>(HashEntry[] hashEntries, string fullKey, CancellationToken ct)
     {
         // 从抽屉里拿出各个字段
-        var valueEntry = hashEntries.FirstOrDefault(x => x.Name == "value").Value;
-        var absExpEntry = hashEntries.FirstOrDefault(x => x.Name == "absExp").Value;
-        var sldExpEntry = hashEntries.FirstOrDefault(x => x.Name == "sldExp").Value;
+        var valueEntry = hashEntries.FirstOrDefault(x => x.Name == ValueField).Value;
+        var absExpEntry = hashEntries.FirstOrDefault(x => x.Name == AbsoluteExpirationField).Value;
+        var sldExpEntry = hashEntries.FirstOrDefault(x => x.Name == SlidingExpirationField).Value;
 
         if (!valueEntry.HasValue) return default;
 
@@ -707,28 +951,13 @@ public class RedisCaching : ICacheProvider
             if (DateTimeOffset.UtcNow > absTime)
             {
                 _logger.LogDebug("缓存已过绝对生存期，逻辑删除: {Key}", fullKey);
-                await ExecuteWithRetry(()=> _db.KeyDeleteAsync(fullKey), ct);
+                await ExecuteWithRetry(() => _db.KeyDeleteAsync(fullKey), ct).ConfigureAwait(false);
                 return default;
             }
         }
 
-        if (sldExpEntry.HasValue && sldExpEntry.TryParse(out long sldTicks))
-        {
-            var newTtl = TimeSpan.FromTicks(sldTicks);
-
-
-            if (absExpEntry.HasValue && absExpEntry.TryParse(out long absTicksForTruncate))
-            {
-                var absTime = new DateTimeOffset(absTicksForTruncate, TimeSpan.Zero);
-                var maxRemaining = absTime - DateTimeOffset.UtcNow;
-                if (newTtl > maxRemaining) newTtl = maxRemaining;
-            }
-
-            if (newTtl > TimeSpan.Zero)
-            {
-                await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, newTtl), ct);
-            }
-        }
+        // 命中时不再自动滑动续期，避免热路径额外 Expire 往返；需要续期时显式调用 RefreshAsync。
+        _ = sldExpEntry;
 
         _cacheHits.Add(1);
         _logger.LogDebug("缓存命中: {Key}", fullKey);
@@ -738,39 +967,66 @@ public class RedisCaching : ICacheProvider
 
 
     /// <summary>
-    /// 将 Redis 值智能反序列化为目标类型
+    /// 将 Redis 值智能反序列化为目标类型。
+    /// <para>
+    /// 类型元数据通过 <see cref="TypeCache{T}"/> 静态缓存，避免每次反射开销。
+    /// 值类型（对应 SetValueAsync 中 IsPrimitive || IsValueType 存储路径）从字符串解析；
+    /// 引用类型从二进制字节反序列化，不产生额外字符串分配。
+    /// </para>
     /// </summary>
-    /// <typeparam name="T">要反序列化的类型</typeparam>
-    /// <param name="redisValue">Redis 中存储的值</param>
-    /// <returns>反序列化后的对象，如果无法反序列化则返回默认值</returns>
     private T? SmartDeserialize<T>(RedisValue redisValue)
     {
-        var value = redisValue.ToString();
+        if (!redisValue.HasValue) return default;
 
-        var type = typeof(T);
+        // 快速路径：string 类型无需任何类型解析
+        if (TypeCache<T>.IsString)
+            return (T)(object)redisValue.ToString();
 
-        if (type == typeof(string))
-            return (T)(object)value;
+        var underlyingType = TypeCache<T>.UnderlyingType;
 
-        var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
+        // 引用类型：以二进制存储，直接反序列化，避免 ToString() 分配
+        if (!TypeCache<T>.IsStringRepresented)
+            return _serializer.Deserialize<T>((byte[])redisValue!);
+
+        // 值类型：以 ToString() 存储（对应 SetValueAsync 存储路径），从字符串还原
+        var str = redisValue.ToString();
 
         if (underlyingType.IsEnum)
-            return (T)Enum.Parse(underlyingType, value, ignoreCase: true);
+            return (T)Enum.Parse(underlyingType, str, ignoreCase: true);
 
         if (underlyingType == typeof(Guid))
-            return (T)(object)Guid.Parse(value);
+            return (T)(object)Guid.Parse(str);
 
         if (underlyingType == typeof(DateTime))
-            return (T)(object)DateTime.Parse(value);
+            return (T)(object)DateTime.Parse(str, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
         if (underlyingType == typeof(DateTimeOffset))
-            return (T)(object)DateTimeOffset.Parse(value);
+            return (T)(object)DateTimeOffset.Parse(str, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
-        if (underlyingType.IsPrimitive || underlyingType == typeof(decimal))
-            return (T)Convert.ChangeType(value, underlyingType);
+        if (underlyingType == typeof(TimeSpan))
+            return (T)(object)TimeSpan.Parse(str, CultureInfo.InvariantCulture);
 
-        // 复杂对象
-        return _serializer.Deserialize<T>(redisValue);
+        return (T)Convert.ChangeType(str, underlyingType, CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// 按泛型参数 T 缓存常用类型元数据，CLR 保证每个 T 只初始化一次，零额外分配。
+    /// </summary>
+    private static class TypeCache<T>
+    {
+        /// <summary>去掉 Nullable 包装后的实际类型，对非 Nullable 类型等于 typeof(T)。</summary>
+        public static readonly Type UnderlyingType = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+
+        /// <summary>是否为 string 类型（string 在 SetValueAsync 中走独立分支存储为 RedisValue 字符串）。</summary>
+        public static readonly bool IsString = typeof(T) == typeof(string);
+
+        /// <summary>
+        /// 是否以字符串形式存入 Redis。
+        /// 与 SetValueAsync 中 <c>IsPrimitive || IsValueType</c> 分支保持对称，
+        /// 包括 int/bool/double 等基元类型、Guid、DateTime、DateTimeOffset、TimeSpan、decimal 等值类型。
+        /// </summary>
+        public static readonly bool IsStringRepresented =
+            !IsString && (UnderlyingType.IsPrimitive || UnderlyingType.IsValueType);
     }
 
 

@@ -1,10 +1,10 @@
 using Core.Interfaces;
 using Core.Interfaces.Cache;
-using Core.Models.Identity;
 using Infrastructure.Caching;
-using Infrastructure.Models.DbContext;
-using Infrastructure.Serializer;
-using Infrastructure.Services.Identity;
+using Infrastructure.Data;
+using Infrastructure.Serialization;
+using Infrastructure.Messaging;
+using Infrastructure.Services.Utilities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -31,13 +31,15 @@ public static class InfrastructureExtensions
 
             // 注册 TSID 生成器为单例服务
             services.AddSingleton<ITsidGenerator, TsidGeneratorService>();
-            // 注册 UserDbContext，使用 PostgreSQL 数据库
-            services.AddDbContext<UserDbContext>(op=>op.UseNpgsql(connectionString));
-
-            // 注册 ASP.NET Core Identity 服务，使用 ApplicationUser 和 ApplicationRoles，并指定 UserDbContext 作为存储
-            services.AddIdentityCore<ApplicationUser>()
-                .AddRoles<ApplicationRoles>()
-                .AddEntityFrameworkStores<UserDbContext>();
+            services.AddSingleton<RealtimeDomainOutboxInterceptor>();
+            // 连接池 + 命令超时；DbContextPool 降低上下文分配开销
+            services.AddDbContextPool<UserDbContext>((serviceProvider, options) => options
+                .UseNpgsql(connectionString, npgsql =>
+                {
+                    npgsql.CommandTimeout(15);
+                    npgsql.EnableRetryOnFailure(maxRetryCount: 2, maxRetryDelay: TimeSpan.FromSeconds(2), errorCodesToAdd: null);
+                })
+                .AddInterceptors(serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>()));
 
             return services;
         }
@@ -45,9 +47,10 @@ public static class InfrastructureExtensions
         public async Task<IServiceCollection> AddRedisCacheServices(IConfiguration configuration)
         {
 
-            await services.AddRedis(configuration);
+            await services.AddGarnet(configuration);
             services.AddSerializer();
-            services.AddSingleton<RedisCacheOptions>();
+            // 从配置文件 GarnetCache 节绑定选项，而不是使用默认实例
+            services.Configure<RedisCacheOptions>(configuration.GetSection(RedisCacheOptions.SectionName));
             services.AddSingleton<ICacheProvider, RedisCaching>();
             return services;
         }
@@ -58,20 +61,18 @@ public static class InfrastructureExtensions
         }
 
         /// <summary>
-        /// 添加Redis缓存服务到服务集合中
+        /// 添加 Garnet（Redis 兼容）缓存服务到服务集合中
         /// </summary>
-        /// <param name="configuration">应用程序配置，用于获取Redis连接字符串和其他相关设置</param>
-        /// <returns>包含已注册Redis缓存服务的服务集合</returns>
-        private async Task AddRedis(IConfiguration configuration)
+        private async Task AddGarnet(IConfiguration configuration)
         {
-            var redisConnStr = configuration.GetConnectionString("Redis");
-            var configurationOptions = ConfigurationOptions.Parse(redisConnStr ?? throw new InvalidOperationException(), true);
-            //configurationOptions.ResolveDns = true;
-            configurationOptions.ResolveDns = false;      // 本地开发必关！直接用 IP 连，不走 DNS
-            configurationOptions.ConnectTimeout = 3000;   // 3 秒没连上就立刻报错
-            configurationOptions.SyncTimeout = 3000;      // 同步操作超时
+            var connStr = configuration.GetConnectionString("Garnet");
+            var configurationOptions = ConfigurationOptions.Parse(connStr ?? throw new InvalidOperationException("未找到 Garnet 连接字符串"), true);
+            configurationOptions.ResolveDns = false;
+            // 总重试预算控制在约 1s 内，缓存故障时快速失败返回 503，避免打满线程池。
+            configurationOptions.ConnectTimeout = 1000;
+            configurationOptions.SyncTimeout = 1000;
             configurationOptions.AbortOnConnectFail = false;
-            configurationOptions.ConnectRetry = 3;
+            configurationOptions.ConnectRetry = 1;
             configurationOptions.KeepAlive = 180;
 
             var multiplexer = await ConnectionMultiplexer.ConnectAsync(configurationOptions).ConfigureAwait(false);

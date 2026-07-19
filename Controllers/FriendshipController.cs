@@ -1,0 +1,261 @@
+using System.Security.Claims;
+using Core.Interfaces;
+using Core.Models.Common;
+using Core.Models.Friend;
+using Core.Models.Friend.Requests;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+
+namespace ChatApp.Server.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+[Authorize]
+public class FriendshipController(
+    IFriendshipService friendshipService) : ControllerBase
+{
+    /// <summary>
+    /// 好友列表
+    /// </summary>
+    /// <returns></returns>
+    [HttpGet("all")]
+    public Task<CursorPage<FriendDto>> GetAllFriends(
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50)
+    {
+        return friendshipService.GetFriendsAsync<FriendDto>(
+            GetCurrentUserId(),
+            f => new FriendDto
+            {
+                FriendId   = f.FriendId,
+                FriendName = f.Friend!.UserName,
+                Note       = f.Note,
+                CreatedAt  = f.CreatedAt,
+                GroupId    = f.GroupId,
+                GroupName  = f.Group != null ? f.Group.GroupName : null,
+                AvatarUrl  = f.Friend!.AvatarUrl
+            },
+            cursor,
+            limit);
+    }
+
+    /// <summary>
+    /// 删除指定的好友。
+    /// </summary>
+    /// <param name="friendId">要删除的好友ID。</param>
+    /// <returns>表示异步操作的结果，成功时返回200 OK，失败时返回400 Bad Request。</returns>
+    [HttpDelete("{friendId:long}")]
+    public async Task<IActionResult> DeleteFriend([FromRoute] long friendId)
+    {
+        var result = await friendshipService.DeleteFriendshipAsync(
+            GetCurrentUserId(), friendId);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 发送好友请求
+    /// </summary>
+    /// <param name="request">包含目标用户ID和可选消息的请求对象</param>
+    /// <returns>表示请求发送结果的操作结果</returns>
+    [HttpPost("requests")]
+    public async Task<IActionResult> SendFriendRequest(
+        [FromBody] SendFriendRequestRequest request)
+    {
+        var result = await friendshipService.SendRequestAsync(
+            GetCurrentUserId(), request.TargetUserId, request.Message);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 接受来自指定用户的好友请求。
+    /// </summary>
+    /// <param name="requesterId">请求方用户的ID。</param>
+    /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含新添加的好友信息。</returns>
+    [HttpPut("requests/{requesterId:long}/accept")]
+    public async Task<IActionResult> AcceptFriendRequest([FromRoute] long requesterId)
+    {
+        var result = await friendshipService.AcceptRequestAsync(
+            GetCurrentUserId(), requesterId);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 拒绝好友请求。
+    /// </summary>
+    /// <param name="requesterId">请求方用户ID。</param>
+    /// <param name="blockAfterDecline">拒绝后是否拉黑请求方，默认为false。</param>
+    /// <returns>操作结果，成功返回200 OK，失败返回400 Bad Request。</returns>
+    [HttpPut("requests/{requesterId:long}/decline")]
+    public async Task<IActionResult> DeclineFriendRequest(
+        [FromRoute] long requesterId,
+        [FromQuery] bool blockAfterDecline = false)
+    {
+        var result = await friendshipService.DeclineRequestAsync(
+            GetCurrentUserId(), requesterId, blockAfterDecline);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 获取当前用户的所有待处理的入站好友请求。
+    /// </summary>
+    /// <returns>一个包含所有入站好友请求的异步可枚举集合。</returns>
+    [HttpGet("requests/incoming")] // ← 拆成两个端点
+    public Task<CursorPage<FriendRequestDto>> GetIncomingRequests(
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50)
+    {
+        return friendshipService.GetRequestsAsync<FriendRequestDto>(
+            GetCurrentUserId(),
+            r => new FriendRequestDto
+            {
+                RequestId    = r.RequestId,
+                RequesterId  = r.RequesterId,
+                TargetUserId = r.TargetUserId,
+                Message      = r.Message,
+                Status       = r.Status,
+                CreatedAt    = r.CreatedAt
+            },
+            FriendRequestType.Incoming,
+            cursor,
+            limit);
+    }
+
+    /// <summary>
+    /// 获取当前用户发出的好友请求列表。
+    /// </summary>
+    /// <returns>一个包含好友请求信息的异步可枚举集合。</returns>
+    [HttpGet("requests/outgoing")]
+    public Task<CursorPage<FriendRequestDto>> GetOutgoingRequests(
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50)
+    {
+        return friendshipService.GetRequestsAsync<FriendRequestDto>(
+            GetCurrentUserId(),
+            r => new FriendRequestDto
+            {
+                RequestId    = r.RequestId,
+                RequesterId  = r.RequesterId,
+                TargetUserId = r.TargetUserId,
+                Message      = r.Message,
+                Status       = r.Status,
+                CreatedAt    = r.CreatedAt
+            },
+            FriendRequestType.Outgoing,
+            cursor,
+            limit);
+    }
+
+
+    /// <summary>
+    /// 拉黑指定用户
+    /// </summary>
+    /// <param name="request">包含目标用户ID的请求对象</param>
+    /// <returns>返回操作结果，成功时为Ok响应，失败时为BadRequest响应</returns>
+    [HttpPost("block")]
+    public async Task<IActionResult> BlockUser([FromBody] BlockUserRequest request)
+    {
+        var result = await friendshipService.BlockUserAsync(
+            GetCurrentUserId(), request.TargetUserId);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 解除对指定用户的拉黑状态。
+    /// </summary>
+    /// <param name="targetUserId">要解除拉黑的目标用户ID。</param>
+    /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含解封信息，失败时包含错误详情。</returns>
+    [HttpDelete("block/{targetUserId:long}")]
+    public async Task<IActionResult> UnblockUser([FromRoute] long targetUserId)
+    {
+        var result = await friendshipService.UnblockUserAsync(
+            GetCurrentUserId(), targetUserId);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 获取当前用户已屏蔽的用户列表。
+    /// </summary>
+    /// <returns>一个包含被屏蔽用户信息的异步可枚举集合。</returns>
+    [HttpGet("blocked")]
+    public Task<CursorPage<BlockedUserDto>> GetBlockedUsers(
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50)
+    {
+        return friendshipService.GetBlockedUsersAsync<BlockedUserDto>(
+            GetCurrentUserId(),
+            b => new BlockedUserDto
+            {
+                UserId    = b.BlockedUserId,
+                UserName  = b.BlockedUser!.UserName,
+                AvatarUrl = b.BlockedUser.AvatarUrl,
+                BlockedAt = b.BlockedAt
+            },
+            cursor,
+            limit);
+    }
+
+    /// <summary>
+    /// 更新指定好友的备注信息。
+    /// </summary>
+    /// <param name="friendId">要更新备注的好友ID。</param>
+    /// <param name="request">包含新备注信息的请求对象。</param>
+    /// <returns>如果操作成功，返回200状态码；如果失败，返回400状态码及错误详情。</returns>
+    [HttpPut("friends/{friendId:long}/note")]
+    public async Task<IActionResult> UpdateFriendNote(
+        [FromRoute] long friendId, [FromBody] UpdateNoteRequest request)
+    {
+        var result = await friendshipService.UpdateFriendNoteAsync(
+            GetCurrentUserId(), friendId, request.Note);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 将好友分配到指定的分组
+    /// </summary>
+    /// <param name="friendId">要分配的好友ID</param>
+    /// <param name="request">包含目标分组ID的请求对象</param>
+    /// <returns>返回操作结果，成功时返回200 OK，失败时返回400 Bad Request</returns>
+    [HttpPut("friends/{friendId:long}/group")]
+    public async Task<IActionResult> AssignFriendToGroup(
+        [FromRoute] long friendId, [FromBody] AssignGroupRequest request)
+    {
+        var result = await friendshipService.AssignFriendToGroupAsync(
+            GetCurrentUserId(), friendId, request.GroupId);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>
+    /// 搜索好友（支持名称/备注搜索）
+    /// </summary>
+    /// <param name="searchTerm">用于搜索的好友名称或备注关键字</param>
+    /// <returns>符合条件的好友搜索结果列表</returns>
+    [HttpGet("search")]
+    public Task<CursorPage<FriendSearchResultDto>> SearchFriends(
+        [FromQuery] string searchTerm,
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50)
+    {
+        return friendshipService.SearchFriendsAsync(
+            GetCurrentUserId(), searchTerm, cursor, limit);
+    }
+
+    #region 辅助方法
+    private long GetCurrentUserId()
+    {
+        var claim = User.FindFirstValue(ClaimTypes.NameIdentifier);
+        return long.TryParse(claim, out var id)
+            ? id
+            : throw new UnauthorizedAccessException("无效的用户凭证");
+    }
+
+
+   
+    private IActionResult HandleServiceResult(FriendshipOperationResult result)
+        => result.IsSuccess ? Ok(new ApiResponse(result)) : BadRequest(result);
+
+
+   
+    private IActionResult HandleServiceResult<T>(FriendshipOperationResult<T> result)
+        => result.Succeeded ? Ok(new ApiResponse(result.Data)) : BadRequest(result);
+    #endregion
+}

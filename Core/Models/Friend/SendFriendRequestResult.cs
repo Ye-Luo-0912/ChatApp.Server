@@ -1,5 +1,3 @@
-using Core.Models.DTOs;
-
 namespace Core.Models.Friend;
 
 public class SendFriendRequestResult : FriendshipOperationResult

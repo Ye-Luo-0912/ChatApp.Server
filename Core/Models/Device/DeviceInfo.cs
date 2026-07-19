@@ -31,4 +31,9 @@ public class DeviceInfo
     /// 设备类型（自动识别，如 Mobile/Desktop）
     /// </summary>
     public string? DeviceType { get; set; }
+
+    /// <summary>
+    /// 客户端原始 User-Agent 字符串，用于设备指纹生成和安全审计。
+    /// </summary>
+    public string? UserAgent { get; set; }
 }

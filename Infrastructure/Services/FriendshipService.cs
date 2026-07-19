@@ -1,10 +1,9 @@
 ﻿using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
-using Core.Models.DTOs;
+using Core.Models.Common;
 using Core.Models.Friend;
-using Infrastructure.Models.DbContext;
+using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -16,12 +15,10 @@ namespace Infrastructure.Services;
 public class FriendshipService(UserDbContext context, ICacheProvider cacheService, ILogger<FriendshipService> logger)
     : IFriendshipService
 {
-    private const string FriendListCacheKey = "FriendList_{0}";
-    private const string RequestListCacheKey = "RequestList_{0}_{1}"; // {userId}_{requestType}
     private const string RelationshipCacheKey = "Relationship_{0}_{1}"; // {userId1}_{userId2}
 
-    private const string CacheIncomingStr = nameof(FriendRequestType.Incoming);
-    private const string CacheOutgoingStr = nameof(FriendRequestType.Outgoing);
+    private const int DefaultPageLimit = 50;
+    private const int MaxPageLimit = 100;
 
 
     private readonly ILogger<FriendshipService> _logger = logger;
@@ -105,21 +102,15 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
     private async Task<SendFriendRequestResult> RestoreFriendshipAsync(UserFriendEntry requesterRecord,
         long requesterId, long targetUserId, CancellationToken ct)
     {
-        await using var transaction = await context.Database
-            .BeginTransactionAsync(ct)
-            .ConfigureAwait(false);
-
         try
         {
             requesterRecord.IsDeleted = false;
             requesterRecord.DeletedAt = null;
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex, "恢复好友关系失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
                 requesterId, targetUserId);
             return SendFriendRequestResult.Failed(FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
@@ -173,7 +164,6 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         }
 
         
-        await using var transaction = await context.Database.BeginTransactionAsync(ct) .ConfigureAwait(false);
         try
         {
             if (existingRequest is null)
@@ -197,35 +187,19 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             }
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogDebug("{name} --> 该操作被取消", nameof(CreateOrUpdateRequestAsync));
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex, "发送好友请求失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
                 requesterId, targetUserId);
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError,
                 "操作失败，请稍后重试");
-        }
-
-        // 缓存清理
-        try
-        {
-            await Task.WhenAll(
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, targetUserId, CacheIncomingStr), ct),
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, requesterId, CacheOutgoingStr), ct)
-            ).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "发送好友请求后缓存清理失败");
         }
 
         return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestSent);
@@ -240,10 +214,6 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         try
         {
             await Task.WhenAll(
-                cacheService.RemoveAsync(string.Format(FriendListCacheKey, userId1), ct),
-                cacheService.RemoveAsync(string.Format(FriendListCacheKey, userId2), ct),
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, userId1, CacheIncomingStr), ct),
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, userId2, CacheOutgoingStr), ct),
                 cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId1, userId2), ct),
                 cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId2, userId1), ct)
             ).ConfigureAwait(false);
@@ -440,28 +410,19 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 "操作失败，请稍后重试");
         }
 
-        // 缓存清理
-        try
+        if (blockAfterDecline)
         {
-            var tasks = new List<Task>
+            try
             {
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, declinerId, CacheIncomingStr), ct),
-                cacheService.RemoveAsync(string.Format(RequestListCacheKey, requesterId, CacheOutgoingStr), ct)
-            };
-
-            if (blockAfterDecline)
-            {
-                tasks.Add(cacheService.RemoveAsync(string.Format(FriendListCacheKey, declinerId), ct));
-                tasks.Add(cacheService.RemoveAsync(string.Format(FriendListCacheKey, requesterId), ct));
-                tasks.Add(cacheService.RemoveAsync(string.Format(RelationshipCacheKey, declinerId, requesterId), ct));
-                tasks.Add(cacheService.RemoveAsync(string.Format(RelationshipCacheKey, requesterId, declinerId), ct));
+                await Task.WhenAll(
+                    cacheService.RemoveAsync(string.Format(RelationshipCacheKey, declinerId, requesterId), ct),
+                    cacheService.RemoveAsync(string.Format(RelationshipCacheKey, requesterId, declinerId), ct)
+                ).ConfigureAwait(false);
             }
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "拒绝好友请求后缓存清理失败");
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "拒绝好友请求后缓存清理失败");
+            }
         }
 
         return FriendshipOperationResult.Success(request.RequesterId.ToString());
@@ -665,39 +626,40 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
     /// <summary>
     /// 获取好友列表
     /// </summary>
-    /// <typeparam name="T">返回类型</typeparam>
-    /// <param name="userId">用户ID</param>
-    /// <param name="func">投影表达式</param>
-    /// <param name="ct"></param>
-    /// <returns>好友列表</returns>
-    public async IAsyncEnumerable<T> GetFriendsAsync<T>(long userId, Expression<Func<UserFriendEntry, T>> func,[EnumeratorCancellation] CancellationToken ct = default)
-        where T : class
+    public async Task<CursorPage<T>> GetFriendsAsync<T>(long userId, Expression<Func<UserFriendEntry, T>> func,
+        string? cursor = null, int limit = DefaultPageLimit, CancellationToken ct = default) where T : class
     {
-        var friends = context.Friendships
-            .Where(f => f.UserId == userId)
-            .Include(f => f.Friend)
-            .Select(func)
-            .AsNoTracking();
+        var pageSize = ClampLimit(limit);
+        var cursorId = ParseCursor(cursor);
 
-        await foreach (var item in friends.AsAsyncEnumerable().WithCancellation(ct))
-        {
-            yield return item;
-        }
+        var query = context.Friendships
+            .Where(f => f.UserId == userId);
+
+        if (cursorId.HasValue)
+            query = query.Where(f => f.FriendId > cursorId.Value);
+
+        var entries = await query
+            .OrderBy(f => f.FriendId)
+            .Take(pageSize + 1)
+            .Include(f => f.Friend)
+            .Include(f => f.Group)
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        return BuildPage(entries, pageSize, e => e.FriendId, func);
     }
 
     /// <summary>
     /// 获取好友请求列表
     /// </summary>
-    /// <typeparam name="T">返回类型</typeparam>
-    /// <param name="userId">用户ID</param>
-    /// <param name="func">投影表达式</param>
-    /// <param name="requestType">请求类型（Incoming/Outgoing）</param>
-    /// <param name="ct"></param>
-    /// <returns>请求列表</returns>
-    public async IAsyncEnumerable<T> GetRequestsAsync<T>(long userId, Expression<Func<FriendRequest, T>> func,
-        FriendRequestType requestType,[EnumeratorCancellation] CancellationToken ct = default) where T : class
+    public async Task<CursorPage<T>> GetRequestsAsync<T>(long userId, Expression<Func<FriendRequest, T>> func,
+        FriendRequestType requestType, string? cursor = null, int limit = DefaultPageLimit,
+        CancellationToken ct = default) where T : class
     {
-        // 收到请求和发出请求共用一套投影逻辑，只是起始查询条件不同。
+        var pageSize = ClampLimit(limit);
+        var cursorId = ParseCursor(cursor);
+
         var query = requestType switch
         {
             FriendRequestType.Incoming => context.FriendRequests.Where(r => r.TargetUserId == userId),
@@ -705,17 +667,21 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             _ => throw new ArgumentOutOfRangeException(nameof(requestType))
         };
 
-        var results = query
-            .Where(r => r.Status == RequestStatus.Pending)
+        query = query.Where(r => r.Status == RequestStatus.Pending);
+
+        if (cursorId.HasValue)
+            query = query.Where(r => r.RequestId > cursorId.Value);
+
+        var entries = await query
+            .OrderBy(r => r.RequestId)
+            .Take(pageSize + 1)
             .Include(r => r.Requester)
             .Include(r => r.TargetUser)
-            .Select(func)
-            .AsNoTracking();
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
 
-        await foreach (var item in results.AsAsyncEnumerable().WithCancellation(ct))
-        {
-            yield return item;
-        }
+        return BuildPage(entries, pageSize, r => r.RequestId, func);
     }
 
     /// <summary>
@@ -776,16 +742,6 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 "操作失败，请稍后重试");
         }
 
-        try
-        {
-            await cacheService.RemoveAsync(string.Format(FriendListCacheKey, userId), ct)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "更新备注后缓存清理失败");
-        }
-
         return FriendshipOperationResult.Success();
     }
 
@@ -832,7 +788,6 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         try
         {
             await Task.WhenAll(
-                cacheService.RemoveAsync(string.Format(FriendListCacheKey, userId), ct),
                 cacheService.RemoveAsync($"FriendGroup_{userId}_{originalGroup}", ct),
                 cacheService.RemoveAsync($"FriendGroup_{userId}_{groupId}", ct)
             ).ConfigureAwait(false);
@@ -848,66 +803,84 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
     /// <summary>
     /// 搜索好友
     /// </summary>
-    /// <param name="userId">用户ID</param>
-    /// <param name="searchTerm">搜索词</param>
-    /// <param name="ct"></param>
-    /// <returns>搜索结果</returns>
-    /// <exception cref="ArgumentNullException"></exception>
-    public async IAsyncEnumerable<FriendSearchResultDto> SearchFriendsAsync(long userId, string searchTerm,[EnumeratorCancellation] CancellationToken ct = default)
+    public async Task<CursorPage<FriendSearchResultDto>> SearchFriendsAsync(long userId, string searchTerm,
+        string? cursor = null, int limit = DefaultPageLimit, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(searchTerm) || searchTerm.Length < 2)
             throw new ArgumentException("搜索关键词至少需要 2 个字符。");
+
+        var pageSize = ClampLimit(limit);
+        var cursorId = ParseCursor(cursor);
 
         // 对通配符做转义，避免用户输入 % 时把 Like 查询放大。  
         var safeSearchTerm = searchTerm.Replace("%", @"\%").Replace("_", @"\_");
         var cleanSearchTerm = $"%{safeSearchTerm}%";
 
-        var query = from f in context.Friendships
-            // 匹配 UserId
-            where  f.UserId == userId
-            // 模糊搜索
-            where EF.Functions.ILike(f.Friend!.UserName!, cleanSearchTerm) ||
-                  EF.Functions.ILike(f.Note!, cleanSearchTerm)
-            // 按照用户名排序
-            orderby f.Friend!.UserName
-            select new FriendSearchResultDto
-            {
-                FriendId = f.Friend!.Id,
-                FriendName = f.Friend.UserName,
-                Note = f.Note,
-                LastInteractionAt = f.Friend.LastLoginDate
-            };
+        var query = context.Friendships
+            .Where(f => f.UserId == userId)
+            .Where(f => EF.Functions.ILike(f.Friend!.UserName!, cleanSearchTerm) ||
+                        EF.Functions.ILike(f.Note!, cleanSearchTerm));
 
-        await foreach (var item in query.AsNoTracking().AsAsyncEnumerable().WithCancellation(ct))
+        if (cursorId.HasValue)
+            query = query.Where(f => f.FriendId > cursorId.Value);
+
+        var entries = await query
+            .OrderBy(f => f.FriendId)
+            .Take(pageSize + 1)
+            .Include(f => f.Friend)
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var hasMore = entries.Count > pageSize;
+        if (hasMore)
+            entries.RemoveAt(entries.Count - 1);
+
+        var items = entries.Select(f => new FriendSearchResultDto
         {
-            yield return item;
-        }
+            FriendId = f.Friend!.Id,
+            FriendName = f.Friend.UserName,
+            Note = f.Note,
+            LastInteractionAt = f.Friend.LastLoginDate
+        }).ToList();
+
+        return new CursorPage<FriendSearchResultDto>
+        {
+            Items = items,
+            HasMore = hasMore,
+            NextCursor = hasMore && entries.Count > 0 ? entries[^1].FriendId.ToString() : null
+        };
     }
 
 
     /// <summary>
     /// 获取被指定用户封禁的用户列表
     /// </summary>
-    /// <typeparam name="T">选择器返回的对象类型</typeparam>
-    /// <param name="userId">查询封禁记录的用户ID</param>
-    /// <param name="selector">用于从BlockRecord实体中选择和转换数据的表达式</param>
-    /// <param name="ct">用于取消操作的CancellationToken</param>
-    /// <returns>返回一个异步可枚举集合，包含根据选择器转换后的被封禁用户信息</returns>
-    public async IAsyncEnumerable<T> GetBlockedUsersAsync<T>(
+    public async Task<CursorPage<T>> GetBlockedUsersAsync<T>(
         long userId,
         Expression<Func<BlockRecord, T>> selector,
-        [EnumeratorCancellation] CancellationToken ct = default) where T : class
+        string? cursor = null,
+        int limit = DefaultPageLimit,
+        CancellationToken ct = default) where T : class
     {
-        var query = context.BlockRecords
-            .Where(b => b.BlockerId == userId)
-            .Include(b => b.BlockedUser)     // 需确认导航属性名
-            .Select(selector)
-            .AsNoTracking();
+        var pageSize = ClampLimit(limit);
+        var cursorId = ParseCursor(cursor);
 
-        await foreach (var item in query.AsAsyncEnumerable().WithCancellation(ct))
-        {
-            yield return item;
-        }
+        var query = context.BlockRecords
+            .Where(b => b.BlockerId == userId);
+
+        if (cursorId.HasValue)
+            query = query.Where(b => b.BlockedUserId > cursorId.Value);
+
+        var entries = await query
+            .OrderBy(b => b.BlockedUserId)
+            .Take(pageSize + 1)
+            .Include(b => b.BlockedUser)
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        return BuildPage(entries, pageSize, b => b.BlockedUserId, selector);
     }
 
     /// <summary>
@@ -959,5 +932,32 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         }
 
         return new FriendshipStatusInfo { IsMutual = false, Status = FriendshipStatus.None };
+    }
+
+    private static int ClampLimit(int limit) =>
+        Math.Clamp(limit <= 0 ? DefaultPageLimit : limit, 1, MaxPageLimit);
+
+    private static long? ParseCursor(string? cursor) =>
+        long.TryParse(cursor, out var id) ? id : null;
+
+    private static CursorPage<T> BuildPage<TEntity, T>(
+        List<TEntity> entries,
+        int limit,
+        Func<TEntity, long> idSelector,
+        Expression<Func<TEntity, T>> projector) where T : class
+    {
+        var hasMore = entries.Count > limit;
+        if (hasMore)
+            entries.RemoveAt(entries.Count - 1);
+
+        var compiled = projector.Compile();
+        var items = entries.Select(compiled).ToList();
+
+        return new CursorPage<T>
+        {
+            Items = items,
+            HasMore = hasMore,
+            NextCursor = hasMore && entries.Count > 0 ? idSelector(entries[^1]).ToString() : null
+        };
     }
 }

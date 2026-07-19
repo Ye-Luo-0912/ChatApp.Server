@@ -1,4 +1,4 @@
-using Core.Models.DTOs;
+using Core.Models.Email;
 
 namespace Core.Interfaces;
 
