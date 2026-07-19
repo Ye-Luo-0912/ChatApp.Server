@@ -7,8 +7,8 @@ namespace Core.Interfaces;
 /// </summary>
 public interface IUserRepository
 {
-    Task<ApplicationUser?> FindByIdAsync(long userId);
-    Task<ApplicationUser?> FindByNameAsync(string username);
-    Task<bool> UpdateAsync(ApplicationUser user);
-    Task<bool> DeleteAsync(ApplicationUser user);
+    Task<ApplicationUser?> FindByIdAsync(long userId, CancellationToken cancellationToken = default);
+    Task<ApplicationUser?> FindByNameAsync(string username, CancellationToken cancellationToken = default);
+    Task<bool> UpdateAsync(ApplicationUser user, CancellationToken cancellationToken = default);
+    Task<bool> DeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default);
 }

@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- 统一解决方案配置，避免 Release 引用到依赖项目的 Debug 产物 -->
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+  </PropertyGroup>
+</Project>

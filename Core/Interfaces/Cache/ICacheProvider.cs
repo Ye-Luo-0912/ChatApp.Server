@@ -116,6 +116,27 @@ public interface ICacheProvider
     bool IsHealthy { get; }
 
     /// <summary>
+    /// 以 Redis STRING 写入 JSON 载荷（单次 SET + TTL），用于访问令牌等热路径。
+    /// </summary>
+    Task SetStringPayloadAsync<T>(
+        string key,
+        T value,
+        TimeSpan absoluteExpiration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 以 Redis STRING 读取 JSON 载荷（单次 GET）。
+    /// </summary>
+    Task<T?> GetStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 在同一 MULTI/EXEC 事务中写入多条缓存（登录建会话等）。
+    /// </summary>
+    Task SetManyAsync(
+        IReadOnlyList<CacheSetRequest> writes,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 原子地消费一个缓存键：读取并反序列化后由 <paramref name="createPlan"/> 决定是否继续；
     /// 仅当键仍持有读取时的原始值时，才删除旧键并写入替换条目（CAS）。
     /// <para>

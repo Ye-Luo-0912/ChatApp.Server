@@ -646,13 +646,13 @@ public class RedisCaching : ICacheProvider
             if (plan is null)
                 return AtomicConsumeResult<TResult>.Fail();
 
-            var preparedWrites = new List<PreparedHashWrite>(plan.Writes.Count);
+            var preparedWrites = new List<PreparedWrite>(plan.Writes.Count);
             foreach (var write in plan.Writes)
             {
                 if (string.IsNullOrEmpty(write.Key))
                     throw new ArgumentException("原子写入条目的键不能为空", nameof(createPlan));
 
-                preparedWrites.Add(PrepareHashWrite(write));
+                preparedWrites.Add(PrepareWrite(write));
             }
 
             var tran = _db.CreateTransaction();
@@ -669,8 +669,16 @@ public class RedisCaching : ICacheProvider
 
             foreach (var write in preparedWrites)
             {
-                _ = tran.HashSetAsync(write.FullKey, write.Entries);
-                _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+                if (write.AsString)
+                {
+                    _ = tran.StringSetAsync(write.FullKey, write.StringPayload!);
+                    _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+                }
+                else
+                {
+                    _ = tran.HashSetAsync(write.FullKey, write.Entries!);
+                    _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+                }
             }
 
             var committed = await tran.ExecuteAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -702,16 +710,121 @@ public class RedisCaching : ICacheProvider
         }
     }
 
-    private PreparedHashWrite PrepareHashWrite(CacheSetRequest request)
+    /// <inheritdoc />
+    public async Task SetStringPayloadAsync<T>(
+        string key,
+        T value,
+        TimeSpan absoluteExpiration,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return;
+
+        var fullKey = NormalizeKey(key);
+        try
+        {
+            var bytes = _serializer.Serialize(value);
+            await ExecuteWithRetry(
+                    () => _db.StringSetAsync(fullKey, bytes, absoluteExpiration),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（StringPayload SET）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException and not CacheUnavailableException)
+        {
+            _logger.LogError(ex, "序列化失败（StringPayload SET）: {Key}", key);
+            throw new CacheSerializationException("对象序列化失败", ex);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<T?> GetStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return default;
+
+        var fullKey = NormalizeKey(key);
+        try
+        {
+            var value = await ExecuteWithRetry(() => _db.StringGetAsync(fullKey), cancellationToken)
+                .ConfigureAwait(false);
+            if (value.IsNullOrEmpty)
+                return default;
+
+            return _serializer.Deserialize<T>((byte[])value!);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（StringPayload GET）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "反序列化失败（StringPayload GET）: {Key}", key);
+            throw new CacheCorruptedException("缓存数据损坏", ex);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task SetManyAsync(
+        IReadOnlyList<CacheSetRequest> writes,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(writes);
+        if (writes.Count == 0)
+            return;
+
+        try
+        {
+            var prepared = writes.Select(PrepareWrite).ToList();
+            var tran = _db.CreateTransaction();
+            foreach (var write in prepared)
+            {
+                if (write.AsString)
+                {
+                    _ = tran.StringSetAsync(write.FullKey, write.StringPayload!);
+                    _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+                }
+                else
+                {
+                    _ = tran.HashSetAsync(write.FullKey, write.Entries!);
+                    _ = tran.KeyExpireAsync(write.FullKey, write.Ttl);
+                }
+            }
+
+            var ok = await tran.ExecuteAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!ok)
+                throw new CacheUnavailableException("批量写入事务未提交", new InvalidOperationException("MULTI/EXEC aborted"));
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（SetMany）");
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+    }
+
+    private PreparedWrite PrepareWrite(CacheSetRequest request)
     {
         var fullKey = NormalizeKey(request.Key);
+        var ttl = CalculateExpiration(request.SlidingExpiration, request.AbsoluteExpiration);
+
+        if (request.AsRedisString)
+        {
+            var payload = request.Value is string s
+                ? System.Text.Encoding.UTF8.GetBytes(s)
+                : _serializer.Serialize(request.Value);
+            return new PreparedWrite(fullKey, null, payload, ttl, AsString: true);
+        }
+
         var entries = new List<HashEntry>(3);
         var data = request.Value;
 
-        if (data is string s)
-        {
-            entries.Add(new HashEntry(ValueField, s));
-        }
+        if (data is string str)
+            entries.Add(new HashEntry(ValueField, str));
         else
         {
             var type = data.GetType();
@@ -735,11 +848,15 @@ public class RedisCaching : ICacheProvider
                 request.SlidingExpiration.Value.Ticks));
         }
 
-        var ttl = CalculateExpiration(request.SlidingExpiration, request.AbsoluteExpiration);
-        return new PreparedHashWrite(fullKey, entries.ToArray(), ttl);
+        return new PreparedWrite(fullKey, entries.ToArray(), null, ttl, AsString: false);
     }
 
-    private readonly record struct PreparedHashWrite(string FullKey, HashEntry[] Entries, TimeSpan Ttl);
+    private readonly record struct PreparedWrite(
+        string FullKey,
+        HashEntry[]? Entries,
+        byte[]? StringPayload,
+        TimeSpan Ttl,
+        bool AsString);
 
     /// <summary>
     /// 计算最终的过期时间，考虑滑动过期、绝对过期和默认值，并添加随机抖动以防止缓存雪崩
@@ -822,7 +939,12 @@ public class RedisCaching : ICacheProvider
                 await Task.WhenAll(hashTask, expireTask).ConfigureAwait(false);
             }, ct).ConfigureAwait(false);
         }
-        catch (Exception e)
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败: {Key}", fullKey);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+        catch (Exception e) when (e is not OperationCanceledException and not CacheUnavailableException)
         {
             _logger.LogError(e, "序列化失败: {Key}", fullKey);
             throw new CacheSerializationException("对象序列化失败", e);

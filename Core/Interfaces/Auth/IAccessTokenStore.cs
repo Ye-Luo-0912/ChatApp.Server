@@ -13,15 +13,15 @@ public interface IAccessTokenStore
     /// <summary>
     /// 写入访问令牌及其元数据，并设置绝对过期时间。
     /// </summary>
-    Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry);
+    Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 查询访问令牌对应的元数据。令牌不存在或已被撤销则返回 <see langword="null"/>。
     /// </summary>
-    Task<AccessTokenData?> GetAccessTokenAsync(string token);
+    Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 立即撤销访问令牌，使其在到期前失效（适用于主动登出场景）。
     /// </summary>
-    Task RevokeAccessTokenAsync(string token);
+    Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default);
 }

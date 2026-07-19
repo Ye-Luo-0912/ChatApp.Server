@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using Core.Models.Email;
 using Core.Models.Friend;
 using Core.Models.Identity;
 using ChatApp.Realtime.Integration.Outbox;
@@ -18,6 +19,7 @@ namespace Infrastructure.Data
         public DbSet<BlockRecord> BlockRecords { get; set; }
         public DbSet<FriendGroup> FriendGroups { get; set; }
         public DbSet<RealtimeIntegrationOutboxItem> RealtimeOutbox { get; set; }
+        public DbSet<EmailOutboxItem> EmailOutbox { get; set; }
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -55,6 +57,7 @@ namespace Infrastructure.Data
             builder.ApplyConfiguration(new FriendRequestConfig());
             builder.ApplyConfiguration(new BlockRecordConfig());
             builder.ApplyConfiguration(new FriendGroupConfig());
+            builder.ApplyConfiguration(new EmailOutboxItemConfig());
             builder.AddChatAppRealtimeOutbox();
         }
     }

@@ -1,32 +1,50 @@
 using Core.Interfaces;
 using Core.Models.Email;
+using Infrastructure.Data;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Infrastructure.Services.Email;
 
 /// <summary>
-/// API 侧邮件发送门面：入队后等待后台 worker 完成（带超时）。
+/// API 侧邮件发送门面：写入持久化 Outbox 后立即返回。
 /// </summary>
-public sealed class QueuedEmailSender(EmailQueue queue) : IEmailSender
+public sealed class QueuedEmailSender(
+    IServiceScopeFactory scopeFactory,
+    ITsidGenerator tsidGenerator,
+    EmailOutboxMetrics metrics) : IEmailSender
 {
-    private static readonly TimeSpan EnqueueWaitTimeout = TimeSpan.FromSeconds(25);
-
     public async Task<EmailResult> SendEmailAsync(
         string to, string subject, string body, bool isHtml = true, CancellationToken cancellation = default)
     {
-        var tcs = new TaskCompletionSource<EmailResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var item = new EmailWorkItem(to, subject, body, isHtml, tcs);
+        if (string.IsNullOrWhiteSpace(to)
+            || string.IsNullOrWhiteSpace(subject)
+            || string.IsNullOrWhiteSpace(body))
+        {
+            return new EmailResult { IsSuccess = false, ErrorMessage = "收件人、主题和内容不能为空" };
+        }
 
-        try
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+
+        var now = DateTime.UtcNow;
+        db.EmailOutbox.Add(new EmailOutboxItem
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-            cts.CancelAfter(EnqueueWaitTimeout);
-            await queue.EnqueueAsync(item, cts.Token).ConfigureAwait(false);
-            return await tcs.Task.WaitAsync(cts.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
-        {
-            return new EmailResult { IsSuccess = false, ErrorMessage = "邮件队列繁忙或发送超时" };
-        }
+            Id = tsidGenerator.GenerateTsid(),
+            To = to.Trim(),
+            Subject = subject,
+            Body = body,
+            IsHtml = isHtml,
+            Status = EmailOutboxStatus.Pending,
+            AttemptCount = 0,
+            CreatedAt = now,
+            UpdatedAt = now,
+            NextAttemptAt = now,
+        });
+
+        await db.SaveChangesAsync(cancellation).ConfigureAwait(false);
+        metrics.RecordEnqueued();
+
+        return new EmailResult { IsSuccess = true };
     }
 
     public Task<EmailResult> SendVerificationEmailAsync(

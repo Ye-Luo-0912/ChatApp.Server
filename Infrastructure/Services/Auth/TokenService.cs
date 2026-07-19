@@ -62,20 +62,20 @@ public sealed class TokenService(
     /// <summary>
     /// 将访问令牌元数据写入 Redis，键为 AT:{SHA-256(token)}，防止原始令牌暴露在日志中。
     /// </summary>
-    public Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry)
-        => cache.SetAsync(AccessTokenKey(token), data, absoluteExpiration: expiry);
+    public Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default)
+        => cache.SetStringPayloadAsync(AccessTokenKey(token), data, expiry, cancellationToken);
 
     /// <summary>
     /// 查询访问令牌对应的元数据，不存在则返回 <see langword="null"/>。
     /// </summary>
-    public Task<AccessTokenData?> GetAccessTokenAsync(string token)
-        => cache.GetAsync<AccessTokenData>(AccessTokenKey(token));
+    public Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default)
+        => cache.GetStringPayloadAsync<AccessTokenData>(AccessTokenKey(token), cancellationToken);
 
     /// <summary>
     /// 从 Redis 中删除访问令牌（主动登出或安全事件触发的强制下线）。
     /// </summary>
-    public Task RevokeAccessTokenAsync(string token)
-        => cache.RemoveAsync(AccessTokenKey(token));
+    public Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default)
+        => cache.RemoveAsync(AccessTokenKey(token), cancellationToken);
 
     // ─────────────────────────────────────────────────────────────────────────
     // IRefreshTokenStore
@@ -84,7 +84,7 @@ public sealed class TokenService(
     /// <summary>
     /// 将刷新令牌及当前请求的设备信息写入 Redis，同时更新对应的 <see cref="SessionRecord"/>。
     /// </summary>
-    public async Task StoreRefreshTokenAsync(string userId, string refreshToken)
+    public async Task StoreRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
         var device = deviceInfo.GenerateDeviceInfo();
         var expiry = TimeSpan.FromDays(_settings.RefreshTokenExpirationDays);
@@ -113,8 +113,8 @@ public sealed class TokenService(
         };
 
         await Task.WhenAll(
-            cache.SetAsync(rtKey, rtData,  absoluteExpiration: expiry),
-            cache.SetAsync(ssKey, session, absoluteExpiration: expiry));
+            cache.SetAsync(rtKey, rtData,  absoluteExpiration: expiry, cancellationToken: cancellationToken),
+            cache.SetAsync(ssKey, session, absoluteExpiration: expiry, cancellationToken: cancellationToken));
 
         logger.LogDebug("刷新令牌及会话已写入缓存，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
     }
@@ -122,9 +122,9 @@ public sealed class TokenService(
     /// <summary>
     /// 验证刷新令牌：Redis 中存在 + 未过期 + 设备 ID 与当前请求一致。
     /// </summary>
-    public async Task<bool> ValidateRefreshTokenAsync(string userId, string refreshToken)
+    public async Task<bool> ValidateRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
-        var data     = await GetRefreshTokenData(userId, refreshToken);
+        var data     = await GetRefreshTokenData(userId, refreshToken, cancellationToken);
         var deviceId = deviceInfo.GetDeviceId();
 
         if (data is null || !data.IsValid)
@@ -137,26 +137,26 @@ public sealed class TokenService(
     /// <summary>
     /// 从 Redis 中删除指定刷新令牌，并同步撤销对应的会话记录（主动登出）。
     /// </summary>
-    public async Task RevokeRefreshTokenAsync(string userId, string refreshToken)
+    public async Task RevokeRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
         // 先读取设备 ID，以便同步删除会话记录
-        var data = await GetRefreshTokenData(userId, refreshToken);
-        await cache.RemoveAsync(RefreshTokenKey(userId, refreshToken));
+        var data = await GetRefreshTokenData(userId, refreshToken, cancellationToken);
+        await cache.RemoveAsync(RefreshTokenKey(userId, refreshToken), cancellationToken);
 
         if (data?.DeviceId is { } deviceId)
-            await cache.RemoveAsync(SessionKey(userId, deviceId));
+            await cache.RemoveAsync(SessionKey(userId, deviceId), cancellationToken);
     }
 
     /// <summary>
     /// 查询刷新令牌元数据，不存在则返回 <see langword="null"/>。
     /// </summary>
-    public Task<RefreshToken?> GetRefreshTokenAsync(string userId, string refreshToken)
-        => GetRefreshTokenData(userId, refreshToken);
+    public Task<RefreshToken?> GetRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
+        => GetRefreshTokenData(userId, refreshToken, cancellationToken);
 
     /// <summary>
     /// 先校验令牌（含设备匹配），通过后立即原子撤销——一次性消费语义。
     /// </summary>
-    public async Task<bool> ValidateAndRevokeRefreshTokenAsync(string userId, string refreshToken)
+    public async Task<bool> ValidateAndRevokeRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
         var deviceId = deviceInfo.GetDeviceId();
         if (deviceId is null)
@@ -174,7 +174,8 @@ public sealed class TokenService(
                     Result = true,
                     AdditionalKeysToDelete = [SessionKey(userId, oldRt.DeviceId)],
                 };
-            });
+            },
+            cancellationToken);
 
         return consumed.Succeeded;
     }
@@ -183,7 +184,7 @@ public sealed class TokenService(
     /// 原子地撤销旧刷新令牌并写入新刷新令牌，继承原始登录时间并递增轮换计数。
     /// <para>同时撤销旧 RT 对应的访问令牌（通过 <see cref="RefreshToken.CurrentAccessTokenKey"/>)。</para>
     /// </summary>
-    public async Task<bool> RotateRefreshTokenAsync(string userId, string oldRefreshToken, string newRefreshToken)
+    public async Task<bool> RotateRefreshTokenAsync(string userId, string oldRefreshToken, string newRefreshToken, CancellationToken cancellationToken = default)
     {
         var device = deviceInfo.GenerateDeviceInfo();
         var expiry = TimeSpan.FromDays(_settings.RefreshTokenExpirationDays);
@@ -240,7 +241,8 @@ public sealed class TokenService(
                         new CacheSetRequest { Key = ssKey, Value = newSession, AbsoluteExpiration = expiry },
                     ],
                 };
-            });
+            },
+            cancellationToken);
 
         if (rotated.Succeeded)
         {
@@ -259,7 +261,7 @@ public sealed class TokenService(
     /// 登录时一次性签发访问令牌和刷新令牌，并将两者持久化到 Redis。
     /// 生成 SessionId 并建立 AT / RT / Session 三者间的第一方关联。
     /// </summary>
-    public async Task<TokenIssueResult> IssueLoginTokensAsync(ApplicationUser user, IList<string> roles)
+    public async Task<TokenIssueResult> IssueLoginTokensAsync(ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default)
     {
         var sessionId     = Generate(16);
         var rawAt         = Generate(16);
@@ -308,10 +310,19 @@ public sealed class TokenService(
             CurrentRefreshTokenKey  = rtKey,
         };
 
-        await Task.WhenAll(
-            cache.SetAsync(atKey, atData,   absoluteExpiration: accessExpiry),
-            cache.SetAsync(rtKey, rtData,   absoluteExpiration: refreshExpiry),
-            cache.SetAsync(ssKey, session,  absoluteExpiration: refreshExpiry));
+        await cache.SetManyAsync(
+            [
+                new CacheSetRequest
+                {
+                    Key = atKey,
+                    Value = atData,
+                    AbsoluteExpiration = accessExpiry,
+                    AsRedisString = true,
+                },
+                new CacheSetRequest { Key = rtKey, Value = rtData, AbsoluteExpiration = refreshExpiry },
+                new CacheSetRequest { Key = ssKey, Value = session, AbsoluteExpiration = refreshExpiry },
+            ],
+            cancellationToken);
 
         logger.LogDebug("登录令牌已建立，UserId={UserId}, SessionId={SessionId}, DeviceId={DeviceId}",
             userId, sessionId, device.DeviceId);
@@ -330,7 +341,7 @@ public sealed class TokenService(
     /// <summary>
     /// 签发并存储一枚访问令牌（最小载荷，仅含认证必需字段）。
     /// </summary>
-    public async Task<string> IssueAccessTokenAsync(ApplicationUser user, IList<string> roles, string? sessionId = null)
+    public async Task<string> IssueAccessTokenAsync(ApplicationUser user, IList<string> roles, string? sessionId = null, CancellationToken cancellationToken = default)
     {
         var token  = Generate(16);
         var expiry = TimeSpan.FromMinutes(_settings.AccessTokenExpirationMinutes);
@@ -345,7 +356,7 @@ public sealed class TokenService(
             DeviceIdHash    = DeviceIdHashHelper.Compute(deviceInfo.GetDeviceId()),
         };
 
-        await StoreAccessTokenAsync(token, data, expiry);
+        await StoreAccessTokenAsync(token, data, expiry, cancellationToken);
         return token;
     }
 
@@ -353,7 +364,7 @@ public sealed class TokenService(
     /// 原子地完成令牌轮换：CAS 消费旧 RT，并在同一事务中写入新 AT / RT / Session。
     /// </summary>
     public async Task<(string accessToken, string refreshToken)?> IssueRefreshTokensAsync(
-        string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles)
+        string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default)
     {
         var device = deviceInfo.GenerateDeviceInfo();
         var now    = DateTime.UtcNow;
@@ -425,12 +436,19 @@ public sealed class TokenService(
                     AdditionalKeysToDelete = deletes,
                     Writes =
                     [
-                        new CacheSetRequest { Key = atKey, Value = atData, AbsoluteExpiration = accessExpiry },
+                        new CacheSetRequest
+                        {
+                            Key = atKey,
+                            Value = atData,
+                            AbsoluteExpiration = accessExpiry,
+                            AsRedisString = true,
+                        },
                         new CacheSetRequest { Key = rtKey, Value = newRtData, AbsoluteExpiration = refreshExpiry },
                         new CacheSetRequest { Key = ssKey, Value = session, AbsoluteExpiration = refreshExpiry },
                     ],
                 };
-            });
+            },
+            cancellationToken);
 
         if (!rotated.Succeeded)
         {
@@ -449,20 +467,20 @@ public sealed class TokenService(
     /// <summary>
     /// 查询指定用户在指定设备上的会话记录；不存在则返回 <see langword="null"/>。
     /// </summary>
-    public Task<SessionRecord?> GetSessionAsync(string userId, string deviceId)
-        => cache.GetAsync<SessionRecord>(SessionKey(userId, deviceId));
+    public Task<SessionRecord?> GetSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default)
+        => cache.GetAsync<SessionRecord>(SessionKey(userId, deviceId), cancellationToken: cancellationToken);
 
     /// <summary>
     /// 撤销（删除）指定用户在指定设备上的会话记录，并同步删除对应的访问令牌和刷新令牌。
     /// </summary>
-    public async Task RevokeSessionAsync(string userId, string deviceId)
+    public async Task RevokeSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default)
     {
-        var session = await GetSessionAsync(userId, deviceId);
+        var session = await GetSessionAsync(userId, deviceId, cancellationToken);
         if (session is null) return;
 
-        var tasks = new List<Task>(3) { cache.RemoveAsync(SessionKey(userId, deviceId)) };
-        if (session.CurrentAccessTokenKey  is not null) tasks.Add(cache.RemoveAsync(session.CurrentAccessTokenKey));
-        if (session.CurrentRefreshTokenKey is not null) tasks.Add(cache.RemoveAsync(session.CurrentRefreshTokenKey));
+        var tasks = new List<Task>(3) { cache.RemoveAsync(SessionKey(userId, deviceId), cancellationToken) };
+        if (session.CurrentAccessTokenKey  is not null) tasks.Add(cache.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
+        if (session.CurrentRefreshTokenKey is not null) tasks.Add(cache.RemoveAsync(session.CurrentRefreshTokenKey, cancellationToken));
 
         await Task.WhenAll(tasks);
         logger.LogDebug("会话已撤销，UserId={UserId}, DeviceId={DeviceId}", userId, deviceId);
@@ -488,8 +506,8 @@ public sealed class TokenService(
     private static string SessionKey(string userId, string deviceId)
         => $"{SessionPrefix}{userId}:{deviceId}";
 
-    private Task<RefreshToken?> GetRefreshTokenData(string userId, string refreshToken)
-        => cache.GetAsync<RefreshToken>(RefreshTokenKey(userId, refreshToken));
+    private Task<RefreshToken?> GetRefreshTokenData(string userId, string refreshToken, CancellationToken cancellationToken = default)
+        => cache.GetAsync<RefreshToken>(RefreshTokenKey(userId, refreshToken), cancellationToken: cancellationToken);
 
 }
 

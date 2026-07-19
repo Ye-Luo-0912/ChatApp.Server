@@ -21,7 +21,8 @@ public class FriendshipController(
     [HttpGet("all")]
     public Task<CursorPage<FriendDto>> GetAllFriends(
         [FromQuery] string? cursor = null,
-        [FromQuery] int limit = 50)
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
     {
         return friendshipService.GetFriendsAsync<FriendDto>(
             GetCurrentUserId(),
@@ -36,7 +37,8 @@ public class FriendshipController(
                 AvatarUrl  = f.Friend!.AvatarUrl
             },
             cursor,
-            limit);
+            limit,
+            cancellationToken);
     }
 
     /// <summary>
@@ -45,10 +47,10 @@ public class FriendshipController(
     /// <param name="friendId">要删除的好友ID。</param>
     /// <returns>表示异步操作的结果，成功时返回200 OK，失败时返回400 Bad Request。</returns>
     [HttpDelete("{friendId:long}")]
-    public async Task<IActionResult> DeleteFriend([FromRoute] long friendId)
+    public async Task<IActionResult> DeleteFriend([FromRoute] long friendId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.DeleteFriendshipAsync(
-            GetCurrentUserId(), friendId);
+            GetCurrentUserId(), friendId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -59,10 +61,11 @@ public class FriendshipController(
     /// <returns>表示请求发送结果的操作结果</returns>
     [HttpPost("requests")]
     public async Task<IActionResult> SendFriendRequest(
-        [FromBody] SendFriendRequestRequest request)
+        [FromBody] SendFriendRequestRequest request,
+        CancellationToken cancellationToken)
     {
         var result = await friendshipService.SendRequestAsync(
-            GetCurrentUserId(), request.TargetUserId, request.Message);
+            GetCurrentUserId(), request.TargetUserId, request.Message, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -72,10 +75,10 @@ public class FriendshipController(
     /// <param name="requesterId">请求方用户的ID。</param>
     /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含新添加的好友信息。</returns>
     [HttpPut("requests/{requesterId:long}/accept")]
-    public async Task<IActionResult> AcceptFriendRequest([FromRoute] long requesterId)
+    public async Task<IActionResult> AcceptFriendRequest([FromRoute] long requesterId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.AcceptRequestAsync(
-            GetCurrentUserId(), requesterId);
+            GetCurrentUserId(), requesterId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -88,10 +91,11 @@ public class FriendshipController(
     [HttpPut("requests/{requesterId:long}/decline")]
     public async Task<IActionResult> DeclineFriendRequest(
         [FromRoute] long requesterId,
-        [FromQuery] bool blockAfterDecline = false)
+        [FromQuery] bool blockAfterDecline = false,
+        CancellationToken cancellationToken = default)
     {
         var result = await friendshipService.DeclineRequestAsync(
-            GetCurrentUserId(), requesterId, blockAfterDecline);
+            GetCurrentUserId(), requesterId, blockAfterDecline, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -102,7 +106,8 @@ public class FriendshipController(
     [HttpGet("requests/incoming")] // ← 拆成两个端点
     public Task<CursorPage<FriendRequestDto>> GetIncomingRequests(
         [FromQuery] string? cursor = null,
-        [FromQuery] int limit = 50)
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
     {
         return friendshipService.GetRequestsAsync<FriendRequestDto>(
             GetCurrentUserId(),
@@ -117,7 +122,8 @@ public class FriendshipController(
             },
             FriendRequestType.Incoming,
             cursor,
-            limit);
+            limit,
+            cancellationToken);
     }
 
     /// <summary>
@@ -127,7 +133,8 @@ public class FriendshipController(
     [HttpGet("requests/outgoing")]
     public Task<CursorPage<FriendRequestDto>> GetOutgoingRequests(
         [FromQuery] string? cursor = null,
-        [FromQuery] int limit = 50)
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
     {
         return friendshipService.GetRequestsAsync<FriendRequestDto>(
             GetCurrentUserId(),
@@ -142,7 +149,8 @@ public class FriendshipController(
             },
             FriendRequestType.Outgoing,
             cursor,
-            limit);
+            limit,
+            cancellationToken);
     }
 
 
@@ -152,10 +160,10 @@ public class FriendshipController(
     /// <param name="request">包含目标用户ID的请求对象</param>
     /// <returns>返回操作结果，成功时为Ok响应，失败时为BadRequest响应</returns>
     [HttpPost("block")]
-    public async Task<IActionResult> BlockUser([FromBody] BlockUserRequest request)
+    public async Task<IActionResult> BlockUser([FromBody] BlockUserRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.BlockUserAsync(
-            GetCurrentUserId(), request.TargetUserId);
+            GetCurrentUserId(), request.TargetUserId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -165,10 +173,10 @@ public class FriendshipController(
     /// <param name="targetUserId">要解除拉黑的目标用户ID。</param>
     /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含解封信息，失败时包含错误详情。</returns>
     [HttpDelete("block/{targetUserId:long}")]
-    public async Task<IActionResult> UnblockUser([FromRoute] long targetUserId)
+    public async Task<IActionResult> UnblockUser([FromRoute] long targetUserId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.UnblockUserAsync(
-            GetCurrentUserId(), targetUserId);
+            GetCurrentUserId(), targetUserId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -179,7 +187,8 @@ public class FriendshipController(
     [HttpGet("blocked")]
     public Task<CursorPage<BlockedUserDto>> GetBlockedUsers(
         [FromQuery] string? cursor = null,
-        [FromQuery] int limit = 50)
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
     {
         return friendshipService.GetBlockedUsersAsync<BlockedUserDto>(
             GetCurrentUserId(),
@@ -191,7 +200,8 @@ public class FriendshipController(
                 BlockedAt = b.BlockedAt
             },
             cursor,
-            limit);
+            limit,
+            cancellationToken);
     }
 
     /// <summary>
@@ -202,10 +212,10 @@ public class FriendshipController(
     /// <returns>如果操作成功，返回200状态码；如果失败，返回400状态码及错误详情。</returns>
     [HttpPut("friends/{friendId:long}/note")]
     public async Task<IActionResult> UpdateFriendNote(
-        [FromRoute] long friendId, [FromBody] UpdateNoteRequest request)
+        [FromRoute] long friendId, [FromBody] UpdateNoteRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.UpdateFriendNoteAsync(
-            GetCurrentUserId(), friendId, request.Note);
+            GetCurrentUserId(), friendId, request.Note, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -217,10 +227,10 @@ public class FriendshipController(
     /// <returns>返回操作结果，成功时返回200 OK，失败时返回400 Bad Request</returns>
     [HttpPut("friends/{friendId:long}/group")]
     public async Task<IActionResult> AssignFriendToGroup(
-        [FromRoute] long friendId, [FromBody] AssignGroupRequest request)
+        [FromRoute] long friendId, [FromBody] AssignGroupRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.AssignFriendToGroupAsync(
-            GetCurrentUserId(), friendId, request.GroupId);
+            GetCurrentUserId(), friendId, request.GroupId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -233,10 +243,11 @@ public class FriendshipController(
     public Task<CursorPage<FriendSearchResultDto>> SearchFriends(
         [FromQuery] string searchTerm,
         [FromQuery] string? cursor = null,
-        [FromQuery] int limit = 50)
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
     {
         return friendshipService.SearchFriendsAsync(
-            GetCurrentUserId(), searchTerm, cursor, limit);
+            GetCurrentUserId(), searchTerm, cursor, limit, cancellationToken);
     }
 
     #region 辅助方法

@@ -41,7 +41,7 @@ public static class AddServices
         });
         services.AddSingleton<IGeoLocationService, GeoLocationService>();
 
-        services.AddSingleton<EmailQueue>();
+        services.AddSingleton<EmailOutboxMetrics>();
         services.AddSingleton<SmtpEmailSender>();
         services.AddSingleton<IEmailSender, QueuedEmailSender>();
         services.AddHostedService<EmailDispatchWorker>();

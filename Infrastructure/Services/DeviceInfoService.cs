@@ -144,30 +144,13 @@ public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) 
     }
 
     /// <summary>
-    /// 提取客户端真实 IP，优先读取反代/CDN 注入的头，并验证格式合法性。
-    /// 优先级：Cloudflare → X-Forwarded-For → X-Real-IP → RemoteIpAddress。
+    /// 提取客户端 IP：仅使用经 Forwarded Headers 中间件校验后的
+    /// <see cref="ConnectionInfo.RemoteIpAddress"/>，禁止直接信任请求头中的 X-Forwarded-For。
     /// </summary>
     private static string? ExtractClientIp(HttpContext? context)
     {
         if (context is null) return null;
 
-        ReadOnlySpan<string> proxyHeaders = ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"];
-
-        foreach (var header in proxyHeaders)
-        {
-            if (!context.Request.Headers.TryGetValue(header, out var values))
-                continue;
-
-            // X-Forwarded-For: client, proxy1, proxy2 → 取最左侧（最接近真实客户端）
-            var raw      = values.ToString();
-            var commaIdx = raw.IndexOf(',');
-            var candidate = (commaIdx >= 0 ? raw[..commaIdx] : raw).Trim();
-
-            if (IPAddress.TryParse(candidate, out _))
-                return candidate;
-        }
-
-        // 直连场景：IPv4-mapped IPv6（如 ::ffff:1.2.3.4）转换为标准 IPv4 字符串
         var remote = context.Connection.RemoteIpAddress;
         if (remote is null) return null;
 

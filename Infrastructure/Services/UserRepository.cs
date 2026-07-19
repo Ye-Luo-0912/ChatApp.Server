@@ -10,24 +10,24 @@ namespace Infrastructure.Services;
 /// </summary>
 public class UserRepository(UserDbContext db) : IUserRepository
 {
-    public async Task<ApplicationUser?> FindByIdAsync(long userId) =>
-        await db.Users.FindAsync(userId);
+    public async Task<ApplicationUser?> FindByIdAsync(long userId, CancellationToken cancellationToken = default) =>
+        await db.Users.FindAsync([userId], cancellationToken);
 
-    public async Task<ApplicationUser?> FindByNameAsync(string username)
+    public async Task<ApplicationUser?> FindByNameAsync(string username, CancellationToken cancellationToken = default)
     {
         var normalized = username.ToUpperInvariant();
-        return await db.Users.FirstOrDefaultAsync(u => u.NormalizedUserName == normalized);
+        return await db.Users.FirstOrDefaultAsync(u => u.NormalizedUserName == normalized, cancellationToken);
     }
 
-    public async Task<bool> UpdateAsync(ApplicationUser user)
+    public async Task<bool> UpdateAsync(ApplicationUser user, CancellationToken cancellationToken = default)
     {
         db.Users.Update(user);
-        return await db.SaveChangesAsync() > 0;
+        return await db.SaveChangesAsync(cancellationToken) > 0;
     }
 
-    public async Task<bool> DeleteAsync(ApplicationUser user)
+    public async Task<bool> DeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default)
     {
         db.Users.Remove(user);
-        return await db.SaveChangesAsync() > 0;
+        return await db.SaveChangesAsync(cancellationToken) > 0;
     }
 }

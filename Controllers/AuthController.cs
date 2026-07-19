@@ -6,6 +6,7 @@ using Core.Models.Auth;
 using Core.Models.Token;
 using Infrastructure.Models.Email;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -29,8 +30,9 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
     /// </summary>
     [AllowAnonymous]
     [EnableRateLimiting("auth-login")]
+    [RequestTimeout("auth")]
     [HttpPost("login")]
-    public async Task<IActionResult> Login([FromBody] LoginRequest model)
+    public async Task<IActionResult> Login([FromBody] LoginRequest model, CancellationToken cancellationToken)
     {
         if (!ModelState.IsValid)
             return BadRequest(ModelState);
@@ -38,7 +40,7 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
         
         try
         {
-            var result = await _authService.LoginAsync(model.Username, model.Password);
+            var result = await _authService.LoginAsync(model.Username, model.Password, cancellationToken);
             return result.IsSuccess ? Ok(result) : BadRequest(result);
         }
         catch (IdentityException ex)
@@ -55,7 +57,7 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
     /// <returns>如果成功，返回包含成功消息的结果；否则返回错误信息。</returns>
     [Authorize]
     [HttpPost("logout")]
-    public async Task<IActionResult> Logout([FromBody] LogoutRequest request)
+    public async Task<IActionResult> Logout([FromBody] LogoutRequest request, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
@@ -65,7 +67,7 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
 
         try
         {
-            await _authService.LogoutAsync(userId, request.RefreshToken);
+            await _authService.LogoutAsync(userId, request.RefreshToken, cancellationToken);
             return Ok(new { Message = "成功登出" });
         }
         catch (IdentityException ex)
@@ -90,14 +92,14 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
         
         try
         {
-            if (await _authService.IsEmailRegisteredAsync(model.Email))
+            if (await _authService.IsEmailRegisteredAsync(model.Email, ct))
                 return BadRequest(new {Message="该邮箱已经被注册过了"});
             
             var verifyResult = await _emailVerificationService.VerifyEmailCodeAsync(model.Email, model.Code, EmailCodePurpose.Register, ct);
             if (!verifyResult.IsSuccess) 
                 return BadRequest(new { Message = verifyResult.ErrorMessage });
             
-            var result = await _authService.RegisterAsync(model.Username, model.Email, model.Password);
+            var result = await _authService.RegisterAsync(model.Username, model.Email, model.Password, ct);
 
             
             return result.IsSuccess
@@ -126,15 +128,16 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
     /// <returns>如果成功，返回包含新访问令牌和刷新令牌的结果；否则返回错误信息。</returns>
     [AllowAnonymous]
     [EnableRateLimiting("auth-refresh")]
+    [RequestTimeout("auth")]
     [HttpPost("refresh-token")]
-    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequest model)
+    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequest model, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(model.RefreshToken) || model.UserId <= 0)
             return BadRequest(TokenPairResult.Fail(AuthErrorType.InvalidCredentials));
 
         try
         {
-            var result = await _authService.RefreshLoginAsync(model.UserId, model.RefreshToken);
+            var result = await _authService.RefreshLoginAsync(model.UserId, model.RefreshToken, cancellationToken);
 
             if (!result.IsSuccess)
             {
@@ -158,6 +161,7 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
     /// <returns>如果成功发送验证码，则返回Ok结果；否则，返回BadRequest并附带错误信息。</returns>
     [AllowAnonymous]
     [EnableRateLimiting("auth-email")]
+    [RequestTimeout("email")]
     [HttpPost("send-register-code")]
     public async Task<IActionResult> SendRegisterCode([FromBody] SendEmailCodeRequest request, CancellationToken ct)
     {
@@ -166,7 +170,7 @@ public class AuthController(IAuthService authService, ILogger<AuthController> lo
         if(string.IsNullOrEmpty(email))
             return BadRequest(new { Message = "邮箱不能为空" });
 
-        if (await _authService.IsEmailRegisteredAsync(email))
+        if (await _authService.IsEmailRegisteredAsync(email, ct))
             return BadRequest("该邮箱已经被注册");
         
         var result= await _emailVerificationService.SendEmailCodeAsync(email, EmailCodePurpose.Register, ct);

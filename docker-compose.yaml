@@ -17,12 +17,29 @@ services:
       timeout: 5s
       retries: 5
 
+  # 登录态事实来源：必须挂卷 + AOF/checkpoint + --recover，否则重启会全量掉线。
   garnet_cache:
     image: ghcr.io/microsoft/garnet:1.0.84
     container_name: chatapp_garnet
     restart: unless-stopped
+    user: "0:0"
+    command:
+      - "--bind"
+      - "0.0.0.0"
+      - "--port"
+      - "6379"
+      - "--checkpointdir"
+      - "/data/checkpoints"
+      - "--logdir"
+      - "/data/logs"
+      - "--aof"
+      - "--aof-size-limit"
+      - "64m"
+      - "--recover"
     ports:
       - "6379:6379"
+    volumes:
+      - garnet_data:/data
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/6379' || exit 1"]
       interval: 10s
@@ -31,3 +48,4 @@ services:
 
 volumes:
   postgres_data:
+  garnet_data:

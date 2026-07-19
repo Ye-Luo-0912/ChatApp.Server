@@ -48,13 +48,13 @@ public sealed class OpaqueTokenAuthHandler(
         try
         {
             // 认证热路径：每次请求仅一次缓存读取。
-            var data = await tokenStore.GetAccessTokenAsync(token);
+            var data = await tokenStore.GetAccessTokenAsync(token, Context.RequestAborted);
             if (data is null)
                 return AuthenticateResult.Fail("令牌无效或不存在");
 
             if (data.IsExpired)
             {
-                await tokenStore.RevokeAccessTokenAsync(token);
+                await tokenStore.RevokeAccessTokenAsync(token, Context.RequestAborted);
                 return AuthenticateResult.Fail("令牌已过期");
             }
 

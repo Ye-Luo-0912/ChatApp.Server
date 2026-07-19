@@ -360,10 +360,6 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 FriendshipOperationResultErrorCode.FriendshipRequestExpired,
                 "好友请求不存在或已处理");
 
-        await using var transaction = await context.Database
-            .BeginTransactionAsync(ct)
-            .ConfigureAwait(false);
-
         try
         {
             request.Status = RequestStatus.Declined;
@@ -371,38 +367,57 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
 
             if (blockAfterDecline)
             {
-                await context.BlockRecords.AddAsync(new BlockRecord
-                {
-                    BlockerId = declinerId,
-                    BlockedUserId = requesterId,
-                    BlockedAt = DateTime.UtcNow
-                }, ct).ConfigureAwait(false);
-
-                var friendships = await context.Friendships
-                    .IgnoreQueryFilters()
-                    .Where(f => (f.UserId == declinerId && f.FriendId == requesterId) ||
-                                (f.UserId == requesterId && f.FriendId == declinerId))
-                    .ToListAsync(ct)
+                await using var transaction = await context.Database
+                    .BeginTransactionAsync(ct)
                     .ConfigureAwait(false);
 
-                foreach (var friendship in friendships)
+                try
                 {
-                    friendship.IsDeleted = true;
-                    friendship.DeletedAt = DateTime.UtcNow;
+                    await context.BlockRecords.AddAsync(new BlockRecord
+                    {
+                        BlockerId = declinerId,
+                        BlockedUserId = requesterId,
+                        BlockedAt = DateTime.UtcNow
+                    }, ct).ConfigureAwait(false);
+
+                    var friendships = await context.Friendships
+                        .IgnoreQueryFilters()
+                        .Where(f => (f.UserId == declinerId && f.FriendId == requesterId) ||
+                                    (f.UserId == requesterId && f.FriendId == declinerId))
+                        .ToListAsync(ct)
+                        .ConfigureAwait(false);
+
+                    foreach (var friendship in friendships)
+                    {
+                        friendship.IsDeleted = true;
+                        friendship.DeletedAt = DateTime.UtcNow;
+                    }
+
+                    await context.SaveChangesAsync(ct).ConfigureAwait(false);
+                    await transaction.CommitAsync(ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
+                catch
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    throw;
                 }
             }
-
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            else
+            {
+                await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex, "拒绝好友请求失败，DeclinerId={DeclinerId}, RequesterId={RequesterId}",
                 declinerId, requesterId);
             return FriendshipOperationResult.Failed(
@@ -582,36 +597,48 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             .FirstOrDefaultAsync(f => f.UserId == friendId && f.FriendId == userId, ct)
             .ConfigureAwait(false);
 
-        await using var transaction = await context.Database
-            .BeginTransactionAsync(ct)
-            .ConfigureAwait(false);
-
         try
         {
             if (friendRecord is { IsDeleted: true })
             {
-                // 对方已删除 → 双向物理删除
-                context.Friendships.Remove(myRecord);
-                context.Friendships.Remove(friendRecord);
+                await using var transaction = await context.Database
+                    .BeginTransactionAsync(ct)
+                    .ConfigureAwait(false);
+
+                try
+                {
+                    // 对方已删除 → 双向物理删除
+                    context.Friendships.Remove(myRecord);
+                    context.Friendships.Remove(friendRecord);
+
+                    await context.SaveChangesAsync(ct).ConfigureAwait(false);
+                    await transaction.CommitAsync(ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
+                catch
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    throw;
+                }
             }
             else
             {
                 // 对方还没删 → 单边软删除
                 myRecord.IsDeleted = true;
                 myRecord.DeletedAt = DateTime.UtcNow;
+                await context.SaveChangesAsync(ct).ConfigureAwait(false);
             }
-
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex, "删除好友失败，UserId={UserId}, FriendId={FriendId}",
                 userId, friendId);
             return FriendshipOperationResult.Failed(

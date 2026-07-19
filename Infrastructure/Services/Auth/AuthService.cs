@@ -36,9 +36,10 @@ public class AuthService(
     /// </summary>
     /// <param name="account">用户的账户名。</param>
     /// <param name="password">用户的密码。</param>
+    /// <param name="cancellationToken">用于取消操作的令牌。</param>
     /// <returns>返回一个<see cref="LoginResult"/>对象，包含登录结果信息。如果登录成功，则包括访问令牌、刷新令牌及其过期时间等；如果失败，则返回错误信息及状态。</returns>
     /// <exception cref="IdentityException">当登录过程中发生异常时抛出。</exception>
-    public async Task<LoginResult> LoginAsync(string account, string password)
+    public async Task<LoginResult> LoginAsync(string account, string password, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(account) || string.IsNullOrWhiteSpace(password))
             return LoginResult.Fail("账号或密码不能为空", LoginCheckStatus.InvalidCredentials);
@@ -46,16 +47,16 @@ public class AuthService(
         try
         {
             // 先统一校验账户状态和密码正确性。
-            var (status, user) = await VerifyUserCredentialsAsync(account, password);
+            var (status, user) = await VerifyUserCredentialsAsync(account, password, cancellationToken);
             if (user is null)
                 return LoginResult.Fail("用户名或密码错误 / 账户已被锁定", status);
 
-            var roles = await GetRolesAsync(user.Id);
-            var tokens = await _tokenService.IssueLoginTokensAsync(user, roles);
+            var roles = await GetRolesAsync(user.Id, cancellationToken);
+            var tokens = await _tokenService.IssueLoginTokensAsync(user, roles, cancellationToken);
 
             // 记录上次登录时间后再更新，供登录响应携带「异地登录提醒」
             var previousLoginDate = user.LastLoginDate;
-            await UpdateLastLoginAsync(user);
+            await UpdateLastLoginAsync(user, cancellationToken);
 
             var tcpServer = new ServerEndPoint
             {
@@ -77,11 +78,11 @@ public class AuthService(
     /// <summary>
     /// 撤销指定用户的刷新令牌，实现登出。
     /// </summary>
-    public async Task LogoutAsync(long userId, string refreshToken)
+    public async Task LogoutAsync(long userId, string refreshToken, CancellationToken cancellationToken = default)
     {
         try
         {
-            await _tokenService.RevokeRefreshTokenAsync(userId.ToString(), refreshToken);
+            await _tokenService.RevokeRefreshTokenAsync(userId.ToString(), refreshToken, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -96,9 +97,10 @@ public class AuthService(
     /// <param name="username">用户的用户名，如果未提供，则使用邮箱作为用户名。</param>
     /// <param name="email">用户的邮箱地址。</param>
     /// <param name="password">用户的密码。</param>
+    /// <param name="cancellationToken">用于取消操作的令牌。</param>
     /// <returns>返回一个<see cref="UserRegistrationResult"/>对象，包含注册结果信息。如果注册成功，则包括用户ID和用户名；如果失败，则返回错误信息及状态。</returns>
     /// <exception cref="IdentityException">当注册过程中发生异常时抛出。</exception>
-    public async Task<UserRegistrationResult> RegisterAsync(string? username, string email, string password)
+    public async Task<UserRegistrationResult> RegisterAsync(string? username, string email, string password, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
             return UserRegistrationResult.Fail([], "账号或者密码不能为空");
@@ -108,10 +110,10 @@ public class AuthService(
         var normalizedName  = name.ToUpperInvariant();
 
         // 邮箱和用户名分开检查，以便返回精确的错误提示
-        if (await _db.Users.AnyAsync(u => u.NormalizedEmail == normalizedEmail))
+        if (await _db.Users.AnyAsync(u => u.NormalizedEmail == normalizedEmail, cancellationToken))
             return UserRegistrationResult.Fail([], "该邮箱已被注册");
 
-        if (await _db.Users.AnyAsync(u => u.NormalizedUserName == normalizedName))
+        if (await _db.Users.AnyAsync(u => u.NormalizedUserName == normalizedName, cancellationToken))
             return UserRegistrationResult.Fail([], "该用户名已被使用");
 
         var user = new ApplicationUser
@@ -130,7 +132,7 @@ public class AuthService(
         try
         {
             _db.Users.Add(user);
-            await _db.SaveChangesAsync();
+            await _db.SaveChangesAsync(cancellationToken);
             _logger.LogInformation("成功创建用户 {UserId}", user.Id);
             return UserRegistrationResult.Success(user.Id, user.UserName ?? name);
         }
@@ -146,9 +148,10 @@ public class AuthService(
     /// </summary>
     /// <param name="account">用户的唯一标识符。</param>
     /// <param name="refreshToken">用于刷新的旧刷新令牌。</param>
+    /// <param name="cancellationToken">用于取消操作的令牌。</param>
     /// <returns>包含新访问令牌和刷新令牌的结果，如果失败则返回错误类型。</returns>
     /// <exception cref="IdentityException">在刷新令牌过程中发生异常时抛出。</exception>
-    public async Task<TokenPairResult> RefreshLoginAsync(long account, string refreshToken)
+    public async Task<TokenPairResult> RefreshLoginAsync(long account, string refreshToken, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(refreshToken))
             return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
@@ -158,20 +161,20 @@ public class AuthService(
             var userIdString = account.ToString();
 
             // 快速路径：无效令牌时跳过用户查询。真正的互斥由 IssueRefreshTokensAsync 的 CAS 保证。
-            var isValid = await _tokenService.ValidateRefreshTokenAsync(userIdString, refreshToken);
+            var isValid = await _tokenService.ValidateRefreshTokenAsync(userIdString, refreshToken, cancellationToken);
             if (!isValid)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
             // 再回到用户源数据读取最新角色，避免只依赖旧令牌里的历史信息。
-            var user = await _db.Users.FindAsync(account);
+            var user = await _db.Users.FindAsync([account], cancellationToken);
             if (user is null)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
-            var roles = await GetRolesAsync(user.Id);
+            var roles = await GetRolesAsync(user.Id, cancellationToken);
 
             // 原子轮换：CAS 消费旧 RT，并在同一事务中写入新 AT / RT / Session
             var rotated = await _tokenService.IssueRefreshTokensAsync(
-                userIdString, refreshToken, user, roles);
+                userIdString, refreshToken, user, roles, cancellationToken);
 
             if (rotated is null)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
@@ -189,24 +192,25 @@ public class AuthService(
     /// 检查给定的电子邮件地址是否已被注册。
     /// </summary>
     /// <param name="email">要检查的电子邮件地址。</param>
+    /// <param name="cancellationToken">用于取消操作的令牌。</param>
     /// <returns>如果电子邮件已注册，则返回true；否则返回false。在发生异常时也返回false，并记录错误日志。</returns>
-    public async Task<bool> IsEmailRegisteredAsync(string email)
+    public async Task<bool> IsEmailRegisteredAsync(string email, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(email))
             return false;
 
         var normalized = email.Trim().ToUpperInvariant();
-        return await _db.Users.AnyAsync(u => u.NormalizedEmail == normalized);
+        return await _db.Users.AnyAsync(u => u.NormalizedEmail == normalized, cancellationToken);
     }
 
     /// <summary>
     /// 记录最后一次成功登录时间，同时将 VerifyUserCredentials 中对 AccessFailedCount / LockoutEnd
     /// 的重置一并持久化，避免重复调用 SaveChangesAsync。
     /// </summary>
-    private async Task UpdateLastLoginAsync(ApplicationUser user)
+    private async Task UpdateLastLoginAsync(ApplicationUser user, CancellationToken cancellationToken)
     {
         user.LastLoginDate = DateTimeOffset.UtcNow;
-        try { await _db.SaveChangesAsync(); }
+        try { await _db.SaveChangesAsync(cancellationToken); }
         catch (Exception ex)
         {
             // 登录流程已完成，LastLoginDate 更新失败不应阻断响应
@@ -214,12 +218,12 @@ public class AuthService(
         }
     }
 
-    private async Task<IList<string>> GetRolesAsync(long userId)
+    private async Task<IList<string>> GetRolesAsync(long userId, CancellationToken cancellationToken)
     {
         return await _db.UserRoles
             .Where(ur => ur.UserId == userId)
             .Select(ur => ur.Role.Name!)
-            .ToListAsync();
+            .ToListAsync(cancellationToken);
     }
 
     /// <summary>
@@ -227,17 +231,18 @@ public class AuthService(
     /// </summary>
     /// <param name="account">用户的账号，可以是用户名或电子邮件。</param>
     /// <param name="password">用户提供的密码。</param>
+    /// <param name="cancellationToken">用于取消操作的令牌。</param>
     /// <returns>返回一个元组，包含验证状态和对应的用户对象。如果验证成功，则返回<see cref="LoginCheckStatus.Success"/>及用户对象；
     /// 如果凭证无效，则返回<see cref="LoginCheckStatus.InvalidCredentials"/>且用户对象为null；
     /// 如果账户被锁定，则返回<see cref="LoginCheckStatus.LockedOut"/>且用户对象为null。</returns>
     private async Task<(LoginCheckStatus Status, ApplicationUser? User)> VerifyUserCredentialsAsync(string account,
-        string password)
+        string password, CancellationToken cancellationToken)
     {
         var normalized = account.Trim().ToUpperInvariant();
 
         // 邮箱与用户名合并为单次查询，减少一次数据库往返
         var user = await _db.Users.FirstOrDefaultAsync(
-            u => u.NormalizedEmail == normalized || u.NormalizedUserName == normalized);
+            u => u.NormalizedEmail == normalized || u.NormalizedUserName == normalized, cancellationToken);
 
         if (user is null)
             return (LoginCheckStatus.InvalidCredentials, null);
@@ -260,11 +265,11 @@ public class AuthService(
             {
                 user.LockoutEnd = DateTimeOffset.UtcNow.Add(LockoutDuration);
                 _logger.LogWarning("登录失败：连续错误已达上限，账号已锁定。UserId={UserId}", user.Id);
-                await _db.SaveChangesAsync();
+                await _db.SaveChangesAsync(cancellationToken);
                 return (LoginCheckStatus.LockedOut, null);
             }
 
-            await _db.SaveChangesAsync();
+            await _db.SaveChangesAsync(cancellationToken);
             _logger.LogWarning("登录失败：密码错误。UserId={UserId}, FailedCount={Count}",
                 user.Id, user.AccessFailedCount);
             return (LoginCheckStatus.InvalidCredentials, null);

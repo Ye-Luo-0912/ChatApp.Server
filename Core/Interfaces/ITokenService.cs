@@ -23,7 +23,7 @@ public interface ITokenService : ITokenGenerator, IAccessTokenStore, IRefreshTok
     /// 内部生成 <c>SessionId</c> 并同步写入 <see cref="SessionRecord"/>，同时在 <see cref="RefreshToken"/> 中
     /// 记录当前访问令牌的 Redis 键，供后续轮换和会话撤销使用。
     /// </summary>
-    Task<TokenIssueResult> IssueLoginTokensAsync(ApplicationUser user, IList<string> roles);
+    Task<TokenIssueResult> IssueLoginTokensAsync(ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 仅签发并存储一枚访问令牌，适用于外部直接调用场景（如管理员强制刷新）。
@@ -31,7 +31,7 @@ public interface ITokenService : ITokenGenerator, IAccessTokenStore, IRefreshTok
     /// 令牌刷新请使用 <see cref="IssueRefreshTokensAsync"/>，它会同时处理旧访问令牌的撤销。
     /// </para>
     /// </summary>
-    Task<string> IssueAccessTokenAsync(ApplicationUser user, IList<string> roles, string? sessionId = null);
+    Task<string> IssueAccessTokenAsync(ApplicationUser user, IList<string> roles, string? sessionId = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 原子地完成令牌轮换：校验并消费旧刷新令牌、撤销旧访问令牌，同时签发并持久化新的访问令牌和刷新令牌。
@@ -42,5 +42,5 @@ public interface ITokenService : ITokenGenerator, IAccessTokenStore, IRefreshTok
     /// </summary>
     /// <returns>成功时返回新签发的 (accessToken, refreshToken)；失败返回 <see langword="null"/>。</returns>
     Task<(string accessToken, string refreshToken)?> IssueRefreshTokensAsync(
-        string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles);
+        string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default);
 }

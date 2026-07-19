@@ -17,12 +17,12 @@ public class UsersController(IUserAccountService userAccountService) : BaseApiCo
     /// 获取当前登录用户资料。
     /// </summary>
     [HttpGet("me")]
-    public async Task<IActionResult> GetCurrentUser()
+    public async Task<IActionResult> GetCurrentUser(CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var user = await userAccountService.GetByIdAsync(userId);
+        var user = await userAccountService.GetByIdAsync(userId, cancellationToken);
         return user is not null ? Ok(user) : NotFound();
     }
 
@@ -31,9 +31,9 @@ public class UsersController(IUserAccountService userAccountService) : BaseApiCo
     /// </summary>
     [AllowAnonymous]
     [HttpGet("{username}")]
-    public async Task<IActionResult> GetUserByName(string username)
+    public async Task<IActionResult> GetUserByName(string username, CancellationToken cancellationToken)
     {
-        var user = await userAccountService.GetByUserNameAsync(username);
+        var user = await userAccountService.GetByUserNameAsync(username, cancellationToken);
         return user is not null
             ? Ok(user)
             : NotFound(new { Message = "用户不存在" });
@@ -43,12 +43,12 @@ public class UsersController(IUserAccountService userAccountService) : BaseApiCo
     /// 更新当前登录用户的基础资料。
     /// </summary>
     [HttpPut("me")]
-    public async Task<IActionResult> UpdateCurrentUser([FromBody] UpdateCurrentUserRequest model)
+    public async Task<IActionResult> UpdateCurrentUser([FromBody] UpdateCurrentUserRequest model, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await userAccountService.UpdateAsync(userId, model.Email, model.PhoneNumber);
+        var result = await userAccountService.UpdateAsync(userId, model.Email, model.PhoneNumber, cancellationToken);
         if (result is null)
             return NotFound();
 
@@ -59,12 +59,12 @@ public class UsersController(IUserAccountService userAccountService) : BaseApiCo
     /// 修改当前登录用户密码。
     /// </summary>
     [HttpPost("me/change-password")]
-    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest model)
+    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest model, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await userAccountService.ChangePasswordAsync(userId, model.CurrentPassword, model.NewPassword);
+        var result = await userAccountService.ChangePasswordAsync(userId, model.CurrentPassword, model.NewPassword, cancellationToken);
         if (result is null)
             return NotFound();
 
@@ -76,9 +76,9 @@ public class UsersController(IUserAccountService userAccountService) : BaseApiCo
     /// </summary>
     [Authorize(Roles = "Admin")]
     [HttpDelete("{userId:long}")]
-    public async Task<IActionResult> DeleteUser(long userId)
+    public async Task<IActionResult> DeleteUser(long userId, CancellationToken cancellationToken)
     {
-        var result = await userAccountService.DeleteAsync(userId);
+        var result = await userAccountService.DeleteAsync(userId, cancellationToken);
         if (result is null)
             return NotFound();
 

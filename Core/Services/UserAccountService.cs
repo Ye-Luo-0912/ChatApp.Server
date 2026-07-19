@@ -17,11 +17,11 @@ public class UserAccountService(
     /// <summary>
     /// 获取完整的用户资料。
     /// </summary>
-    public async Task<UserProfileResponse?> GetByIdAsync(long userId)
+    public async Task<UserProfileResponse?> GetByIdAsync(long userId, CancellationToken cancellationToken = default)
     {
         try
         {
-            var user = await userRepository.FindByIdAsync(userId);
+            var user = await userRepository.FindByIdAsync(userId, cancellationToken);
             return user is null ? null : UserProfileResponse.FromUser(user);
         }
         catch (Exception ex)
@@ -34,11 +34,11 @@ public class UserAccountService(
     /// <summary>
     /// 获取公开展示的用户信息。
     /// </summary>
-    public async Task<PublicUserResponse?> GetByUserNameAsync(string username)
+    public async Task<PublicUserResponse?> GetByUserNameAsync(string username, CancellationToken cancellationToken = default)
     {
         try
         {
-            var user = await userRepository.FindByNameAsync(username);
+            var user = await userRepository.FindByNameAsync(username, cancellationToken);
             return user is null ? null : PublicUserResponse.FromUser(user);
         }
         catch (Exception ex)
@@ -51,11 +51,11 @@ public class UserAccountService(
     /// <summary>
     /// 更新用户的邮箱和手机号等基础资料。
     /// </summary>
-    public async Task<AuthOperationResult?> UpdateAsync(long userId, string? email, string? phoneNumber)
+    public async Task<AuthOperationResult?> UpdateAsync(long userId, string? email, string? phoneNumber, CancellationToken cancellationToken = default)
     {
         try
         {
-            var user = await userRepository.FindByIdAsync(userId);
+            var user = await userRepository.FindByIdAsync(userId, cancellationToken);
             if (user is null)
                 return null;
 
@@ -67,7 +67,7 @@ public class UserAccountService(
 
             user.PhoneNumber = phoneNumber ?? user.PhoneNumber;
 
-            var ok = await userRepository.UpdateAsync(user);
+            var ok = await userRepository.UpdateAsync(user, cancellationToken);
             if (ok) logger.LogInformation("成功更新用户 {UserId}", userId);
 
             return ok
@@ -84,15 +84,15 @@ public class UserAccountService(
     /// <summary>
     /// 删除指定用户。
     /// </summary>
-    public async Task<AuthOperationResult?> DeleteAsync(long userId)
+    public async Task<AuthOperationResult?> DeleteAsync(long userId, CancellationToken cancellationToken = default)
     {
         try
         {
-            var user = await userRepository.FindByIdAsync(userId);
+            var user = await userRepository.FindByIdAsync(userId, cancellationToken);
             if (user is null)
                 return null;
 
-            var ok = await userRepository.DeleteAsync(user);
+            var ok = await userRepository.DeleteAsync(user, cancellationToken);
             if (ok) logger.LogInformation("成功删除用户 {UserId}", userId);
 
             return ok
@@ -109,11 +109,11 @@ public class UserAccountService(
     /// <summary>
     /// 修改指定用户密码。
     /// </summary>
-    public async Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword)
+    public async Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default)
     {
         try
         {
-            var user = await userRepository.FindByIdAsync(userId);
+            var user = await userRepository.FindByIdAsync(userId, cancellationToken);
             if (user is null)
                 return null;
 
@@ -125,7 +125,7 @@ public class UserAccountService(
             user.SecurityStamp = Guid.NewGuid().ToString();
             user.AccessFailedCount = 0;
 
-            var ok = await userRepository.UpdateAsync(user);
+            var ok = await userRepository.UpdateAsync(user, cancellationToken);
             if (ok) logger.LogInformation("用户 {UserId} 密码修改成功", userId);
 
             return ok

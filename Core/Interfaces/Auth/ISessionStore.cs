@@ -15,10 +15,10 @@ public interface ISessionStore
     /// <summary>
     /// 查询指定用户在指定设备上的会话记录；不存在则返回 <see langword="null"/>。
     /// </summary>
-    Task<SessionRecord?> GetSessionAsync(string userId, string deviceId);
+    Task<SessionRecord?> GetSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// 撤销（删除）指定用户在指定设备上的会话记录，用于远程踢出设备。
     /// </summary>
-    Task RevokeSessionAsync(string userId, string deviceId);
+    Task RevokeSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default);
 }
