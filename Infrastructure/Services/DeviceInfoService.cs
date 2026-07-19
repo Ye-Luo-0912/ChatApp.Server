@@ -60,7 +60,8 @@ public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) 
 
         var info = new DeviceInfo
         {
-            DeviceId        = ComputeDeviceId(userAgent, acceptLanguage),
+            // 优先使用客户端生成的稳定设备 ID（X-Device-Id），缺失时回退 UA/语言指纹。
+            DeviceId        = ResolveDeviceId(context, userAgent, acceptLanguage),
             DeviceName      = BuildDeviceName(clientInfo),
             DeviceType      = DetectDeviceType(userAgent, clientInfo),
             IpAddress       = clientIp,
@@ -83,7 +84,37 @@ public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) 
 
         var userAgent      = GetRawUserAgent(context);
         var acceptLanguage = GetAcceptLanguage(context);
+        return ResolveDeviceId(context, userAgent, acceptLanguage);
+    }
+
+    /// <summary>
+    /// 读取客户端提供的稳定设备 ID；需为 URL 安全、长度 16～128 的随机串。
+    /// </summary>
+    private static string ResolveDeviceId(HttpContext? context, string userAgent, string acceptLanguage)
+    {
+        if (context?.Request.Headers.TryGetValue("X-Device-Id", out var header) == true)
+        {
+            var clientId = header.ToString().Trim();
+            if (IsValidClientDeviceId(clientId))
+                return clientId;
+        }
+
         return ComputeDeviceId(userAgent, acceptLanguage);
+    }
+
+    private static bool IsValidClientDeviceId(string value)
+    {
+        if (value.Length is < 16 or > 128)
+            return false;
+
+        foreach (var ch in value)
+        {
+            if (char.IsAsciiLetterOrDigit(ch) || ch is '-' or '_' or '.')
+                continue;
+            return false;
+        }
+
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

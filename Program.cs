@@ -7,6 +7,7 @@ using Infrastructure.Data.Configurations;
 using Infrastructure.Extensions;
 using Infrastructure.Serialization;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using NLog.Extensions.Logging;
 using OpenTelemetry.Metrics;
@@ -28,6 +29,13 @@ public abstract class Program
             AppJsonOptions.ApplyTo(op.JsonSerializerOptions));
 
         builder.Services.AddHttpContextAccessor();
+        builder.Services.Configure<ForwardedHeadersOptions>(options =>
+        {
+            options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+            // 生产环境请显式配置 KnownProxies / KnownNetworks，避免伪造客户端 IP。
+            options.KnownNetworks.Clear();
+            options.KnownProxies.Clear();
+        });
 
         var config = builder.Configuration;
         var jwtSettings = config.GetSection("JwtSettings");
@@ -128,6 +136,7 @@ public abstract class Program
 
         var app = builder.Build();
 
+        app.UseForwardedHeaders();
         app.UseMiddleware<ExceptionHandlingMiddleware>();
         app.UseCors("AllowSpecific");
         app.UseHttpsRedirection();
