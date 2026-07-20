@@ -1,4 +1,5 @@
 using Core.Models.Friend;
+using Infrastructure.Data;
 using Infrastructure.Extensions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -11,7 +12,14 @@ public class FriendGroupConfig:IEntityTypeConfiguration<FriendGroup>
     {
         builder.ToTable("T_FriendGroup");
         builder.HasKey(k => k.GroupId);
-        builder.HasIndex(g => new { g.UserId, g.GroupName }).IsUnique();
+        builder.HasIndex(g => new { g.UserId, g.GroupName })
+            .IsUnique()
+            .HasDatabaseName(PostgresDbException.FriendGroupNameConstraint);
+
+        builder.Property(g => g.SortOrder).HasDefaultValue(0);
+        builder.Property(g => g.IsDefault).HasDefaultValue(false);
+        builder.HasIndex(g => new { g.UserId, g.SortOrder })
+            .HasDatabaseName("IX_FriendGroup_UserId_SortOrder");
         
         builder.HasNoForeignKeyConstraints();
 

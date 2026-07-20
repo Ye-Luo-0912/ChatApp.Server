@@ -27,7 +27,24 @@ public sealed class EmailOutboxItemConfig : IEntityTypeConfiguration<EmailOutbox
         builder.Property(x => x.LastError)
             .HasMaxLength(2048);
 
+        builder.Property(x => x.EmailType)
+            .HasMaxLength(64);
+
+        builder.Property(x => x.IdempotencyKey)
+            .HasMaxLength(256);
+
+        builder.Property(x => x.LockOwner)
+            .HasMaxLength(128);
+
         builder.HasIndex(x => new { x.Status, x.NextAttemptAt })
             .HasDatabaseName("IX_EmailOutbox_Status_NextAttemptAt");
+
+        builder.HasIndex(x => x.IdempotencyKey)
+            .IsUnique()
+            .HasFilter("\"IdempotencyKey\" IS NOT NULL AND \"Status\" IN (0, 1, 3)")
+            .HasDatabaseName("IX_EmailOutbox_IdempotencyKey_Active");
+
+        builder.HasIndex(x => new { x.Status, x.LockedAt })
+            .HasDatabaseName("IX_EmailOutbox_Status_LockedAt");
     }
 }

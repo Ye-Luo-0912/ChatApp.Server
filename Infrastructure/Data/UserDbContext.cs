@@ -2,6 +2,9 @@ using System.Text.RegularExpressions;
 using Core.Models.Email;
 using Core.Models.Friend;
 using Core.Models.Identity;
+using Core.Models.Moderation;
+using Core.Models.Notifications;
+using Core.Models.Security;
 using ChatApp.Realtime.Integration.Outbox;
 using Infrastructure.Data.Configurations;
 using Microsoft.EntityFrameworkCore;
@@ -20,6 +23,12 @@ namespace Infrastructure.Data
         public DbSet<FriendGroup> FriendGroups { get; set; }
         public DbSet<RealtimeIntegrationOutboxItem> RealtimeOutbox { get; set; }
         public DbSet<EmailOutboxItem> EmailOutbox { get; set; }
+        public DbSet<NotificationOutboxItem> NotificationOutbox { get; set; }
+        public DbSet<SecurityEvent> SecurityEvents { get; set; }
+        public DbSet<AdminAuditLog> AdminAuditLogs { get; set; }
+        public DbSet<InAppNotification> InAppNotifications { get; set; }
+        public DbSet<UserReport> UserReports { get; set; }
+        public DbSet<TrustedDevice> TrustedDevices { get; set; }
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -52,12 +61,88 @@ namespace Infrastructure.Data
                 .HasForeignKey(ur => ur.RoleId)
                 .OnDelete(DeleteBehavior.Cascade);
 
+            builder.Entity<SecurityEvent>(e =>
+            {
+                e.ToTable("T_SecurityEvent");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.DeviceId).HasMaxLength(128);
+                e.Property(x => x.ClientIp).HasMaxLength(64);
+                e.Property(x => x.Location).HasMaxLength(256);
+                e.Property(x => x.Detail).HasMaxLength(1024);
+                e.Property(x => x.ActorUserId).HasMaxLength(64);
+                e.HasIndex(x => new { x.UserId, x.Id }).HasDatabaseName("IX_SecurityEvent_UserId_Id");
+            });
+
+            builder.Entity<AdminAuditLog>(e =>
+            {
+                e.ToTable("T_AdminAuditLog");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.Action).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Reason).HasMaxLength(512);
+                e.Property(x => x.Detail).HasMaxLength(1024);
+                e.Property(x => x.ClientIp).HasMaxLength(64);
+                e.HasIndex(x => new { x.AdminUserId, x.CreatedAt }).HasDatabaseName("IX_AdminAuditLog_Admin_Created");
+                e.HasIndex(x => x.TargetUserId).HasDatabaseName("IX_AdminAuditLog_Target");
+            });
+
+            builder.Entity<InAppNotification>(e =>
+            {
+                e.ToTable("T_InAppNotification");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.Type).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Title).HasMaxLength(200).IsRequired();
+                e.Property(x => x.Body).HasMaxLength(2000).IsRequired();
+                e.HasIndex(x => new { x.UserId, x.Id }).HasDatabaseName("IX_InAppNotification_UserId_Id");
+                e.HasIndex(x => x.SourceOutboxId)
+                    .IsUnique()
+                    .HasFilter("\"SourceOutboxId\" IS NOT NULL")
+                    .HasDatabaseName("IX_InAppNotification_SourceOutboxId");
+                e.HasIndex(x => x.UserId)
+                    .HasFilter("\"IsRead\" = FALSE")
+                    .HasDatabaseName("IX_InAppNotification_UserId_Unread");
+            });
+
+            builder.Entity<UserReport>(e =>
+            {
+                e.ToTable("T_UserReport");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.TargetType).HasConversion<byte>();
+                e.Property(x => x.Status).HasConversion<byte>();
+                e.Property(x => x.Reason).HasMaxLength(200).IsRequired();
+                e.Property(x => x.Detail).HasMaxLength(2000);
+                e.Property(x => x.TargetMessageId).HasMaxLength(128);
+                e.Property(x => x.EvidenceSnapshot).HasMaxLength(4000);
+                e.Property(x => x.AppealNote).HasMaxLength(2000);
+                e.HasIndex(x => new { x.Status, x.Id }).HasDatabaseName("IX_UserReport_Status_Id");
+                e.HasIndex(x => x.TargetUserId).HasDatabaseName("IX_UserReport_TargetUser");
+                e.HasIndex(x => new { x.ReporterId, x.TargetUserId, x.TargetMessageId, x.CreatedAt })
+                    .HasDatabaseName("IX_UserReport_Reporter_Target_Created");
+            });
+
+            builder.Entity<TrustedDevice>(e =>
+            {
+                e.ToTable("T_TrustedDevice");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.DeviceIdHint).HasMaxLength(128);
+                e.Property(x => x.TokenHash).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Label).HasMaxLength(128);
+                e.Property(x => x.ClientIp).HasMaxLength(64);
+                e.HasIndex(x => x.TokenHash).IsUnique().HasDatabaseName("IX_TrustedDevice_TokenHash");
+                e.HasIndex(x => new { x.UserId, x.ExpiresAt }).HasDatabaseName("IX_TrustedDevice_User_Expires");
+            });
+
             builder.Ignore<Capture>();
             builder.ApplyConfiguration(new FriendshipConfig());
             builder.ApplyConfiguration(new FriendRequestConfig());
             builder.ApplyConfiguration(new BlockRecordConfig());
             builder.ApplyConfiguration(new FriendGroupConfig());
             builder.ApplyConfiguration(new EmailOutboxItemConfig());
+            builder.ApplyConfiguration(new NotificationOutboxItemConfig());
             builder.AddChatAppRealtimeOutbox();
         }
     }

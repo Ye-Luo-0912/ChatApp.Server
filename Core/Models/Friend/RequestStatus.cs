@@ -13,5 +13,9 @@ public enum RequestStatus:byte
     /// <summary>
     /// 请求已被拒绝
     /// </summary>
-    Declined
+    Declined,
+    /// <summary>
+    /// 请求方已撤回
+    /// </summary>
+    Withdrawn
 }

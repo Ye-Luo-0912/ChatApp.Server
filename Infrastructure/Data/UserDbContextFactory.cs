@@ -1,22 +1,20 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 
-namespace Infrastructure.Data
+namespace Infrastructure.Data;
+
+internal sealed class UserDbContextFactory : IDesignTimeDbContextFactory<UserDbContext>
 {
-    internal class UserDbContextFactory : IDesignTimeDbContextFactory<UserDbContext>
+    public UserDbContext CreateDbContext(string[] args)
     {
-        /// <summary>
-        /// 设计时 DbContext 工厂，用于在设计时创建 UserDbContext 实例，主要用于迁移和其他设计时操作
-        /// </summary>
-        /// <param name="args"></param>
-        /// <returns></returns>
-        public UserDbContext CreateDbContext(string[] args)
-        {
-            var optionsBuilder = new DbContextOptionsBuilder<UserDbContext>();
+        var connectionString =
+            Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection")
+            ?? Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES")
+            ?? throw new InvalidOperationException(
+                "设计时迁移需要连接串：请设置环境变量 ConnectionStrings__DefaultConnection，或先加载项目根目录 .env。");
 
-            optionsBuilder.UseNpgsql("Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=520666");
-
-            return new UserDbContext(optionsBuilder.Options);
-        }
+        var optionsBuilder = new DbContextOptionsBuilder<UserDbContext>();
+        optionsBuilder.UseNpgsql(connectionString);
+        return new UserDbContext(optionsBuilder.Options);
     }
 }

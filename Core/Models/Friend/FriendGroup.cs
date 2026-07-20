@@ -27,6 +27,12 @@ public class FriendGroup
     /// </summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
+    /// <summary>排序权重，越小越靠前。</summary>
+    public int SortOrder { get; set; }
+
+    /// <summary>是否为默认分组。</summary>
+    public bool IsDefault { get; set; }
+
     /// <summary>
     /// 表示该好友组的所有者。
     /// </summary>

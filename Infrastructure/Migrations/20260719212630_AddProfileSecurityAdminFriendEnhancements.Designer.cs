@@ -3,6 +3,7 @@ using System;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Infrastructure.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260719212630_AddProfileSecurityAdminFriendEnhancements")]
+    partial class AddProfileSecurityAdminFriendEnhancements
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -327,17 +330,9 @@ namespace Infrastructure.Migrations
                     b.Property<int>("AccessFailedCount")
                         .HasColumnType("integer");
 
-                    b.Property<bool>("AllowBeSearched")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(true);
-
                     b.Property<string>("AvatarUrl")
                         .HasMaxLength(2048)
                         .HasColumnType("character varying(2048)");
-
-                    b.Property<DateTimeOffset?>("BanUntil")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTime?>("Birthday")
                         .HasColumnType("timestamp with time zone");
@@ -346,16 +341,6 @@ namespace Infrastructure.Migrations
                         .HasColumnType("text");
 
                     b.Property<DateTimeOffset>("CreatedDate")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("DeletionLeaseOwner")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTimeOffset?>("DeletionLeaseUntil")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset?>("DeletionScheduledAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("Email")
@@ -382,11 +367,6 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset?>("LockoutEnd")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<bool>("MustChangePassword")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(false);
-
                     b.Property<string>("NormalizedEmail")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
@@ -399,16 +379,6 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
 
-                    b.Property<bool>("NotifyFriendRequests")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(true);
-
-                    b.Property<bool>("NotifySecurityEmail")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(true);
-
                     b.Property<string>("PasswordHash")
                         .HasColumnType("text");
 
@@ -419,21 +389,11 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset?>("PendingEmailRequestedAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<string>("PendingRecoveryCodesHashJson")
-                        .HasColumnType("text");
-
-                    b.Property<string>("PendingTotpSecret")
-                        .HasMaxLength(512)
-                        .HasColumnType("character varying(512)");
-
                     b.Property<string>("PhoneNumber")
                         .HasColumnType("text");
 
                     b.Property<bool>("PhoneNumberConfirmed")
                         .HasColumnType("boolean");
-
-                    b.Property<string>("RecoveryCodesHashJson")
-                        .HasColumnType("text");
 
                     b.Property<string>("Region")
                         .HasMaxLength(200)
@@ -449,10 +409,6 @@ namespace Infrastructure.Migrations
                     b.Property<int>("Status")
                         .HasColumnType("integer");
 
-                    b.Property<string>("TotpSecret")
-                        .HasMaxLength(512)
-                        .HasColumnType("character varying(512)");
-
                     b.Property<bool>("TwoFactorEnabled")
                         .HasColumnType("boolean");
 
@@ -464,10 +420,6 @@ namespace Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
-
-                    b.HasIndex("DeletionScheduledAt")
-                        .HasDatabaseName("IX_AspNetUsers_DeletionScheduledAt")
-                        .HasFilter("\"DeletionScheduledAt\" IS NOT NULL");
 
                     b.HasIndex("NormalizedEmail")
                         .IsUnique()
@@ -496,154 +448,6 @@ namespace Infrastructure.Migrations
                     b.HasIndex("RoleId");
 
                     b.ToTable("AspNetUserRoles", (string)null);
-                });
-
-            modelBuilder.Entity("Core.Models.Moderation.UserReport", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<string>("AppealNote")
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
-
-                    b.Property<DateTimeOffset?>("BanUntil")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Detail")
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
-
-                    b.Property<string>("EvidenceSnapshot")
-                        .HasMaxLength(4000)
-                        .HasColumnType("character varying(4000)");
-
-                    b.Property<string>("Reason")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("character varying(200)");
-
-                    b.Property<long>("ReporterId")
-                        .HasColumnType("bigint");
-
-                    b.Property<long?>("ReviewedByAdminId")
-                        .HasColumnType("bigint");
-
-                    b.Property<byte>("Status")
-                        .HasColumnType("smallint");
-
-                    b.Property<string>("TargetMessageId")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
-
-                    b.Property<byte>("TargetType")
-                        .HasColumnType("smallint");
-
-                    b.Property<long?>("TargetUserId")
-                        .HasColumnType("bigint");
-
-                    b.Property<DateTimeOffset>("UpdatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("TargetUserId")
-                        .HasDatabaseName("IX_UserReport_TargetUser");
-
-                    b.HasIndex("Status", "Id")
-                        .HasDatabaseName("IX_UserReport_Status_Id");
-
-                    b.HasIndex("ReporterId", "TargetUserId", "TargetMessageId", "CreatedAt")
-                        .HasDatabaseName("IX_UserReport_Reporter_Target_Created");
-
-                    b.ToTable("T_UserReport", (string)null);
-                });
-
-            modelBuilder.Entity("Core.Models.Notifications.NotificationOutboxItem", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<int>("AttemptCount")
-                        .HasColumnType("integer");
-
-                    b.Property<string>("Body")
-                        .IsRequired()
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset?>("EmailDeliveredAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("IdempotencyKey")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
-
-                    b.Property<DateTimeOffset?>("InAppDeliveredAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("LastError")
-                        .HasMaxLength(1000)
-                        .HasColumnType("character varying(1000)");
-
-                    b.Property<string>("LockOwner")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTimeOffset?>("LockedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset>("NextAttemptAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<bool>("PreferEmail")
-                        .HasColumnType("boolean");
-
-                    b.Property<byte>("Status")
-                        .HasColumnType("smallint");
-
-                    b.Property<string>("Title")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("character varying(200)");
-
-                    b.Property<string>("Type")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTimeOffset>("UpdatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<long>("UserId")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("IdempotencyKey")
-                        .IsUnique()
-                        .HasDatabaseName("IX_NotificationOutbox_IdempotencyKey_Active")
-                        .HasFilter("\"IdempotencyKey\" IS NOT NULL AND \"Status\" IN (0, 1, 3)");
-
-                    b.HasIndex("Status", "LockedAt")
-                        .HasDatabaseName("IX_NotificationOutbox_Status_LockedAt");
-
-                    b.HasIndex("Status", "NextAttemptAt")
-                        .HasDatabaseName("IX_NotificationOutbox_Status_NextAttemptAt");
-
-                    b.ToTable("T_NotificationOutbox", (string)null);
                 });
 
             modelBuilder.Entity("Core.Models.Security.AdminAuditLog", b =>
@@ -691,58 +495,6 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_AdminAuditLog", (string)null);
                 });
 
-            modelBuilder.Entity("Core.Models.Security.InAppNotification", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<string>("Body")
-                        .IsRequired()
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
-
-                    b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<bool>("IsRead")
-                        .HasColumnType("boolean");
-
-                    b.Property<long?>("SourceOutboxId")
-                        .HasColumnType("bigint");
-
-                    b.Property<string>("Title")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("character varying(200)");
-
-                    b.Property<string>("Type")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<long>("UserId")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SourceOutboxId")
-                        .IsUnique()
-                        .HasDatabaseName("IX_InAppNotification_SourceOutboxId")
-                        .HasFilter("\"SourceOutboxId\" IS NOT NULL");
-
-                    b.HasIndex("UserId")
-                        .HasDatabaseName("IX_InAppNotification_UserId_Unread")
-                        .HasFilter("\"IsRead\" = FALSE");
-
-                    b.HasIndex("UserId", "Id")
-                        .HasDatabaseName("IX_InAppNotification_UserId_Id");
-
-                    b.ToTable("T_InAppNotification", (string)null);
-                });
-
             modelBuilder.Entity("Core.Models.Security.SecurityEvent", b =>
                 {
                     b.Property<long>("Id")
@@ -786,58 +538,6 @@ namespace Infrastructure.Migrations
                         .HasDatabaseName("IX_SecurityEvent_UserId_Id");
 
                     b.ToTable("T_SecurityEvent", (string)null);
-                });
-
-            modelBuilder.Entity("Core.Models.Security.TrustedDevice", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<string>("ClientIp")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<string>("DeviceIdHint")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
-
-                    b.Property<DateTimeOffset>("ExpiresAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Label")
-                        .HasMaxLength(128)
-                        .HasColumnType("character varying(128)");
-
-                    b.Property<DateTimeOffset>("LastSeenAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset?>("RevokedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("TokenHash")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTimeOffset>("TrustedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<long>("UserId")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("TokenHash")
-                        .IsUnique()
-                        .HasDatabaseName("IX_TrustedDevice_TokenHash");
-
-                    b.HasIndex("UserId", "ExpiresAt")
-                        .HasDatabaseName("IX_TrustedDevice_User_Expires");
-
-                    b.ToTable("T_TrustedDevice", (string)null);
                 });
 
             modelBuilder.Entity("Core.Models.Friend.BlockRecord", b =>

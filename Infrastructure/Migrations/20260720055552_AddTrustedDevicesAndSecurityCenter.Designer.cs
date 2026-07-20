@@ -3,6 +3,7 @@ using System;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Infrastructure.Migrations
 {
     [DbContext(typeof(UserDbContext))]
-    partial class UserDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260720055552_AddTrustedDevicesAndSecurityCenter")]
+    partial class AddTrustedDevicesAndSecurityCenter
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -584,15 +587,9 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<DateTimeOffset?>("EmailDeliveredAt")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<string>("IdempotencyKey")
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
-
-                    b.Property<DateTimeOffset?>("InAppDeliveredAt")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("LastError")
                         .HasMaxLength(1000)
@@ -710,9 +707,6 @@ namespace Infrastructure.Migrations
                     b.Property<bool>("IsRead")
                         .HasColumnType("boolean");
 
-                    b.Property<long?>("SourceOutboxId")
-                        .HasColumnType("bigint");
-
                     b.Property<string>("Title")
                         .IsRequired()
                         .HasMaxLength(200)
@@ -727,15 +721,6 @@ namespace Infrastructure.Migrations
                         .HasColumnType("bigint");
 
                     b.HasKey("Id");
-
-                    b.HasIndex("SourceOutboxId")
-                        .IsUnique()
-                        .HasDatabaseName("IX_InAppNotification_SourceOutboxId")
-                        .HasFilter("\"SourceOutboxId\" IS NOT NULL");
-
-                    b.HasIndex("UserId")
-                        .HasDatabaseName("IX_InAppNotification_UserId_Unread")
-                        .HasFilter("\"IsRead\" = FALSE");
 
                     b.HasIndex("UserId", "Id")
                         .HasDatabaseName("IX_InAppNotification_UserId_Id");
@@ -800,12 +785,10 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
-                    b.Property<string>("DeviceIdHint")
+                    b.Property<string>("DeviceId")
+                        .IsRequired()
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
-
-                    b.Property<DateTimeOffset>("ExpiresAt")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("Label")
                         .HasMaxLength(128)
@@ -813,14 +796,6 @@ namespace Infrastructure.Migrations
 
                     b.Property<DateTimeOffset>("LastSeenAt")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTimeOffset?>("RevokedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("TokenHash")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
 
                     b.Property<DateTimeOffset>("TrustedAt")
                         .HasColumnType("timestamp with time zone");
@@ -830,12 +805,9 @@ namespace Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("TokenHash")
+                    b.HasIndex("UserId", "DeviceId")
                         .IsUnique()
-                        .HasDatabaseName("IX_TrustedDevice_TokenHash");
-
-                    b.HasIndex("UserId", "ExpiresAt")
-                        .HasDatabaseName("IX_TrustedDevice_User_Expires");
+                        .HasDatabaseName("IX_TrustedDevice_User_Device");
 
                     b.ToTable("T_TrustedDevice", (string)null);
                 });

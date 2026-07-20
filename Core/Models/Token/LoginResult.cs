@@ -20,6 +20,12 @@ public sealed class LoginResult
     public DateTimeOffset LoginAt { get; init; }
     /// <summary>上次成功登录时间（UTC），为空表示首次登录。客户端可据此提示异地登录。</summary>
     public DateTimeOffset? PreviousLoginDate { get; init; }
+    /// <summary>本次登录的客户端 IP。</summary>
+    public string? ClientIp { get; init; }
+    /// <summary>是否为该设备首次出现的会话（新设备登录提醒）。</summary>
+    public bool IsNewDevice { get; init; }
+    /// <summary>当前 IP 是否与既有活跃会话均不一致（异常地点提醒）。</summary>
+    public bool IsUnusualLocation { get; init; }
     /// <summary>本次登录的会话唯一标识；TCP 握手时可携带，用于会话关联。</summary>
     public string? SessionId { get; init; }
     /// <summary>
@@ -28,6 +34,10 @@ public sealed class LoginResult
     /// 完整设备信息（设备名、IP 等）可通过 SessionId 关联的会话包获取。
     /// </summary>
     public ulong? DeviceIdHash { get; init; }
+
+    /// <summary>需要 MFA 时返回，客户端携带至 /api/auth/mfa/verify。</summary>
+    public string? MfaToken { get; init; }
+    public bool RequiresTwoFactor { get; init; }
 
     // ---------- 用户画像快照（避免客户端登录后再发一次 /profile 请求） ----------
     public long? UserId { get; init; }
@@ -52,6 +62,16 @@ public sealed class LoginResult
         LoginCheckStatus = status
     };
 
+    public static LoginResult RequireMfa(long userId, string mfaToken) => new()
+    {
+        IsSuccess = false,
+        LoginCheckStatus = LoginCheckStatus.RequiresTwoFactor,
+        ErrorMessage = "需要两步验证",
+        UserId = userId,
+        MfaToken = mfaToken,
+        RequiresTwoFactor = true,
+    };
+
     /// <summary>
     /// 工厂方法：创建一个表示登录成功的 LoginResult 实例。
     /// </summary>
@@ -74,13 +94,19 @@ public sealed class LoginResult
         DateTime accessTokenExpiresAtUtc,
         string refreshToken,
         DateTime refreshTokenExpiresAtUtc,
-        ref ServerEndPoint server
+        ref ServerEndPoint server,
+        string? clientIp = null,
+        bool isNewDevice = false,
+        bool isUnusualLocation = false
     ) => new()
     {
         IsSuccess = true,
         LoginCheckStatus = LoginCheckStatus.Success,
         LoginAt                  = DateTimeOffset.UtcNow,
         PreviousLoginDate        = previousLoginDate,
+        ClientIp                 = clientIp,
+        IsNewDevice              = isNewDevice,
+        IsUnusualLocation        = isUnusualLocation,
         SessionId                = sessionId,
         DeviceIdHash             = deviceIdHash,
         UserId                   = user.Id,

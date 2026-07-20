@@ -64,4 +64,14 @@ public enum FriendshipOperationResultErrorCode:byte
     /// 好友分组未定义
     /// </summary>
     FriendGroupNotFound = 11,
+
+    /// <summary>
+    /// 分组名称冲突
+    /// </summary>
+    FriendGroupNameConflict = 12,
+
+    /// <summary>
+    /// 对方隐私设置不允许陌生人申请
+    /// </summary>
+    FriendRequestRejectedByPrivacy = 13,
 }

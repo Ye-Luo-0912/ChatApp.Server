@@ -11,6 +11,7 @@
     </ItemGroup>
 
     <ItemGroup>
+      <PackageReference Include="AWSSDK.S3" Version="3.7.405.1" />
       <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
       <PackageReference Include="MailKit" Version="4.16.0" />
       <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="10.0.5">
@@ -19,13 +20,18 @@
       </PackageReference>
       <PackageReference Include="NLog.Extensions.Logging" Version="6.1.2" />
       <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
+      <PackageReference Include="Otp.NET" Version="1.4.0" />
+      <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
       <PackageReference Include="StackExchange.Redis" Version="2.12.4" />
       <PackageReference Include="TSID.Creator.NET" Version="1.0.0" />
     </ItemGroup>
 
     <ItemGroup>
       <ProjectReference Include="..\Core\Core.csproj" />
-      <ProjectReference Include="..\..\ChatApp.RealtimeServices\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
+      <ProjectReference Include="..\..\ChatApp.RealtimeServices\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj">
+        <SetConfiguration>Configuration=$(Configuration)</SetConfiguration>
+        <SetPlatform>Platform=AnyCPU</SetPlatform>
+      </ProjectReference>
     </ItemGroup>
 
 </Project>
