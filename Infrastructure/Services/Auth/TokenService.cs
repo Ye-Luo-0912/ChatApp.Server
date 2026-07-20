@@ -37,6 +37,8 @@ public sealed class TokenService(
     private const string AccessTokenPrefix  = "AT:";
     private const string RefreshTokenPrefix = "RT:";
     private const string SessionPrefix      = "SS:";
+    /// <summary>用户设备索引：SET of deviceId。</summary>
+    private const string UserDeviceIndexPrefix = "UDI:";
 
     private readonly JwtSettings _settings = options.Value;
 
@@ -114,7 +116,8 @@ public sealed class TokenService(
 
         await Task.WhenAll(
             cache.SetAsync(rtKey, rtData,  absoluteExpiration: expiry, cancellationToken: cancellationToken),
-            cache.SetAsync(ssKey, session, absoluteExpiration: expiry, cancellationToken: cancellationToken));
+            cache.SetAsync(ssKey, session, absoluteExpiration: expiry, cancellationToken: cancellationToken),
+            IndexDeviceAsync(userId, device.DeviceId, expiry, cancellationToken));
 
         logger.LogDebug("刷新令牌及会话已写入缓存，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
     }
@@ -144,7 +147,7 @@ public sealed class TokenService(
         await cache.RemoveAsync(RefreshTokenKey(userId, refreshToken), cancellationToken);
 
         if (data?.DeviceId is { } deviceId)
-            await cache.RemoveAsync(SessionKey(userId, deviceId), cancellationToken);
+            await RevokeSessionAsync(userId, deviceId, cancellationToken);
     }
 
     /// <summary>
@@ -246,6 +249,7 @@ public sealed class TokenService(
 
         if (rotated.Succeeded)
         {
+            await IndexDeviceAsync(userId, device.DeviceId, expiry, cancellationToken);
             logger.LogDebug("刷新令牌已轮换，UserId={UserId}, DeviceId={DeviceId}",
                 userId, device.DeviceId);
         }
@@ -323,6 +327,8 @@ public sealed class TokenService(
                 new CacheSetRequest { Key = ssKey, Value = session, AbsoluteExpiration = refreshExpiry },
             ],
             cancellationToken);
+
+        await IndexDeviceAsync(userId, device.DeviceId, refreshExpiry, cancellationToken);
 
         logger.LogDebug("登录令牌已建立，UserId={UserId}, SessionId={SessionId}, DeviceId={DeviceId}",
             userId, sessionId, device.DeviceId);
@@ -456,6 +462,8 @@ public sealed class TokenService(
             return null;
         }
 
+        await IndexDeviceAsync(userId, device.DeviceId, refreshExpiry, cancellationToken);
+
         logger.LogDebug("令牌已轮换，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
         return rotated.Value;
     }
@@ -470,25 +478,83 @@ public sealed class TokenService(
     public Task<SessionRecord?> GetSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default)
         => cache.GetAsync<SessionRecord>(SessionKey(userId, deviceId), cancellationToken: cancellationToken);
 
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<SessionRecord>> ListSessionsAsync(string userId, CancellationToken cancellationToken = default)
+    {
+        var deviceIds = await cache.SetMembersAsync(UserDeviceIndexKey(userId), cancellationToken).ConfigureAwait(false);
+        if (deviceIds.Count == 0)
+            return [];
+
+        var sessions = new List<SessionRecord>(deviceIds.Count);
+        var stale = new List<string>();
+
+        foreach (var deviceId in deviceIds)
+        {
+            var session = await GetSessionAsync(userId, deviceId, cancellationToken).ConfigureAwait(false);
+            if (session is null || !session.IsActive)
+            {
+                stale.Add(deviceId);
+                continue;
+            }
+
+            sessions.Add(session);
+        }
+
+        if (stale.Count > 0)
+        {
+            await Task.WhenAll(stale.Select(id =>
+                cache.SetRemoveAsync(UserDeviceIndexKey(userId), id, cancellationToken))).ConfigureAwait(false);
+        }
+
+        return sessions;
+    }
+
     /// <summary>
     /// 撤销（删除）指定用户在指定设备上的会话记录，并同步删除对应的访问令牌和刷新令牌。
     /// </summary>
     public async Task RevokeSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default)
     {
         var session = await GetSessionAsync(userId, deviceId, cancellationToken);
-        if (session is null) return;
+        var tasks = new List<Task>(4)
+        {
+            cache.RemoveAsync(SessionKey(userId, deviceId), cancellationToken),
+            cache.SetRemoveAsync(UserDeviceIndexKey(userId), deviceId, cancellationToken),
+        };
 
-        var tasks = new List<Task>(3) { cache.RemoveAsync(SessionKey(userId, deviceId), cancellationToken) };
-        if (session.CurrentAccessTokenKey  is not null) tasks.Add(cache.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
-        if (session.CurrentRefreshTokenKey is not null) tasks.Add(cache.RemoveAsync(session.CurrentRefreshTokenKey, cancellationToken));
+        if (session?.CurrentAccessTokenKey  is not null) tasks.Add(cache.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
+        if (session?.CurrentRefreshTokenKey is not null) tasks.Add(cache.RemoveAsync(session.CurrentRefreshTokenKey, cancellationToken));
 
         await Task.WhenAll(tasks);
         logger.LogDebug("会话已撤销，UserId={UserId}, DeviceId={DeviceId}", userId, deviceId);
     }
 
+    /// <inheritdoc />
+    public async Task<int> RevokeAllSessionsAsync(string userId, string? exceptDeviceId = null, CancellationToken cancellationToken = default)
+    {
+        var deviceIds = await cache.SetMembersAsync(UserDeviceIndexKey(userId), cancellationToken).ConfigureAwait(false);
+        var revoked = 0;
+
+        foreach (var deviceId in deviceIds)
+        {
+            if (exceptDeviceId is not null && string.Equals(deviceId, exceptDeviceId, StringComparison.Ordinal))
+                continue;
+
+            await RevokeSessionAsync(userId, deviceId, cancellationToken).ConfigureAwait(false);
+            revoked++;
+        }
+
+        if (exceptDeviceId is null)
+            await cache.KeyDeleteAsync(UserDeviceIndexKey(userId), cancellationToken).ConfigureAwait(false);
+
+        return revoked;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 私有辅助方法
     // ─────────────────────────────────────────────────────────────────────────
+
+    private Task IndexDeviceAsync(string userId, string deviceId, TimeSpan ttl, CancellationToken cancellationToken)
+        => cache.SetAddAsync(UserDeviceIndexKey(userId), deviceId, ttl, cancellationToken);
 
     /// <summary>对令牌做 SHA-256 哈希，用于构造 Redis 键，避免原始值出现在键名中。</summary>
     private static string HashToken(string token)
@@ -505,6 +571,9 @@ public sealed class TokenService(
 
     private static string SessionKey(string userId, string deviceId)
         => $"{SessionPrefix}{userId}:{deviceId}";
+
+    private static string UserDeviceIndexKey(string userId)
+        => $"{UserDeviceIndexPrefix}{userId}";
 
     private Task<RefreshToken?> GetRefreshTokenData(string userId, string refreshToken, CancellationToken cancellationToken = default)
         => cache.GetAsync<RefreshToken>(RefreshTokenKey(userId, refreshToken), cancellationToken: cancellationToken);

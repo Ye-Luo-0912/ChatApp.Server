@@ -1,13 +1,19 @@
-﻿using Core.Exceptions;
+﻿using System.Security.Cryptography;
+using Core.Caching;
+using Core.Exceptions;
 using Core.Interfaces;
+using Core.Interfaces.Auth;
+using Core.Interfaces.Cache;
+using Core.Models;
 using Core.Models.Auth;
 using Core.Models.Identity;
+using Core.Models.Security;
 using Core.Models.Token;
+using Core.Settings;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Core.Settings;
 
 namespace Infrastructure.Services.Auth;
 
@@ -18,27 +24,32 @@ public class AuthService(
     UserDbContext db,
     IPasswordHasher passwordHasher,
     ITokenService tokenService,
+    ISessionStore sessionStore,
+    IDeviceInfo deviceInfo,
+    IEmailVerificationService emailVerificationService,
     ITsidGenerator tsidGenerator,
+    ISecurityEventStore securityEventStore,
+    IMfaService mfaService,
+    ICacheProvider cache,
+    ISecurityNotificationService securityNotifications,
     IOptions<RealtimeGatewayOptions> realtimeGatewayOptions,
     ILogger<AuthService> logger) : IAuthService
 {
     private const int MaxFailedAccessAttempts = 5;
+    private const int MaxMfaAttempts = 5;
     private static readonly TimeSpan LockoutDuration = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MfaChallengeTtl = TimeSpan.FromMinutes(5);
 
     private readonly ILogger<AuthService> _logger = logger;
     private readonly UserDbContext _db = db;
     private readonly IPasswordHasher _passwordHasher = passwordHasher;
     private readonly ITokenService _tokenService = tokenService;
+    private readonly ISessionStore _sessionStore = sessionStore;
+    private readonly IDeviceInfo _deviceInfo = deviceInfo;
+    private readonly IEmailVerificationService _emailVerificationService = emailVerificationService;
     private readonly RealtimeGatewayOptions _realtimeGateway = realtimeGatewayOptions.Value;
 
-    /// <summary>
-    /// 使用提供的账户和密码进行登录。
-    /// </summary>
-    /// <param name="account">用户的账户名。</param>
-    /// <param name="password">用户的密码。</param>
-    /// <param name="cancellationToken">用于取消操作的令牌。</param>
-    /// <returns>返回一个<see cref="LoginResult"/>对象，包含登录结果信息。如果登录成功，则包括访问令牌、刷新令牌及其过期时间等；如果失败，则返回错误信息及状态。</returns>
-    /// <exception cref="IdentityException">当登录过程中发生异常时抛出。</exception>
+    /// <inheritdoc />
     public async Task<LoginResult> LoginAsync(string account, string password, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(account) || string.IsNullOrWhiteSpace(password))
@@ -46,28 +57,26 @@ public class AuthService(
 
         try
         {
-            // 先统一校验账户状态和密码正确性。
             var (status, user) = await VerifyUserCredentialsAsync(account, password, cancellationToken);
             if (user is null)
                 return LoginResult.Fail("用户名或密码错误 / 账户已被锁定", status);
 
-            var roles = await GetRolesAsync(user.Id, cancellationToken);
-            var tokens = await _tokenService.IssueLoginTokensAsync(user, roles, cancellationToken);
+            if (user.MustChangePassword)
+                return LoginResult.Fail("检测到异常登录，请先重置或修改密码后再登录", LoginCheckStatus.NotAllowed);
 
-            // 记录上次登录时间后再更新，供登录响应携带「异地登录提醒」
-            var previousLoginDate = user.LastLoginDate;
-            await UpdateLastLoginAsync(user, cancellationToken);
-
-            var tcpServer = new ServerEndPoint
+            if (user.TwoFactorEnabled && !string.IsNullOrWhiteSpace(user.TotpSecret))
             {
-                Host = _realtimeGateway.Host,
-                Port = _realtimeGateway.Port,
-                Name = _realtimeGateway.Name
-            };
+                var mfaToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                    .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+                var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, mfaToken);
+                await cache.StringSetAsync(key, user.Id.ToString(), MfaChallengeTtl, cancellationToken);
+                _logger.LogInformation("用户 {UserId} 需要 MFA 验证", user.Id);
+                return LoginResult.RequireMfa(user.Id, mfaToken);
+            }
 
-            _logger.LogInformation("用户 {Username} 登录成功", account);
-            return LoginResult.Success(user, previousLoginDate, tokens.SessionId, tokens.DeviceIdHash, tokens.AccessToken, tokens.AccessTokenExpiresAtUtc, tokens.RefreshToken, tokens.RefreshTokenExpiresAtUtc, ref tcpServer);
+            return await CompleteLoginAsync(user, account, cancellationToken);
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogError(ex, "用户 {Username} 登录时发生异常", account);
@@ -75,15 +84,168 @@ public class AuthService(
         }
     }
 
-    /// <summary>
-    /// 撤销指定用户的刷新令牌，实现登出。
-    /// </summary>
+    /// <inheritdoc />
+    public async Task<LoginResult> VerifyMfaAsync(
+        string mfaToken, string code, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(mfaToken) || string.IsNullOrWhiteSpace(code))
+            return LoginResult.Fail("MFA 参数无效", LoginCheckStatus.InvalidCredentials);
+
+        var token = mfaToken.Trim();
+        var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, token);
+        var attemptsKey = CacheKeyBuilder.WithPrefix(CacheConstants.MfaAttemptsPrefix, token);
+
+        var attempts = await cache.StringIncrementAsync(attemptsKey, MfaChallengeTtl, cancellationToken);
+        if (attempts > MaxMfaAttempts)
+        {
+            await cache.RemoveAsync(key, cancellationToken);
+            await cache.RemoveAsync(attemptsKey, cancellationToken);
+            return LoginResult.Fail("MFA 尝试次数过多，请重新登录", LoginCheckStatus.NotAllowed);
+        }
+
+        var userIdRaw = await cache.StringGetAsync(key, cancellationToken: cancellationToken);
+        if (string.IsNullOrWhiteSpace(userIdRaw) || !long.TryParse(userIdRaw, out var userId))
+            return LoginResult.Fail("MFA 挑战已过期，请重新登录", LoginCheckStatus.InvalidCredentials);
+
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
+        if (user is null || !user.TwoFactorEnabled || string.IsNullOrWhiteSpace(user.TotpSecret))
+            return LoginResult.Fail("MFA 不可用", LoginCheckStatus.InvalidCredentials);
+
+        var ok = mfaService.VerifyTotpForUser(user, code)
+                 || await mfaService.TryConsumeRecoveryCodeAsync(userId, code, cancellationToken);
+        if (!ok)
+            return LoginResult.Fail("验证码或恢复码无效", LoginCheckStatus.InvalidCredentials);
+
+        // MFA 成功即视为登录校验通过，清零此前密码失败计数，避免遗留锁定状态。
+        if (user.AccessFailedCount != 0 || user.LockoutEnd is not null)
+        {
+            user.AccessFailedCount = 0;
+            user.LockoutEnd = null;
+        }
+
+        await cache.RemoveAsync(key, cancellationToken);
+        await cache.RemoveAsync(attemptsKey, cancellationToken);
+        return await CompleteLoginAsync(user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
+    }
+
+    private async Task<LoginResult> CompleteLoginAsync(
+        ApplicationUser user, string account, CancellationToken cancellationToken)
+    {
+        var userIdString = user.Id.ToString();
+        var existingSessions = await _sessionStore.ListSessionsAsync(userIdString, cancellationToken);
+        var currentDevice = _deviceInfo.GetDeviceId();
+        var deviceSnapshot = _deviceInfo.GenerateDeviceInfo();
+        var currentIp = deviceSnapshot.IpAddress;
+
+        var roles = await GetRolesAsync(user.Id, cancellationToken);
+        var tokens = await _tokenService.IssueLoginTokensAsync(user, roles, cancellationToken);
+
+        var previousLoginDate = user.LastLoginDate;
+        user.LastLoginDate = DateTimeOffset.UtcNow;
+
+        var isNewDevice = currentDevice is null
+            || existingSessions.All(s => !string.Equals(s.DeviceId, currentDevice, StringComparison.Ordinal));
+        var isUnusualLocation = !string.IsNullOrWhiteSpace(currentIp)
+            && existingSessions.Count > 0
+            && existingSessions.All(s =>
+                string.IsNullOrWhiteSpace(s.ClientIp)
+                || !string.Equals(s.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase));
+
+        var tcpServer = new ServerEndPoint
+        {
+            Host = _realtimeGateway.Host,
+            Port = _realtimeGateway.Port,
+            Name = _realtimeGateway.Name
+        };
+
+        _logger.LogInformation(
+            "用户 {Username} 登录成功 IsNewDevice={IsNewDevice} UnusualLocation={UnusualLocation}",
+            account, isNewDevice, isUnusualLocation);
+
+        var loginEvents = new List<SecurityEvent>
+        {
+            new()
+            {
+                UserId = user.Id,
+                EventType = SecurityEventType.LoginSuccess,
+                DeviceId = currentDevice,
+                ClientIp = currentIp,
+                Detail = $"session={tokens.SessionId}",
+                CreatedAt = DateTimeOffset.UtcNow,
+            },
+        };
+        if (isNewDevice)
+        {
+            loginEvents.Add(new SecurityEvent
+            {
+                UserId = user.Id,
+                EventType = SecurityEventType.LoginNewDevice,
+                DeviceId = currentDevice,
+                ClientIp = currentIp,
+                CreatedAt = DateTimeOffset.UtcNow,
+            });
+            securityNotifications.StageNotify(
+                user.Id, "LoginNewDevice", "新设备登录",
+                $"检测到新设备登录，IP：{currentIp ?? "未知"}。", preferEmail: true);
+        }
+
+        if (isUnusualLocation)
+        {
+            loginEvents.Add(new SecurityEvent
+            {
+                UserId = user.Id,
+                EventType = SecurityEventType.LoginUnusualLocation,
+                DeviceId = currentDevice,
+                ClientIp = currentIp,
+                CreatedAt = DateTimeOffset.UtcNow,
+            });
+            securityNotifications.StageNotify(
+                user.Id, "LoginUnusualLocation", "异常地点登录",
+                $"检测到与既有会话不一致的 IP：{currentIp ?? "未知"}。", preferEmail: true);
+        }
+
+        securityEventStore.StageLoginEvents(loginEvents);
+        try
+        {
+            await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "用户 {UserId} 登录附属写入失败（LastLogin/安全事件/通知），不影响发令牌", user.Id);
+            foreach (var entry in _db.ChangeTracker.Entries()
+                         .Where(e => e.State is EntityState.Added or EntityState.Modified)
+                         .ToList())
+            {
+                if (entry.Entity is SecurityEvent or Core.Models.Notifications.NotificationOutboxItem)
+                    entry.State = EntityState.Detached;
+                else if (entry.Entity is ApplicationUser)
+                    entry.State = EntityState.Unchanged;
+            }
+        }
+
+        return LoginResult.Success(
+            user,
+            previousLoginDate,
+            tokens.SessionId,
+            tokens.DeviceIdHash,
+            tokens.AccessToken,
+            tokens.AccessTokenExpiresAtUtc,
+            tokens.RefreshToken,
+            tokens.RefreshTokenExpiresAtUtc,
+            ref tcpServer,
+            currentIp,
+            isNewDevice,
+            isUnusualLocation);
+    }
+
     public async Task LogoutAsync(long userId, string refreshToken, CancellationToken cancellationToken = default)
     {
         try
         {
             await _tokenService.RevokeRefreshTokenAsync(userId.ToString(), refreshToken, cancellationToken);
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogError(ex, "撤销刷新令牌失败: {UserId}", userId);
@@ -91,15 +253,6 @@ public class AuthService(
         }
     }
 
-    /// <summary>
-    /// 使用提供的用户名、邮箱和密码进行用户注册。
-    /// </summary>
-    /// <param name="username">用户的用户名，如果未提供，则使用邮箱作为用户名。</param>
-    /// <param name="email">用户的邮箱地址。</param>
-    /// <param name="password">用户的密码。</param>
-    /// <param name="cancellationToken">用于取消操作的令牌。</param>
-    /// <returns>返回一个<see cref="UserRegistrationResult"/>对象，包含注册结果信息。如果注册成功，则包括用户ID和用户名；如果失败，则返回错误信息及状态。</returns>
-    /// <exception cref="IdentityException">当注册过程中发生异常时抛出。</exception>
     public async Task<UserRegistrationResult> RegisterAsync(string? username, string email, string password, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
@@ -109,7 +262,6 @@ public class AuthService(
         var normalizedEmail = email.Trim().ToUpperInvariant();
         var normalizedName  = name.ToUpperInvariant();
 
-        // 邮箱和用户名分开检查，以便返回精确的错误提示
         if (await _db.Users.AnyAsync(u => u.NormalizedEmail == normalizedEmail, cancellationToken))
             return UserRegistrationResult.Fail([], "该邮箱已被注册");
 
@@ -123,7 +275,7 @@ public class AuthService(
             NormalizedUserName = normalizedName,
             Email              = email.Trim(),
             NormalizedEmail    = normalizedEmail,
-            // BCrypt 哈希密码，WorkFactor 在 BcryptPasswordHasher 中统一配置
+            EmailConfirmed     = true,
             PasswordHash   = _passwordHasher.HashPassword(password),
             SecurityStamp  = Guid.NewGuid().ToString(),
             LockoutEnabled = true
@@ -136,6 +288,7 @@ public class AuthService(
             _logger.LogInformation("成功创建用户 {UserId}", user.Id);
             return UserRegistrationResult.Success(user.Id, user.UserName ?? name);
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogError(ex, "创建用户时发生异常");
@@ -143,14 +296,6 @@ public class AuthService(
         }
     }
 
-    /// <summary>
-    /// 刷新登录令牌对。
-    /// </summary>
-    /// <param name="account">用户的唯一标识符。</param>
-    /// <param name="refreshToken">用于刷新的旧刷新令牌。</param>
-    /// <param name="cancellationToken">用于取消操作的令牌。</param>
-    /// <returns>包含新访问令牌和刷新令牌的结果，如果失败则返回错误类型。</returns>
-    /// <exception cref="IdentityException">在刷新令牌过程中发生异常时抛出。</exception>
     public async Task<TokenPairResult> RefreshLoginAsync(long account, string refreshToken, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(refreshToken))
@@ -160,19 +305,21 @@ public class AuthService(
         {
             var userIdString = account.ToString();
 
-            // 快速路径：无效令牌时跳过用户查询。真正的互斥由 IssueRefreshTokensAsync 的 CAS 保证。
             var isValid = await _tokenService.ValidateRefreshTokenAsync(userIdString, refreshToken, cancellationToken);
             if (!isValid)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
-            // 再回到用户源数据读取最新角色，避免只依赖旧令牌里的历史信息。
             var user = await _db.Users.FindAsync([account], cancellationToken);
             if (user is null)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
+            if (user.MustChangePassword
+                || (user.BanUntil.HasValue && user.BanUntil.Value > DateTimeOffset.UtcNow)
+                || (user.LockoutEnabled && user.LockoutEnd.HasValue && user.LockoutEnd.Value > DateTimeOffset.UtcNow))
+                return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
+
             var roles = await GetRolesAsync(user.Id, cancellationToken);
 
-            // 原子轮换：CAS 消费旧 RT，并在同一事务中写入新 AT / RT / Session
             var rotated = await _tokenService.IssueRefreshTokensAsync(
                 userIdString, refreshToken, user, roles, cancellationToken);
 
@@ -181,6 +328,7 @@ public class AuthService(
 
             return TokenPairResult.Success(rotated.Value.accessToken, rotated.Value.refreshToken);
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             _logger.LogError(ex, "刷新用户 {UserId} 的令牌时发生异常", account);
@@ -188,12 +336,6 @@ public class AuthService(
         }
     }
 
-    /// <summary>
-    /// 检查给定的电子邮件地址是否已被注册。
-    /// </summary>
-    /// <param name="email">要检查的电子邮件地址。</param>
-    /// <param name="cancellationToken">用于取消操作的令牌。</param>
-    /// <returns>如果电子邮件已注册，则返回true；否则返回false。在发生异常时也返回false，并记录错误日志。</returns>
     public async Task<bool> IsEmailRegisteredAsync(string email, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(email))
@@ -203,19 +345,40 @@ public class AuthService(
         return await _db.Users.AnyAsync(u => u.NormalizedEmail == normalized, cancellationToken);
     }
 
-    /// <summary>
-    /// 记录最后一次成功登录时间，同时将 VerifyUserCredentials 中对 AccessFailedCount / LockoutEnd
-    /// 的重置一并持久化，避免重复调用 SaveChangesAsync。
-    /// </summary>
-    private async Task UpdateLastLoginAsync(ApplicationUser user, CancellationToken cancellationToken)
+    public async Task<AuthOperationResult> ResetPasswordAsync(
+        string email, string code, string newPassword, CancellationToken cancellationToken = default)
     {
-        user.LastLoginDate = DateTimeOffset.UtcNow;
-        try { await _db.SaveChangesAsync(cancellationToken); }
-        catch (Exception ex)
-        {
-            // 登录流程已完成，LastLoginDate 更新失败不应阻断响应
-            _logger.LogWarning(ex, "用户 {UserId} 登录成功，但最后登录时间更新失败", user.Id);
-        }
+        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(newPassword))
+            return AuthOperationResult.Fail("ValidationFailed", "邮箱、验证码和新密码均不能为空");
+
+        if (newPassword.Length < 6)
+            return AuthOperationResult.Fail("WeakPassword", "密码长度至少 6 位");
+
+        var verify = await _emailVerificationService.VerifyEmailCodeAsync(
+            email, code, EmailCodePurpose.ResetPassword, cancellationToken);
+        if (!verify.IsSuccess)
+            return AuthOperationResult.Fail("InvalidCode", verify.ErrorMessage ?? "验证码无效或已过期");
+
+        var normalized = email.Trim().ToUpperInvariant();
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.NormalizedEmail == normalized, cancellationToken);
+        if (user is null)
+            return AuthOperationResult.Fail("UserNotFound", "用户不存在");
+
+        user.PasswordHash = _passwordHasher.HashPassword(newPassword);
+        user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AccessFailedCount = 0;
+        user.LockoutEnd = null;
+        user.MustChangePassword = false;
+
+        await _db.SaveChangesAsync(cancellationToken);
+        await _sessionStore.RevokeAllSessionsAsync(user.Id.ToString(), cancellationToken: cancellationToken);
+
+        await securityNotifications.NotifyAsync(
+            user.Id, "PasswordChanged", "密码已重置",
+            "您的账号密码已通过邮箱验证码重置。", preferEmail: true, cancellationToken);
+
+        _logger.LogInformation("用户 {UserId} 通过邮箱验证码重置密码，已撤销全部会话", user.Id);
+        return AuthOperationResult.Success();
     }
 
     private async Task<IList<string>> GetRolesAsync(long userId, CancellationToken cancellationToken)
@@ -226,34 +389,28 @@ public class AuthService(
             .ToListAsync(cancellationToken);
     }
 
-    /// <summary>
-    /// 验证用户凭证的有效性。
-    /// </summary>
-    /// <param name="account">用户的账号，可以是用户名或电子邮件。</param>
-    /// <param name="password">用户提供的密码。</param>
-    /// <param name="cancellationToken">用于取消操作的令牌。</param>
-    /// <returns>返回一个元组，包含验证状态和对应的用户对象。如果验证成功，则返回<see cref="LoginCheckStatus.Success"/>及用户对象；
-    /// 如果凭证无效，则返回<see cref="LoginCheckStatus.InvalidCredentials"/>且用户对象为null；
-    /// 如果账户被锁定，则返回<see cref="LoginCheckStatus.LockedOut"/>且用户对象为null。</returns>
     private async Task<(LoginCheckStatus Status, ApplicationUser? User)> VerifyUserCredentialsAsync(string account,
         string password, CancellationToken cancellationToken)
     {
         var normalized = account.Trim().ToUpperInvariant();
 
-        // 邮箱与用户名合并为单次查询，减少一次数据库往返
         var user = await _db.Users.FirstOrDefaultAsync(
             u => u.NormalizedEmail == normalized || u.NormalizedUserName == normalized, cancellationToken);
 
         if (user is null)
             return (LoginCheckStatus.InvalidCredentials, null);
 
-        // 锁定检查必须在密码验证之前，避免为已锁定账号执行 BCrypt 计算
+        if (user.BanUntil.HasValue && user.BanUntil.Value > DateTimeOffset.UtcNow)
+            return (LoginCheckStatus.NotAllowed, null);
+
+        if (user.DeletionScheduledAt.HasValue && user.DeletionScheduledAt.Value <= DateTimeOffset.UtcNow)
+            return (LoginCheckStatus.NotAllowed, null);
+
         if (user.LockoutEnabled
             && user.LockoutEnd.HasValue
             && user.LockoutEnd.Value > DateTimeOffset.UtcNow)
             return (LoginCheckStatus.LockedOut, null);
 
-        // BCrypt.Verify 是故意慢的 CPU 密集操作，所有前置校验通过后才执行
         var isPasswordValid = !string.IsNullOrEmpty(user.PasswordHash)
                               && _passwordHasher.VerifyPassword(password, user.PasswordHash);
 
@@ -275,7 +432,6 @@ public class AuthService(
             return (LoginCheckStatus.InvalidCredentials, null);
         }
 
-        // 登录成功：重置失败计数，由 UpdateLastLoginAsync 统一提交 SaveChanges
         user.AccessFailedCount = 0;
         user.LockoutEnd = null;
         return (LoginCheckStatus.Success, user);
