@@ -43,8 +43,47 @@ public sealed class ModerationService(
         if (targetType == UserReportTargetType.Message && string.IsNullOrWhiteSpace(targetMessageId))
             return AuthOperationResult.Fail("ValidationFailed", "目标消息无效");
 
-        if (targetUserId == reporterId)
-            return AuthOperationResult.Fail("InvalidTarget", "不能举报自己");
+        string? evidenceSnapshot = null;
+        if (targetType == UserReportTargetType.Message)
+        {
+            var evidence = await messageEvidence.TryGetAsync(
+                targetMessageId!.Trim(), reporterId, cancellationToken);
+            if (evidence is null)
+                return AuthOperationResult.Fail("EvidenceUnavailable", "无法从消息服务获取可信证据，请稍后重试");
+
+            // 举报人必须是发送方或接收方
+            if (evidence.SenderUserId != reporterId && evidence.ReceiverUserId != reporterId)
+                return AuthOperationResult.Fail("Forbidden", "只能举报自己参与的消息");
+
+            // 目标用户：对方账号（举报人视角）
+            var derivedTarget = evidence.SenderUserId == reporterId
+                ? evidence.ReceiverUserId
+                : evidence.SenderUserId;
+
+            if (targetUserId is > 0 && targetUserId != derivedTarget && targetUserId != evidence.SenderUserId)
+                return AuthOperationResult.Fail("TargetMismatch", "举报目标用户与消息参与方不一致");
+
+            targetUserId = derivedTarget;
+
+            if (targetUserId == reporterId)
+                return AuthOperationResult.Fail("InvalidTarget", "不能举报自己");
+
+            evidenceSnapshot = Truncate(JsonSerializer.Serialize(new
+            {
+                evidence.MessageId,
+                evidence.SenderUserId,
+                evidence.ReceiverUserId,
+                SentAtUtc = evidence.SentAtUtc,
+                evidence.ContentHashSha256,
+                Body = evidence.BodyText,
+                Source = "message-service",
+            }), 4000);
+        }
+        else
+        {
+            if (targetUserId == reporterId)
+                return AuthOperationResult.Fail("InvalidTarget", "不能举报自己");
+        }
 
         if (targetUserId is > 0)
         {
@@ -64,27 +103,6 @@ public sealed class ModerationService(
             cancellationToken);
         if (duplicate)
             return AuthOperationResult.Fail("DuplicateReport", "24 小时内已提交过相同举报");
-
-        string? evidenceSnapshot = null;
-        if (targetType == UserReportTargetType.Message)
-        {
-            var evidence = await messageEvidence.TryGetAsync(targetMessageId!.Trim(), cancellationToken);
-            if (evidence is null)
-                return AuthOperationResult.Fail("EvidenceUnavailable", "无法从消息服务获取可信证据，请稍后重试");
-
-            if (targetUserId is null or <= 0)
-                targetUserId = evidence.SenderUserId;
-
-            evidenceSnapshot = Truncate(JsonSerializer.Serialize(new
-            {
-                evidence.MessageId,
-                evidence.SenderUserId,
-                SentAtUtc = evidence.SentAtUtc,
-                evidence.ContentHashSha256,
-                Body = evidence.BodyText,
-                Source = "message-service",
-            }), 4000);
-        }
 
         var report = new UserReport
         {

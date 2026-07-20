@@ -5,13 +5,20 @@ namespace Core.Interfaces;
 /// </summary>
 public interface IMessageEvidenceProvider
 {
-    Task<MessageEvidenceSnapshot?> TryGetAsync(string messageId, CancellationToken cancellationToken = default);
+    /// <param name="requestingUserId">
+    /// 可选：经 NATS 查询时须为消息参与方；直连 DB 时可为空（由调用方再校验参与关系）。
+    /// </param>
+    Task<MessageEvidenceSnapshot?> TryGetAsync(
+        string messageId,
+        long? requestingUserId = null,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>消息证据快照（原文来自服务端，含内容哈希便于完整性核对）。</summary>
 public sealed record MessageEvidenceSnapshot(
     string MessageId,
     long SenderUserId,
+    long ReceiverUserId,
     DateTimeOffset SentAtUtc,
     string ContentHashSha256,
     string BodyText);

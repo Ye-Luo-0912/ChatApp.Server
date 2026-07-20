@@ -59,6 +59,7 @@ public abstract partial class Program
         service.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
         service.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
         service.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
+        service.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
 
         service.Configure<JwtSettings>(jwtSettings)
             .AddOptions<JwtSettings>()

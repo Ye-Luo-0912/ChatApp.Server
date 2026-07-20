@@ -1,3 +1,6 @@
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Integration.Outbox;
+using ChatApp.Realtime.Integration.Serialization;
 using Core.Interfaces;
 using Core.Interfaces.Auth;
 using Core.Models.Auth;
@@ -18,8 +21,13 @@ public sealed class AccountLifecycleService(
     ILogger<AccountLifecycleService> logger) : IAccountLifecycleService
 {
     public static readonly TimeSpan CoolDown = TimeSpan.FromDays(14);
-    private static readonly string InstanceId = Environment.MachineName + ":" + Guid.NewGuid().ToString("N")[..8];
+    private readonly string _instanceId = Environment.MachineName + ":" + Guid.NewGuid().ToString("N")[..8];
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(5);
+
+    /// <summary>测试钩子：领取租约后、逐用户清理前调用（用于取消竞态注入）。</summary>
+    public Func<IReadOnlyList<long>, CancellationToken, Task>? AfterClaimHook { get; set; }
+
+    public string LeaseOwnerId => _instanceId;
 
     public async Task<AuthOperationResult> ScheduleDeletionAsync(
         long userId, CancellationToken cancellationToken = default)
@@ -46,16 +54,29 @@ public sealed class AccountLifecycleService(
     public async Task<AuthOperationResult> CancelDeletionAsync(
         long userId, CancellationToken cancellationToken = default)
     {
+        // 行锁：若 Worker 正在事务内清理会阻塞至其提交/回滚，避免半删后仍“取消成功”。
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
+            cancellationToken);
         var user = await db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
         if (user is null)
+        {
+            await tx.RollbackAsync(cancellationToken);
             return AuthOperationResult.Fail("NotFound", "用户不存在");
+        }
+
         if (user.DeletionScheduledAt is null)
+        {
+            await tx.RollbackAsync(cancellationToken);
             return AuthOperationResult.Fail("NotScheduled", "未预约注销");
+        }
 
         user.DeletionScheduledAt = null;
         user.DeletionLeaseUntil = null;
         user.DeletionLeaseOwner = null;
         await db.SaveChangesAsync(cancellationToken);
+        await tx.CommitAsync(cancellationToken);
         return AuthOperationResult.Success();
     }
 
@@ -91,6 +112,7 @@ public sealed class AccountLifecycleService(
 
     public async Task<int> ProcessDueDeletionsAsync(CancellationToken cancellationToken = default)
     {
+        db.ChangeTracker.Clear();
         var now = DateTimeOffset.UtcNow;
         var leaseUntil = now.Add(LeaseDuration);
 
@@ -101,7 +123,7 @@ public sealed class AccountLifecycleService(
                 .SqlQuery<long>($"""
                     UPDATE "AspNetUsers" AS u
                     SET "DeletionLeaseUntil" = {leaseUntil},
-                        "DeletionLeaseOwner" = {InstanceId}
+                        "DeletionLeaseOwner" = {_instanceId}
                     WHERE u."Id" IN (
                         SELECT i."Id" FROM "AspNetUsers" AS i
                         WHERE i."DeletionScheduledAt" IS NOT NULL
@@ -120,62 +142,21 @@ public sealed class AccountLifecycleService(
 
         if (claimedIds.Count == 0) return 0;
 
+        if (AfterClaimHook is not null)
+            await AfterClaimHook(claimedIds, cancellationToken);
+
         var processed = 0;
         foreach (var userId in claimedIds)
         {
             try
             {
-                await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
-
-                // 级联清理用户相关数据（策略：物理删除，非匿名化）
-                await db.Friendships
-                    .Where(f => f.UserId == userId || f.FriendId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.FriendRequests
-                    .Where(r => r.RequesterId == userId || r.TargetUserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.BlockRecords
-                    .Where(b => b.BlockerId == userId || b.BlockedUserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.FriendGroups
-                    .Where(g => g.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.InAppNotifications
-                    .Where(n => n.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.NotificationOutbox
-                    .Where(n => n.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.SecurityEvents
-                    .Where(e => e.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.TrustedDevices
-                    .Where(d => d.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.UserReports
-                    .Where(r => r.ReporterId == userId || r.TargetUserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                await db.UserRoles
-                    .Where(ur => ur.UserId == userId)
-                    .ExecuteDeleteAsync(cancellationToken);
-
-                var deleted = await db.Users
-                    .Where(u => u.Id == userId
-                                && u.DeletionScheduledAt != null
-                                && u.DeletionScheduledAt <= now
-                                && u.DeletionLeaseOwner == InstanceId)
-                    .ExecuteDeleteAsync(cancellationToken);
-                if (deleted > 0) processed++;
+                if (await TryPurgeUserAtomicallyAsync(userId, now, cancellationToken))
+                    processed++;
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "注销用户 {UserId} 失败，释放租约以便重试", userId);
-                await db.Users
-                    .Where(u => u.Id == userId && u.DeletionLeaseOwner == InstanceId)
-                    .ExecuteUpdateAsync(
-                        s => s.SetProperty(u => u.DeletionLeaseUntil, (DateTimeOffset?)null)
-                            .SetProperty(u => u.DeletionLeaseOwner, (string?)null),
-                        cancellationToken);
+                await ReleaseLeaseAsync(userId, cancellationToken);
             }
         }
 
@@ -183,6 +164,141 @@ public sealed class AccountLifecycleService(
             logger.LogWarning("已执行 {Count} 个到期账号注销", processed);
         return processed;
     }
+
+    /// <summary>
+    /// 在单事务内锁定用户、复核注销状态/租约，再物理删除关联数据并删除用户。
+    /// 策略：用户自有数据物理删除；管理员审计日志匿名化保留；Realtime 消息通过 Outbox 事件异步清理。
+    /// </summary>
+    public async Task<bool> TryPurgeUserAtomicallyAsync(
+        long userId, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        db.ChangeTracker.Clear();
+        var strategy = db.Database.CreateExecutionStrategy();
+        return await strategy.ExecuteAsync(async () =>
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
+                cancellationToken);
+            var user = await db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
+
+            if (user is null)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            var scheduledAt = user.DeletionScheduledAt;
+            var leaseOwner = user.DeletionLeaseOwner;
+            // 后续全部用 ExecuteDelete/SQL，避免跟踪实体与批量删除冲突。
+            db.Entry(user).State = EntityState.Detached;
+
+            // 取消注销或租约易主：整事务回滚，关联数据不会被部分删除。
+            if (scheduledAt is null
+                || scheduledAt > now
+                || !string.Equals(leaseOwner, _instanceId, StringComparison.Ordinal))
+            {
+                logger.LogInformation(
+                    "跳过注销 UserId={UserId}：状态已变更（取消或租约不匹配）", userId);
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            // Redis 会话在事务外尽力撤销；失败不阻断 DB 清理（用户行删除后令牌也会失效）。
+            try
+            {
+                await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "注销前撤销会话失败 UserId={UserId}，继续清理数据库", userId);
+            }
+
+            await db.Friendships
+                .Where(f => f.UserId == userId || f.FriendId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.FriendRequests
+                .Where(r => r.RequesterId == userId || r.TargetUserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.BlockRecords
+                .Where(b => b.BlockerId == userId || b.BlockedUserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.FriendGroups
+                .Where(g => g.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.InAppNotifications
+                .Where(n => n.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.NotificationOutbox
+                .Where(n => n.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.SecurityEvents
+                .Where(e => e.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.TrustedDevices
+                .Where(d => d.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.UserReports
+                .Where(r => r.ReporterId == userId || r.TargetUserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+            await db.UserRoles
+                .Where(ur => ur.UserId == userId)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            // 审计日志：匿名化保留（不物理删除），满足合规追溯。
+            await db.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE "T_AdminAuditLog"
+                SET "TargetUserId" = CASE WHEN "TargetUserId" = {userId} THEN NULL ELSE "TargetUserId" END,
+                    "Detail" = COALESCE("Detail", '') || {$" [anonymized-user:{userId}]"},
+                    "AdminUserId" = CASE WHEN "AdminUserId" = {userId} THEN 0 ELSE "AdminUserId" END
+                WHERE "TargetUserId" = {userId} OR "AdminUserId" = {userId}
+                """, cancellationToken);
+
+            // Realtime 消息/会话清理：可靠 Outbox 事件（Saga 由 Realtime 侧消费）。
+            var evt = new RealtimeEvent
+            {
+                EventId = Guid.NewGuid().ToString("N"),
+                Type = RealtimeEventType.UserAccountDeleted,
+                TargetUserId = userId,
+                ActorUserId = userId,
+                OccurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PayloadJson = RealtimeWireSerializer.Serialize(new RealtimeDomainNotificationPayload
+                {
+                    Resource = "user-account",
+                    Action = "deleted",
+                    ResourceId = userId.ToString(),
+                    Message = "account-deleted",
+                }),
+            };
+            db.RealtimeOutbox.Add(RealtimeIntegrationOutboxItem.FromEvent(evt));
+
+            var deleted = await db.Users
+                .Where(u => u.Id == userId
+                            && u.DeletionScheduledAt != null
+                            && u.DeletionScheduledAt <= now
+                            && u.DeletionLeaseOwner == _instanceId)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            if (deleted == 0)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            await db.SaveChangesAsync(cancellationToken);
+            await tx.CommitAsync(cancellationToken);
+            return true;
+        });
+    }
+
+    private Task ReleaseLeaseAsync(long userId, CancellationToken cancellationToken)
+        => db.Users
+            .Where(u => u.Id == userId && u.DeletionLeaseOwner == _instanceId)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(u => u.DeletionLeaseUntil, (DateTimeOffset?)null)
+                    .SetProperty(u => u.DeletionLeaseOwner, (string?)null),
+                cancellationToken);
 }
 
 public sealed class AccountDeletionWorker(

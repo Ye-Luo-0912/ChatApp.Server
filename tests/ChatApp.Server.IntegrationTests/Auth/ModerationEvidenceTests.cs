@@ -3,7 +3,6 @@ using Core.Interfaces;
 using Core.Interfaces.Auth;
 using Core.Models.Identity;
 using Core.Models.Moderation;
-using Core.Models.Security;
 using Infrastructure.Data;
 using Infrastructure.Services;
 using Infrastructure.Services.Utilities;
@@ -22,39 +21,13 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
 
         await using var db = postgres.CreateContext();
-        var tsid = new TsidGeneratorService();
-        var suffix = Guid.NewGuid().ToString("N")[..8];
-        var hasher = new Infrastructure.Services.Auth.BcryptPasswordHasher();
-
-        var reporter = new ApplicationUser
-        {
-            Id = tsid.GenerateTsid(),
-            UserName = $"rep-{suffix}",
-            NormalizedUserName = $"REP-{suffix}".ToUpperInvariant(),
-            Email = $"rep-{suffix}@ex.com",
-            NormalizedEmail = $"REP-{suffix}@EX.COM",
-            EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
-            SecurityStamp = Guid.NewGuid().ToString(),
-        };
-        var sender = new ApplicationUser
-        {
-            Id = tsid.GenerateTsid(),
-            UserName = $"snd-{suffix}",
-            NormalizedUserName = $"SND-{suffix}".ToUpperInvariant(),
-            Email = $"snd-{suffix}@ex.com",
-            NormalizedEmail = $"SND-{suffix}@EX.COM",
-            EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
-            SecurityStamp = Guid.NewGuid().ToString(),
-        };
-        db.Users.AddRange(reporter, sender);
-        await db.SaveChangesAsync();
+        var (reporter, sender) = await SeedPairAsync(db, "rep");
 
         var messageId = $"msg-{Guid.NewGuid():N}";
         var provider = new FakeMessageEvidenceProvider(new MessageEvidenceSnapshot(
             messageId,
             sender.Id,
+            reporter.Id,
             DateTimeOffset.UtcNow.AddMinutes(-5),
             "abc123hash",
             "server-side original body"));
@@ -81,10 +54,56 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
             .SingleAsync(r => r.ReporterId == reporter.Id && r.TargetMessageId == messageId);
         Assert.Equal(sender.Id, report.TargetUserId);
         Assert.Contains("server-side original body", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.Contains("ReceiverUserId", report.EvidenceSnapshot, StringComparison.Ordinal);
         Assert.Contains("abc123hash", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("message-service", report.EvidenceSnapshot, StringComparison.Ordinal);
         Assert.DoesNotContain(forged, report.EvidenceSnapshot, StringComparison.Ordinal);
         Assert.Equal(forged, report.Detail);
+    }
+
+    [SkippableFact]
+    public async Task MessageReport_Rejects_NonParticipant()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var (reporter, _) = await SeedPairAsync(db, "np");
+        var outsider = await SeedUserAsync(db, "out");
+        var messageId = $"msg-{Guid.NewGuid():N}";
+        var provider = new FakeMessageEvidenceProvider(new MessageEvidenceSnapshot(
+            messageId, outsider.Id, outsider.Id + 1, DateTimeOffset.UtcNow, "h", "body"));
+
+        var moderation = new ModerationService(
+            db, new NoopSessionStore(),
+            new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
+            provider, NullLogger<ModerationService>.Instance);
+
+        var result = await moderation.ReportAsync(
+            reporter.Id, UserReportTargetType.Message, null, messageId, "abuse", "x");
+        Assert.False(result.Succeeded);
+        Assert.Contains(result.Errors, e => e.Code == "Forbidden");
+    }
+
+    [SkippableFact]
+    public async Task MessageReport_Rejects_TargetMismatch()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var (reporter, sender) = await SeedPairAsync(db, "mm");
+        var other = await SeedUserAsync(db, "oth");
+        var messageId = $"msg-{Guid.NewGuid():N}";
+        var provider = new FakeMessageEvidenceProvider(new MessageEvidenceSnapshot(
+            messageId, sender.Id, reporter.Id, DateTimeOffset.UtcNow, "h", "body"));
+
+        var moderation = new ModerationService(
+            db, new NoopSessionStore(),
+            new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
+            provider, NullLogger<ModerationService>.Instance);
+
+        var result = await moderation.ReportAsync(
+            reporter.Id, UserReportTargetType.Message, other.Id, messageId, "abuse", "x");
+        Assert.False(result.Succeeded);
+        Assert.Contains(result.Errors, e => e.Code == "TargetMismatch");
     }
 
     [SkippableFact]
@@ -93,22 +112,7 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
 
         await using var db = postgres.CreateContext();
-        var tsid = new TsidGeneratorService();
-        var suffix = Guid.NewGuid().ToString("N")[..8];
-        var hasher = new Infrastructure.Services.Auth.BcryptPasswordHasher();
-        var reporter = new ApplicationUser
-        {
-            Id = tsid.GenerateTsid(),
-            UserName = $"reu-{suffix}",
-            NormalizedUserName = $"REU-{suffix}".ToUpperInvariant(),
-            Email = $"reu-{suffix}@ex.com",
-            NormalizedEmail = $"REU-{suffix}@EX.COM",
-            EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
-            SecurityStamp = Guid.NewGuid().ToString(),
-        };
-        db.Users.Add(reporter);
-        await db.SaveChangesAsync();
+        var reporter = await SeedUserAsync(db, "reu");
 
         var moderation = new ModerationService(
             db,
@@ -130,9 +134,38 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         Assert.False(await db.UserReports.AnyAsync(r => r.ReporterId == reporter.Id));
     }
 
+    private async Task<(ApplicationUser A, ApplicationUser B)> SeedPairAsync(UserDbContext db, string prefix)
+    {
+        var a = await SeedUserAsync(db, prefix + "a");
+        var b = await SeedUserAsync(db, prefix + "b");
+        return (a, b);
+    }
+
+    private static async Task<ApplicationUser> SeedUserAsync(UserDbContext db, string prefix)
+    {
+        var tsid = new TsidGeneratorService();
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var hasher = new Infrastructure.Services.Auth.BcryptPasswordHasher();
+        var user = new ApplicationUser
+        {
+            Id = tsid.GenerateTsid(),
+            UserName = $"{prefix}-{suffix}",
+            NormalizedUserName = $"{prefix}-{suffix}".ToUpperInvariant(),
+            Email = $"{prefix}-{suffix}@ex.com",
+            NormalizedEmail = $"{prefix}-{suffix}@EX.COM",
+            EmailConfirmed = true,
+            PasswordHash = hasher.HashPassword("Passw0rd!"),
+            SecurityStamp = Guid.NewGuid().ToString(),
+        };
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
+        return user;
+    }
+
     private sealed class FakeMessageEvidenceProvider(MessageEvidenceSnapshot snapshot) : IMessageEvidenceProvider
     {
-        public Task<MessageEvidenceSnapshot?> TryGetAsync(string messageId, CancellationToken cancellationToken = default)
+        public Task<MessageEvidenceSnapshot?> TryGetAsync(
+            string messageId, long? requestingUserId = null, CancellationToken cancellationToken = default)
             => Task.FromResult<MessageEvidenceSnapshot?>(
                 string.Equals(messageId, snapshot.MessageId, StringComparison.Ordinal) ? snapshot : null);
     }

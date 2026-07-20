@@ -37,7 +37,20 @@ public static class AddServices
         services.AddScoped<IMfaService, MfaService>();
         services.AddScoped<ISecurityNotificationService, SecurityNotificationService>();
         services.AddScoped<IAdminAuditQuery, AdminAuditQuery>();
-        services.AddSingleton<IMessageEvidenceProvider, UnavailableMessageEvidenceProvider>();
+        services.AddSingleton<IMessageEvidenceProvider>(sp =>
+        {
+            var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>().Value;
+            var bus = sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>();
+            if (!string.IsNullOrWhiteSpace(opts.RealtimeConnectionString) || bus is not null)
+            {
+                return new RealtimeMessageEvidenceProvider(
+                    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RealtimeMessageEvidenceProvider>>(),
+                    bus);
+            }
+
+            return ActivatorUtilities.CreateInstance<UnavailableMessageEvidenceProvider>(sp);
+        });
         services.AddScoped<IModerationService, ModerationService>();
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
         services.AddScoped<INotificationQuery, NotificationQuery>();
