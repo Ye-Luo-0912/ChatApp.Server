@@ -187,7 +187,9 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             new LocalAvatarStorage(
                 Options.Create(new AvatarStorageOptions()),
                 redis.Cache,
-                new AvatarReencodeQueue(),
+                new AvatarReencodeQueue(
+                    Options.Create(new AvatarStorageOptions()),
+                    new AvatarReencodeMetrics()),
                 NullLogger<LocalAvatarStorage>.Instance),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             new NoopSecurityNotificationService(),

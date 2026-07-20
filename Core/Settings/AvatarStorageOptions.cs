@@ -28,6 +28,12 @@ public sealed class AvatarStorageOptions
     /// <summary>用户名修改冷却天数。</summary>
     public int UserNameCooldownDays { get; set; } = 30;
 
+    /// <summary>头像重编码最大并发。</summary>
+    public int ReencodeMaxConcurrency { get; set; } = 2;
+
+    /// <summary>等待重编码闸门超时（毫秒）；0 表示一直等到有空位。</summary>
+    public int ReencodeAcquireTimeoutMilliseconds { get; set; } = 5_000;
+
     // S3 兼容（可选）
     public string? S3Bucket { get; set; }
     public string? S3Endpoint { get; set; }

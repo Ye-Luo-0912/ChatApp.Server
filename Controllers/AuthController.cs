@@ -38,7 +38,11 @@ public class AuthController(
         try
         {
             var result = await authService.LoginAsync(model.Username, model.Password, cancellationToken);
-            return result.IsSuccess ? Ok(result) : BadRequest(result);
+            if (result.IsSuccess)
+                return Ok(result);
+            if (result.LoginCheckStatus == LoginCheckStatus.Overloaded)
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, result);
+            return BadRequest(result);
         }
         catch (IdentityException ex)
         {

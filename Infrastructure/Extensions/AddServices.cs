@@ -21,6 +21,8 @@ public static class AddServices
     {
         services.AddSingleton<IDeviceInfo, DeviceInfoService>();
         services.AddSingleton<IPasswordHasher, BcryptPasswordHasher>();
+        services.AddSingleton<NotificationOutboxMetrics>();
+        services.AddSingleton<AvatarReencodeMetrics>();
 
         // TokenService 是单例，同时以多个子接口注册，各处可按需注入
         services.AddSingleton<TokenService>();

@@ -58,6 +58,8 @@ public class AuthService(
         try
         {
             var (status, user) = await VerifyUserCredentialsAsync(account, password, cancellationToken);
+            if (status == LoginCheckStatus.Overloaded)
+                return LoginResult.Fail("服务繁忙，请稍后重试", LoginCheckStatus.Overloaded);
             if (user is null)
                 return LoginResult.Fail("用户名或密码错误 / 账户已被锁定", status);
 
@@ -132,24 +134,42 @@ public class AuthService(
         ApplicationUser user, string account, CancellationToken cancellationToken)
     {
         var userIdString = user.Id.ToString();
-        var existingSessions = await _sessionStore.ListSessionsAsync(userIdString, cancellationToken);
         var currentDevice = _deviceInfo.GetDeviceId();
         var deviceSnapshot = _deviceInfo.GenerateDeviceInfo();
         var currentIp = deviceSnapshot.IpAddress;
+
+        // 新设备判断：只查当前设备会话，避免每次列举全部会话。
+        Core.Models.Token.SessionRecord? currentSession = null;
+        if (!string.IsNullOrWhiteSpace(currentDevice))
+            currentSession = await _sessionStore.GetSessionAsync(userIdString, currentDevice, cancellationToken);
+
+        var isNewDevice = string.IsNullOrWhiteSpace(currentDevice) || currentSession is null;
+
+        var isUnusualLocation = false;
+        if (!string.IsNullOrWhiteSpace(currentIp))
+        {
+            if (currentSession is not null)
+            {
+                // 同设备：与该会话上次 IP 比较即可（热路径不扫全量会话）
+                isUnusualLocation = string.IsNullOrWhiteSpace(currentSession.ClientIp)
+                    || !string.Equals(currentSession.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                // 新设备：与既有会话 IP 集合比较
+                var existingSessions = await _sessionStore.ListSessionsAsync(userIdString, cancellationToken);
+                isUnusualLocation = existingSessions.Count > 0
+                    && existingSessions.All(s =>
+                        string.IsNullOrWhiteSpace(s.ClientIp)
+                        || !string.Equals(s.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase));
+            }
+        }
 
         var roles = await GetRolesAsync(user.Id, cancellationToken);
         var tokens = await _tokenService.IssueLoginTokensAsync(user, roles, cancellationToken);
 
         var previousLoginDate = user.LastLoginDate;
         user.LastLoginDate = DateTimeOffset.UtcNow;
-
-        var isNewDevice = currentDevice is null
-            || existingSessions.All(s => !string.Equals(s.DeviceId, currentDevice, StringComparison.Ordinal));
-        var isUnusualLocation = !string.IsNullOrWhiteSpace(currentIp)
-            && existingSessions.Count > 0
-            && existingSessions.All(s =>
-                string.IsNullOrWhiteSpace(s.ClientIp)
-                || !string.Equals(s.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase));
 
         var tcpServer = new ServerEndPoint
         {
@@ -411,8 +431,17 @@ public class AuthService(
             && user.LockoutEnd.Value > DateTimeOffset.UtcNow)
             return (LoginCheckStatus.LockedOut, null);
 
-        var isPasswordValid = !string.IsNullOrEmpty(user.PasswordHash)
+        var isPasswordValid = false;
+        try
+        {
+            isPasswordValid = !string.IsNullOrEmpty(user.PasswordHash)
                               && _passwordHasher.VerifyPassword(password, user.PasswordHash);
+        }
+        catch (PasswordVerifyOverloadedException)
+        {
+            _logger.LogWarning("登录过载：BCrypt 闸门繁忙，快速拒绝。Account={Account}", account);
+            return (LoginCheckStatus.Overloaded, null);
+        }
 
         if (!isPasswordValid)
         {

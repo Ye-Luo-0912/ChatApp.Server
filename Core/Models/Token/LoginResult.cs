@@ -149,6 +149,10 @@ public enum LoginCheckStatus:byte
     /// <summary>
     /// 表示用户需要通过两步验证才能登录。这通常发生在用户启用了两步验证但尚未完成验证过程时。
     /// </summary>
-    RequiresTwoFactor = 5
+    RequiresTwoFactor = 5,
+    /// <summary>
+    /// 表示密码校验过载（BCrypt 并发闸门），应快速失败并稍后重试。
+    /// </summary>
+    Overloaded = 6
 }
 

@@ -57,6 +57,8 @@ public abstract partial class Program
 
         service.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
         service.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
+        service.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
+        service.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
 
         service.Configure<JwtSettings>(jwtSettings)
             .AddOptions<JwtSettings>()

@@ -1,17 +1,20 @@
 using Core.Interfaces;
 using Core.Models.Notifications;
 using Core.Models.Security;
+using Core.Settings;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
 public sealed class NotificationOutboxDispatcher(
     UserDbContext db,
     IEmailSender emailSender,
+    NotificationOutboxMetrics metrics,
     ILogger logger)
 {
     private static readonly string InstanceId = Environment.MachineName + ":" + Guid.NewGuid().ToString("N")[..8];
@@ -29,6 +32,16 @@ public sealed class NotificationOutboxDispatcher(
                     .SetProperty(x => x.LockOwner, (string?)null)
                     .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow)
                     .SetProperty(x => x.NextAttemptAt, DateTimeOffset.UtcNow),
+                cancellationToken);
+    }
+
+    public async Task<long> CountBacklogAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return await db.NotificationOutbox.AsNoTracking()
+            .CountAsync(
+                x => (x.Status == NotificationOutboxStatus.Pending || x.Status == NotificationOutboxStatus.Failed)
+                     && x.NextAttemptAt <= now,
                 cancellationToken);
     }
 
@@ -61,7 +74,60 @@ public sealed class NotificationOutboxDispatcher(
         }
 
         if (ids.Count == 0) return [];
+        metrics.RecordClaimed(ids.Count);
         return await db.NotificationOutbox.Where(x => ids.Contains(x.Id)).ToListAsync(cancellationToken);
+    }
+
+    /// <summary>批量写入站内通知，减少逐条 SaveChanges。</summary>
+    public async Task DeliverInAppBatchAsync(
+        IReadOnlyList<NotificationOutboxItem> items, CancellationToken cancellationToken)
+    {
+        var pending = items.Where(i => i.InAppDeliveredAt is null).ToList();
+        if (pending.Count == 0) return;
+
+        var ids = pending.Select(i => i.Id).ToList();
+        var existing = await db.InAppNotifications.AsNoTracking()
+            .Where(n => n.SourceOutboxId != null && ids.Contains(n.SourceOutboxId.Value))
+            .Select(n => n.SourceOutboxId!.Value)
+            .ToListAsync(cancellationToken);
+        var existingSet = existing.ToHashSet();
+
+        var toInsert = pending.Where(i => !existingSet.Contains(i.Id)).ToList();
+        if (toInsert.Count > 0)
+        {
+            foreach (var item in toInsert)
+            {
+                db.InAppNotifications.Add(new InAppNotification
+                {
+                    UserId = item.UserId,
+                    Type = item.Type,
+                    Title = item.Title,
+                    Body = item.Body,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                    SourceOutboxId = item.Id,
+                });
+            }
+
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateException)
+            {
+                db.ChangeTracker.Clear();
+            }
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        await db.NotificationOutbox
+            .Where(x => ids.Contains(x.Id) && x.InAppDeliveredAt == null)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(x => x.InAppDeliveredAt, now)
+                    .SetProperty(x => x.UpdatedAt, now),
+                cancellationToken);
+
+        foreach (var item in pending)
+            item.InAppDeliveredAt = now;
     }
 
     public async Task ProcessItemAsync(NotificationOutboxItem item, CancellationToken cancellationToken)
@@ -89,7 +155,6 @@ public sealed class NotificationOutboxDispatcher(
                     }
                     catch (DbUpdateException)
                     {
-                        // 唯一约束冲突：并发重试已写入
                         db.ChangeTracker.Clear();
                     }
                 }
@@ -135,6 +200,7 @@ public sealed class NotificationOutboxDispatcher(
                         .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow)
                         .SetProperty(x => x.LastError, (string?)null),
                     cancellationToken);
+            metrics.RecordSent();
         }
         catch (Exception ex)
         {
@@ -153,16 +219,30 @@ public sealed class NotificationOutboxDispatcher(
                         .SetProperty(x => x.NextAttemptAt, DateTimeOffset.UtcNow.Add(delay))
                         .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow),
                     cancellationToken);
+            if (dead) metrics.RecordDead();
+            else metrics.RecordFailed();
         }
     }
 }
 
 public sealed class NotificationDispatchWorker(
     IServiceScopeFactory scopeFactory,
+    IOptions<NotificationOutboxOptions> options,
+    NotificationOutboxMetrics metrics,
     ILogger<NotificationDispatchWorker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var opts = options.Value;
+        var concurrency = Math.Max(1, opts.MaxConcurrency);
+        var batchSize = Math.Max(1, opts.BatchSize);
+        var poll = TimeSpan.FromSeconds(Math.Max(1, opts.PollIntervalSeconds));
+        var backlogEvery = TimeSpan.FromSeconds(Math.Max(5, opts.BacklogSampleSeconds));
+        var lastBacklogSample = DateTimeOffset.MinValue;
+
+        using var semaphore = new SemaphoreSlim(concurrency, concurrency);
+        var inFlight = new List<Task>();
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -170,11 +250,29 @@ public sealed class NotificationDispatchWorker(
                 await using var scope = scopeFactory.CreateAsyncScope();
                 var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
                 var email = scope.ServiceProvider.GetRequiredService<IEmailSender>();
-                var dispatcher = new NotificationOutboxDispatcher(db, email, logger);
+                var dispatcher = new NotificationOutboxDispatcher(db, email, metrics, logger);
                 await dispatcher.ReclaimExpiredLeasesAsync(stoppingToken);
-                var items = await dispatcher.ClaimDueItemsAsync(20, stoppingToken);
-                foreach (var item in items)
-                    await dispatcher.ProcessItemAsync(item, stoppingToken);
+
+                if (DateTimeOffset.UtcNow - lastBacklogSample >= backlogEvery)
+                {
+                    metrics.SetBacklog(await dispatcher.CountBacklogAsync(stoppingToken));
+                    lastBacklogSample = DateTimeOffset.UtcNow;
+                }
+
+                var items = await dispatcher.ClaimDueItemsAsync(batchSize, stoppingToken);
+                if (items.Count > 0)
+                {
+                    // 站内通知批量落库（同 scope），邮件/收尾用有界并发
+                    await dispatcher.DeliverInAppBatchAsync(items, stoppingToken);
+
+                    foreach (var item in items)
+                    {
+                        await semaphore.WaitAsync(stoppingToken);
+                        inFlight.Add(ProcessOneAsync(item, semaphore, stoppingToken));
+                    }
+
+                    inFlight.RemoveAll(static t => t.IsCompleted);
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -185,7 +283,33 @@ public sealed class NotificationDispatchWorker(
                 logger.LogError(ex, "通知 Outbox 轮询异常");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            try
+            {
+                await Task.Delay(poll, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+
+        await Task.WhenAll(inFlight);
+    }
+
+    private async Task ProcessOneAsync(
+        NotificationOutboxItem item, SemaphoreSlim semaphore, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            var email = scope.ServiceProvider.GetRequiredService<IEmailSender>();
+            var dispatcher = new NotificationOutboxDispatcher(db, email, metrics, logger);
+            await dispatcher.ProcessItemAsync(item, cancellationToken);
+        }
+        finally
+        {
+            semaphore.Release();
         }
     }
 }
