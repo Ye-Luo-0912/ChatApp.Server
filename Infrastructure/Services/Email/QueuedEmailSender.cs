@@ -1,6 +1,7 @@
 using Core.Interfaces;
 using Core.Models.Email;
 using Infrastructure.Data;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Infrastructure.Services.Email;
@@ -13,8 +14,18 @@ public sealed class QueuedEmailSender(
     ITsidGenerator tsidGenerator,
     EmailOutboxMetrics metrics) : IEmailSender
 {
-    public async Task<EmailResult> SendEmailAsync(
+    public Task<EmailResult> SendEmailAsync(
         string to, string subject, string body, bool isHtml = true, CancellationToken cancellation = default)
+        => EnqueueEmailAsync(to, subject, body, isHtml, emailType: null, idempotencyKey: null, cancellation);
+
+    public async Task<EmailResult> EnqueueEmailAsync(
+        string to,
+        string subject,
+        string body,
+        bool isHtml = true,
+        string? emailType = null,
+        string? idempotencyKey = null,
+        CancellationToken cancellation = default)
     {
         if (string.IsNullOrWhiteSpace(to)
             || string.IsNullOrWhiteSpace(subject)
@@ -25,6 +36,19 @@ public sealed class QueuedEmailSender(
 
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+
+        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            var exists = await db.EmailOutbox.AsNoTracking().AnyAsync(
+                x => x.IdempotencyKey == idempotencyKey
+                     && (x.Status == EmailOutboxStatus.Pending
+                         || x.Status == EmailOutboxStatus.Processing
+                         || x.Status == EmailOutboxStatus.Failed),
+                cancellation).ConfigureAwait(false);
+
+            if (exists)
+                return new EmailResult { IsSuccess = true };
+        }
 
         var now = DateTime.UtcNow;
         db.EmailOutbox.Add(new EmailOutboxItem
@@ -39,15 +63,33 @@ public sealed class QueuedEmailSender(
             CreatedAt = now,
             UpdatedAt = now,
             NextAttemptAt = now,
+            EmailType = emailType,
+            IdempotencyKey = string.IsNullOrWhiteSpace(idempotencyKey) ? null : idempotencyKey,
         });
 
-        await db.SaveChangesAsync(cancellation).ConfigureAwait(false);
-        metrics.RecordEnqueued();
+        try
+        {
+            await db.SaveChangesAsync(cancellation).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex) when (PostgresDbException.IsUniqueViolation(
+                  ex, PostgresDbException.EmailOutboxIdempotencyConstraint))
+        {
+            // 仅幂等唯一约束冲突视为已入队
+            return new EmailResult { IsSuccess = true };
+        }
 
+        metrics.RecordEnqueued();
         return new EmailResult { IsSuccess = true };
     }
 
     public Task<EmailResult> SendVerificationEmailAsync(
         string to, string username, string verificationToken, CancellationToken cancellation)
-        => SendEmailAsync(to, "verify", verificationToken, true, cancellation);
+        => EnqueueEmailAsync(
+            to,
+            "verify",
+            verificationToken,
+            true,
+            emailType: "verification",
+            idempotencyKey: $"verify:{to.Trim().ToUpperInvariant()}:{verificationToken}",
+            cancellation);
 }

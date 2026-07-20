@@ -18,4 +18,8 @@ public static class CacheConstants
 
     // ── 分布式锁前缀 ─────────────────────────────────────────────
     public const string LockKeyPrefix = "lock:";
+
+    // ── MFA 登录挑战 ─────────────────────────────────────────────
+    public const string MfaPendingPrefix = "mfa:pending:";
+    public const string MfaAttemptsPrefix = "mfa:attempts:";
 }

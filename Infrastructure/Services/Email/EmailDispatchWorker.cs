@@ -1,6 +1,4 @@
 using Core.Models.Email;
-using Infrastructure.Data;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,20 +15,34 @@ public sealed class EmailDispatchWorker(
     ILogger<EmailDispatchWorker> logger) : BackgroundService
 {
     private const int MaxConcurrency = 4;
-    private const int MaxAttempts = 5;
-    private const int BatchSize = 20;
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan SentRetention = TimeSpan.FromDays(14);
+
+    private readonly EmailOutboxDispatcher _dispatcher = new(
+        scopeFactory,
+        smtp.SendEmailAsync,
+        metrics,
+        logger);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var semaphore = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
         var inFlight = new List<Task>();
+        var lastCleanup = DateTime.UtcNow;
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                var claimed = await ClaimDueItemsAsync(stoppingToken).ConfigureAwait(false);
+                await _dispatcher.ReclaimStaleProcessingAsync(stoppingToken).ConfigureAwait(false);
+
+                if (DateTime.UtcNow - lastCleanup > TimeSpan.FromHours(1))
+                {
+                    await _dispatcher.ArchiveSentAsync(SentRetention, stoppingToken).ConfigureAwait(false);
+                    lastCleanup = DateTime.UtcNow;
+                }
+
+                var claimed = await _dispatcher.ClaimDueItemsAsync(stoppingToken).ConfigureAwait(false);
 
                 foreach (var item in claimed)
                 {
@@ -62,140 +74,16 @@ public sealed class EmailDispatchWorker(
         await Task.WhenAll(inFlight).ConfigureAwait(false);
     }
 
-    private async Task<List<EmailOutboxItem>> ClaimDueItemsAsync(CancellationToken cancellationToken)
-    {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-        var now = DateTime.UtcNow;
-
-        var dueIds = await db.EmailOutbox
-            .AsNoTracking()
-            .Where(x =>
-                (x.Status == EmailOutboxStatus.Pending || x.Status == EmailOutboxStatus.Failed)
-                && x.NextAttemptAt <= now)
-            .OrderBy(x => x.NextAttemptAt)
-            .Select(x => x.Id)
-            .Take(BatchSize)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        var claimed = new List<EmailOutboxItem>(dueIds.Count);
-
-        foreach (var id in dueIds)
-        {
-            var updated = await db.EmailOutbox
-                .Where(x =>
-                    x.Id == id
-                    && (x.Status == EmailOutboxStatus.Pending || x.Status == EmailOutboxStatus.Failed))
-                .ExecuteUpdateAsync(setters => setters
-                    .SetProperty(x => x.Status, EmailOutboxStatus.Processing)
-                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-                .ConfigureAwait(false);
-
-            if (updated == 0)
-                continue;
-
-            var item = await db.EmailOutbox
-                .AsNoTracking()
-                .FirstAsync(x => x.Id == id, cancellationToken)
-                .ConfigureAwait(false);
-
-            claimed.Add(item);
-        }
-
-        return claimed;
-    }
-
     private async Task ProcessItemAsync(
         EmailOutboxItem item, SemaphoreSlim semaphore, CancellationToken cancellationToken)
     {
         try
         {
-            var sendResult = await smtp
-                .SendEmailAsync(item.To, item.Subject, item.Body, item.IsHtml, cancellationToken)
-                .ConfigureAwait(false);
-
-            await using var scope = scopeFactory.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-            var now = DateTime.UtcNow;
-
-            if (sendResult.IsSuccess)
-            {
-                await db.EmailOutbox
-                    .Where(x => x.Id == item.Id)
-                    .ExecuteUpdateAsync(setters => setters
-                        .SetProperty(x => x.Status, EmailOutboxStatus.Sent)
-                        .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-                    .ConfigureAwait(false);
-
-                metrics.RecordSent();
-                return;
-            }
-
-            await HandleFailureAsync(
-                    db,
-                    item,
-                    sendResult.ErrorMessage ?? "邮件发送失败",
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "邮件 Outbox 处理异常 Id={OutboxId} To={To}", item.Id, item.To);
-
-            await using var scope = scopeFactory.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-            await HandleFailureAsync(db, item, ex.Message, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.ProcessItemAsync(item, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             semaphore.Release();
         }
-    }
-
-    private async Task HandleFailureAsync(
-        UserDbContext db,
-        EmailOutboxItem item,
-        string error,
-        CancellationToken cancellationToken)
-    {
-        var now = DateTime.UtcNow;
-        var attemptCount = item.AttemptCount + 1;
-        var truncatedError = error.Length <= 2048 ? error : error[..2048];
-
-        if (attemptCount >= MaxAttempts)
-        {
-            await db.EmailOutbox
-                .Where(x => x.Id == item.Id)
-                .ExecuteUpdateAsync(setters => setters
-                    .SetProperty(x => x.Status, EmailOutboxStatus.Dead)
-                    .SetProperty(x => x.AttemptCount, attemptCount)
-                    .SetProperty(x => x.LastError, truncatedError)
-                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-                .ConfigureAwait(false);
-
-            metrics.RecordDead();
-            return;
-        }
-
-        var nextAttemptAt = now.Add(CalculateBackoff(attemptCount));
-
-        await db.EmailOutbox
-            .Where(x => x.Id == item.Id)
-            .ExecuteUpdateAsync(setters => setters
-                .SetProperty(x => x.Status, EmailOutboxStatus.Failed)
-                .SetProperty(x => x.AttemptCount, attemptCount)
-                .SetProperty(x => x.LastError, truncatedError)
-                .SetProperty(x => x.NextAttemptAt, nextAttemptAt)
-                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-            .ConfigureAwait(false);
-
-        metrics.RecordFailed();
-    }
-
-    private static TimeSpan CalculateBackoff(int attemptCount)
-    {
-        var delaySeconds = Math.Min(3600, Math.Pow(2, attemptCount - 1) * 30);
-        return TimeSpan.FromSeconds(delaySeconds);
     }
 }
