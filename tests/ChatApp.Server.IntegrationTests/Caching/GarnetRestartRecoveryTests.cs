@@ -57,19 +57,21 @@ public sealed class GarnetRestartRecoveryTests
     }
 
     /// <summary>
-    /// 需要本机 docker-compose 的 <c>chatapp_garnet</c> 容器，且启用 AOF/--recover。
-    /// 设置 <c>CHATAPP_TEST_GARNET_DOCKER_RESTART=1</c> 才会执行；CI 可跳过。
+    /// 需要本机 docker 的 <c>chatapp_garnet</c> 容器，且启用 AOF/--recover。
+    /// CI 强制执行；本地需设置 <c>CHATAPP_TEST_GARNET_DOCKER_RESTART=1</c>。
     /// </summary>
     [SkippableFact]
     [Trait("Category", "Docker")]
     public async Task ValueSurvivesGarnetContainerRestart()
     {
+        var inCi = IsContinuousIntegration();
         Skip.If(
-            !string.Equals(
+            !inCi
+            && !string.Equals(
                 Environment.GetEnvironmentVariable("CHATAPP_TEST_GARNET_DOCKER_RESTART"),
                 "1",
                 StringComparison.Ordinal),
-            "Set CHATAPP_TEST_GARNET_DOCKER_RESTART=1 to run docker restart recovery test.");
+            "Set CHATAPP_TEST_GARNET_DOCKER_RESTART=1 (CI runs this automatically).");
 
         var key = $"it:garnet:restart:{Guid.NewGuid():N}";
         const string expected = "persist-after-container-restart";
@@ -101,18 +103,18 @@ public sealed class GarnetRestartRecoveryTests
             await restart.WaitForExitAsync();
             Assert.Equal(0, restart.ExitCode);
 
-            await WaitForGarnetAsync(options, TimeSpan.FromSeconds(30));
+            await WaitForGarnetAsync(options, TimeSpan.FromSeconds(45));
 
             reader = await ConnectionMultiplexer.ConnectAsync(options);
             var actual = await reader.GetDatabase().StringGetAsync(key);
 
             Assert.Equal(expected, actual);
         }
-        catch (RedisConnectionException ex)
+        catch (RedisConnectionException ex) when (!inCi)
         {
             Skip.If(true, $"Garnet unavailable at {ConnectionString}: {ex.Message}");
         }
-        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        catch (Exception ex) when (!inCi && ex is InvalidOperationException or Win32Exception)
         {
             Skip.If(true, $"Docker restart unavailable: {ex.Message}");
         }
@@ -131,6 +133,12 @@ public sealed class GarnetRestartRecoveryTests
             }
         }
     }
+
+    private static bool IsContinuousIntegration()
+        => string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ShouldRunDockerRestartTest() => IsContinuousIntegration();
 
     private static async Task WaitForGarnetAsync(ConfigurationOptions options, TimeSpan timeout)
     {

@@ -34,17 +34,24 @@ public sealed class NormalizedUserUniqueTests(PostgresTestFixture postgres)
     {
         Skip.IfNot(postgres.IsAvailable, postgres.SkipReason ?? "PostgreSQL not available");
 
-        const long ownerId = 2_000_001;
-        var friendIds = new[] { 2_000_010L, 2_000_011L, 2_000_012L, 2_000_013L, 2_000_014L };
-        var friendshipIds = new[] { 3_000_010L, 3_000_011L, 3_000_012L, 3_000_013L, 3_000_014L };
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var ownerId = 2_000_001L + Random.Shared.Next(0, 100_000);
+        var friendIds = new[]
+        {
+            ownerId + 10, ownerId + 11, ownerId + 12, ownerId + 13, ownerId + 14,
+        };
+        var friendshipIds = new[]
+        {
+            ownerId + 100, ownerId + 101, ownerId + 102, ownerId + 103, ownerId + 104,
+        };
 
         await using (var seedContext = postgres.CreateContext())
         {
-            seedContext.Users.Add(CreateUser(ownerId, "owner", $"owner-{ownerId}@example.com"));
+            seedContext.Users.Add(CreateUser(ownerId, $"owner-{suffix}", $"owner-{suffix}@example.com"));
             for (var i = 0; i < friendIds.Length; i++)
             {
                 var friendId = friendIds[i];
-                seedContext.Users.Add(CreateUser(friendId, $"friend-{friendId}", $"friend-{friendId}@example.com"));
+                seedContext.Users.Add(CreateUser(friendId, $"friend-{suffix}-{i}", $"friend-{suffix}-{i}@example.com"));
                 seedContext.Friendships.Add(new UserFriendEntry
                 {
                     FriendshipId = friendshipIds[i],

@@ -4,55 +4,75 @@ using Infrastructure.Serialization;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
+using Testcontainers.Redis;
 using Xunit;
 
 namespace ChatApp.Server.IntegrationTests.Support;
 
 /// <summary>
-/// 连接本机 Garnet/Redis，并为每次测试使用独立 KeyPrefix，避免互相污染。
+/// 提供 Redis/Garnet：优先 <c>CHATAPP_TEST_GARNET</c>，否则启动 Testcontainers Redis。
 /// </summary>
 public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
 {
+    private RedisContainer? _container;
     private IConnectionMultiplexer? _multiplexer;
+
+    public bool IsAvailable { get; private set; }
+
+    public string? SkipReason { get; private set; }
 
     public string KeyPrefix { get; private set; } = string.Empty;
 
     public ICacheProvider Cache { get; private set; } = null!;
 
-    public string ConnectionString { get; } =
-        Environment.GetEnvironmentVariable("CHATAPP_TEST_GARNET")
-        ?? "127.0.0.1:6379,abortConnect=false";
+    public string ConnectionString { get; private set; } = "127.0.0.1:6379,abortConnect=false";
 
     public async Task InitializeAsync()
     {
         KeyPrefix = $"it:{Guid.NewGuid():N}:";
 
-        var options = ConfigurationOptions.Parse(ConnectionString, true);
-        options.AbortOnConnectFail = true;
-        options.ConnectTimeout = 3000;
-
-        _multiplexer = await ConnectionMultiplexer.ConnectAsync(options);
-
-        var cacheOptions = Options.Create(new RedisCacheOptions
+        var envConnection = Environment.GetEnvironmentVariable("CHATAPP_TEST_GARNET");
+        if (!string.IsNullOrWhiteSpace(envConnection))
         {
-            KeyPrefix = KeyPrefix,
-            DefaultSlidingExpiration = TimeSpan.FromMinutes(30),
-            ExpirationJitterPercent = 0,
-            LockTimeout = TimeSpan.FromSeconds(5),
-            DefaultLockExpiry = TimeSpan.FromSeconds(3),
-        });
+            if (await TryConnectAsync(envConnection))
+            {
+                ConnectionString = envConnection;
+                IsAvailable = true;
+                return;
+            }
 
-        Cache = new RedisCaching(
-            _multiplexer,
-            new TextJsonSerializer(),
-            NullLogger<RedisCaching>.Instance,
-            cacheOptions);
+            SkipReason = "CHATAPP_TEST_GARNET is set but connection failed.";
+            return;
+        }
+
+        try
+        {
+            _container = new RedisBuilder()
+                .WithImage("redis:7.2")
+                .Build();
+
+            await _container.StartAsync();
+            var cs = $"{_container.GetConnectionString()},abortConnect=false";
+            if (await TryConnectAsync(cs))
+            {
+                ConnectionString = cs;
+                IsAvailable = true;
+                return;
+            }
+
+            SkipReason = "Testcontainers Redis started but connection failed.";
+        }
+        catch (Exception ex)
+        {
+            SkipReason = $"Redis unavailable: {ex.Message}";
+        }
     }
 
-    public Task DisposeAsync()
+    public async Task DisposeAsync()
     {
         Dispose();
-        return Task.CompletedTask;
+        if (_container is not null)
+            await _container.DisposeAsync();
     }
 
     public void Dispose()
@@ -78,5 +98,40 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
 
         _multiplexer.Dispose();
         _multiplexer = null;
+    }
+
+    private async Task<bool> TryConnectAsync(string connectionString)
+    {
+        try
+        {
+            var options = ConfigurationOptions.Parse(connectionString, true);
+            options.AbortOnConnectFail = true;
+            options.ConnectTimeout = 5000;
+
+            _multiplexer = await ConnectionMultiplexer.ConnectAsync(options);
+
+            var cacheOptions = Options.Create(new RedisCacheOptions
+            {
+                KeyPrefix = KeyPrefix,
+                DefaultSlidingExpiration = TimeSpan.FromMinutes(30),
+                ExpirationJitterPercent = 0,
+                LockTimeout = TimeSpan.FromSeconds(5),
+                DefaultLockExpiry = TimeSpan.FromSeconds(3),
+            });
+
+            Cache = new RedisCaching(
+                _multiplexer,
+                new TextJsonSerializer(),
+                NullLogger<RedisCaching>.Instance,
+                cacheOptions);
+
+            return true;
+        }
+        catch
+        {
+            _multiplexer?.Dispose();
+            _multiplexer = null;
+            return false;
+        }
     }
 }

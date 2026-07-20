@@ -67,6 +67,11 @@ public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
             string to, string subject, string body, bool isHtml = true, CancellationToken cancellation = default)
             => Task.FromResult(new EmailResult { IsSuccess = true });
 
+        public Task<EmailResult> EnqueueEmailAsync(
+            string to, string subject, string body, bool isHtml = true,
+            string? emailType = null, string? idempotencyKey = null, CancellationToken cancellation = default)
+            => SendEmailAsync(to, subject, body, isHtml, cancellation);
+
         public Task<EmailResult> SendVerificationEmailAsync(
             string to, string username, string verificationToken, CancellationToken cancellation)
             => Task.FromResult(new EmailResult { IsSuccess = true });
@@ -83,6 +88,11 @@ public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
             Interlocked.Increment(ref _sendCount);
             return Task.FromResult(new EmailResult { IsSuccess = true });
         }
+
+        public Task<EmailResult> EnqueueEmailAsync(
+            string to, string subject, string body, bool isHtml = true,
+            string? emailType = null, string? idempotencyKey = null, CancellationToken cancellation = default)
+            => SendEmailAsync(to, subject, body, isHtml, cancellation);
 
         public Task<EmailResult> SendVerificationEmailAsync(
             string to, string username, string verificationToken, CancellationToken cancellation)

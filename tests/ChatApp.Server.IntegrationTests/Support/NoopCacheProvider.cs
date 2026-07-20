@@ -57,6 +57,13 @@ internal sealed class NoopCacheProvider : ICacheProvider
         CancellationToken cancellationToken = default)
         => Task.FromResult(false);
 
+    public Task<bool> TryStringCompareAndExpireAsync(
+        string key,
+        string expectedValue,
+        TimeSpan absoluteExpiration,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
     public Task<long> StringIncrementAsync(
         string key,
         TimeSpan? absoluteExpirationWhenCreate = null,
@@ -94,4 +101,20 @@ internal sealed class NoopCacheProvider : ICacheProvider
         Func<T, AtomicConsumePlan<TResult>?> createPlan,
         CancellationToken cancellationToken = default)
         => Task.FromResult(AtomicConsumeResult<TResult>.Fail());
+
+    public Task SetAddAsync(
+        string key,
+        string member,
+        TimeSpan? absoluteExpiration = null,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task SetRemoveAsync(string key, string member, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task<IReadOnlyList<string>> SetMembersAsync(string key, CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlyList<string>>([]);
+
+    public Task KeyDeleteAsync(string key, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 }
