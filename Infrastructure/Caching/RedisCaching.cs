@@ -434,6 +434,42 @@ public class RedisCaching : ICacheProvider
     }
 
     /// <inheritdoc />
+    public async Task<bool> TryStringCompareAndExpireAsync(
+        string key,
+        string expectedValue,
+        TimeSpan absoluteExpiration,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return false;
+
+        var fullKey = NormalizeKey(key);
+        var ttlMs = (long)Math.Max(1, absoluteExpiration.TotalMilliseconds);
+
+        try
+        {
+            var result = await ExecuteWithRetry(
+                    () => _db.ScriptEvaluateAsync(
+                        """
+                        if redis.call('GET', KEYS[1]) == ARGV[1] then
+                          return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                        end
+                        return 0
+                        """,
+                        [fullKey],
+                        [expectedValue, ttlMs]),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return (int)result == 1;
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（compare-and-expire）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+    }
+
+    /// <inheritdoc />
     public async Task<long> StringIncrementAsync(
         string key,
         TimeSpan? absoluteExpirationWhenCreate = null,
@@ -443,19 +479,28 @@ public class RedisCaching : ICacheProvider
             throw new ArgumentException("键不能为空", nameof(key));
 
         var fullKey = NormalizeKey(key);
+        var ttlMs = absoluteExpirationWhenCreate is { } ttl
+            ? (long)Math.Max(1, ttl.TotalMilliseconds)
+            : 0L;
 
         try
         {
-            var value = await ExecuteWithRetry(() => _db.StringIncrementAsync(fullKey), cancellationToken)
+            // INCR + 首次 PEXPIRE 原子化，避免中途崩溃留下永不过期的限流键
+            var result = await ExecuteWithRetry(
+                    () => _db.ScriptEvaluateAsync(
+                        """
+                        local v = redis.call('INCR', KEYS[1])
+                        if v == 1 and tonumber(ARGV[1]) > 0 then
+                          redis.call('PEXPIRE', KEYS[1], ARGV[1])
+                        end
+                        return v
+                        """,
+                        [fullKey],
+                        [ttlMs]),
+                    cancellationToken)
                 .ConfigureAwait(false);
 
-            if (value == 1 && absoluteExpirationWhenCreate is { } ttl)
-            {
-                await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, ttl), cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
-            return value;
+            return (long)result;
         }
         catch (RedisConnectionException ex)
         {
@@ -592,6 +637,57 @@ public class RedisCaching : ICacheProvider
 
         return await _db.KeyExistsAsync(NormalizeKey(key));
     }
+
+    /// <inheritdoc />
+    public async Task SetAddAsync(
+        string key,
+        string member,
+        TimeSpan? absoluteExpiration = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(member))
+            return;
+
+        var fullKey = NormalizeKey(key);
+        await ExecuteWithRetry(() => _db.SetAddAsync(fullKey, member), cancellationToken).ConfigureAwait(false);
+        if (absoluteExpiration is { } ttl)
+            await ExecuteWithRetry(() => _db.KeyExpireAsync(fullKey, ttl), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task SetRemoveAsync(string key, string member, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(member))
+            return;
+
+        await ExecuteWithRetry(() => _db.SetRemoveAsync(NormalizeKey(key), member), cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>> SetMembersAsync(string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return [];
+
+        var members = await ExecuteWithRetry(() => _db.SetMembersAsync(NormalizeKey(key)), cancellationToken)
+            .ConfigureAwait(false);
+        if (members.Length == 0)
+            return [];
+
+        var result = new List<string>(members.Length);
+        foreach (var member in members)
+        {
+            if (member.HasValue)
+                result.Add(member.ToString());
+        }
+
+        return result;
+    }
+
+    /// <inheritdoc />
+    public Task KeyDeleteAsync(string key, CancellationToken cancellationToken = default)
+        => RemoveAsync(key, cancellationToken);
 
     /// <inheritdoc />
     public async Task<AtomicConsumeResult<TResult>> TryAtomicConsumeAsync<T, TResult>(

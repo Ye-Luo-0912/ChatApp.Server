@@ -7,8 +7,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-ChatAppDatabase}
-    ports:
-      - "5432:5432"
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -16,8 +16,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - chatapp_net
 
-  # 登录态事实来源：必须挂卷 + AOF/checkpoint + --recover，否则重启会全量掉线。
   garnet_cache:
     image: ghcr.io/microsoft/garnet:1.0.84
     container_name: chatapp_garnet
@@ -30,14 +31,12 @@ services:
       - "6379"
       - "--checkpointdir"
       - "/data/checkpoints"
-      - "--logdir"
-      - "/data/logs"
       - "--aof"
       - "--aof-size-limit"
       - "64m"
       - "--recover"
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     volumes:
       - garnet_data:/data
     healthcheck:
@@ -45,7 +44,102 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - chatapp_net
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: ChatApp.Server/Dockerfile
+    container_name: chatapp_migrate
+    env_file:
+      - .env
+    environment:
+      ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
+      ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      JwtSettings__Issuer: ChatApp
+      JwtSettings__Audience: ChatApp
+      ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
+      ForwardedHeaders__KnownProxies__0: 127.0.0.1
+    command: ["dotnet", "ChatApp.Server.dll", "--migrate"]
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+      garnet_cache:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - chatapp_net
+
+  api:
+    build:
+      context: ..
+      dockerfile: ChatApp.Server/Dockerfile
+    container_name: chatapp_api
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - avatar_data:/app/App_Data/avatars
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_URLS: http://0.0.0.0:8080
+      EnableHttpsRedirection: "false"
+      ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
+      ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
+      ForwardedHeaders__KnownProxies__0: 127.0.0.1
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres_db:
+        condition: service_healthy
+      garnet_cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+    networks:
+      - chatapp_net
+
+  reverse_proxy:
+    image: nginx:1.27-alpine
+    container_name: chatapp_nginx
+    restart: unless-stopped
+    ports:
+      - "${CHATAPP_PROXY_PORT:-8080}:80"
+      # TLS：取消注释并挂载 deploy/nginx/chatapp-tls.conf.template + 证书
+      # - "${CHATAPP_PROXY_TLS_PORT:-8443}:443"
+    environment:
+      CHATAPP_UPSTREAM_HOST: api
+      CHATAPP_UPSTREAM_PORT: "8080"
+    volumes:
+      - ./deploy/nginx/chatapp.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - chatapp_net
 
 volumes:
   postgres_data:
   garnet_data:
+  avatar_data:
+
+networks:
+  chatapp_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

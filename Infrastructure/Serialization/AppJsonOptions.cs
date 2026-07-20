@@ -1,6 +1,7 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Infrastructure.Serialization;
 
@@ -32,8 +33,9 @@ public static class AppJsonOptions
             DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
         };
 
-        // 优先走源生成，未覆盖的类型再回退反射。
+        // 优先走源生成，未覆盖的类型再回退反射（控制器绑定与 Redis 载荷共用）。
         options.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
+        options.TypeInfoResolverChain.Add(new DefaultJsonTypeInfoResolver());
         return options;
     }
 

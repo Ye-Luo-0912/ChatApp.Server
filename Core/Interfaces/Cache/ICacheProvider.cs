@@ -77,6 +77,15 @@ public interface ICacheProvider
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 原子 compare-and-expire：仅当字符串值等于 <paramref name="expectedValue"/> 时刷新 TTL。
+    /// </summary>
+    Task<bool> TryStringCompareAndExpireAsync(
+        string key,
+        string expectedValue,
+        TimeSpan absoluteExpiration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 对字符串计数器执行 INCR，并在首次创建时设置过期时间。
     /// </summary>
     Task<long> StringIncrementAsync(
@@ -149,4 +158,28 @@ public interface ICacheProvider
         string consumeKey,
         Func<T, AtomicConsumePlan<TResult>?> createPlan,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Redis SET：添加成员，并可刷新集合 TTL（用于用户设备索引等）。
+    /// </summary>
+    Task SetAddAsync(
+        string key,
+        string member,
+        TimeSpan? absoluteExpiration = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Redis SET：移除成员。
+    /// </summary>
+    Task SetRemoveAsync(string key, string member, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Redis SET：返回全部成员。
+    /// </summary>
+    Task<IReadOnlyList<string>> SetMembersAsync(string key, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 删除整键（集合或任意类型）。
+    /// </summary>
+    Task KeyDeleteAsync(string key, CancellationToken cancellationToken = default);
 }

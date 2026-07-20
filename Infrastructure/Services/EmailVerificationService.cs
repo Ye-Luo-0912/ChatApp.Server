@@ -71,6 +71,10 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
 
             return sendResult;
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             return new EmailResult
@@ -151,7 +155,14 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
             "</div>";
 
         return await emailSender
-            .SendEmailAsync(email, subject, body, isHtml: true, cancellation: cancellation)
+            .EnqueueEmailAsync(
+                email,
+                subject,
+                body,
+                isHtml: true,
+                emailType: $"otp:{codePurpose}",
+                idempotencyKey: $"otp:{codePurpose}:{email}:{code}",
+                cancellation: cancellation)
             .ConfigureAwait(false);
     }
 

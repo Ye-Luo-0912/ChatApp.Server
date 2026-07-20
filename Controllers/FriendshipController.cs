@@ -60,6 +60,7 @@ public class FriendshipController(
     /// <param name="request">包含目标用户ID和可选消息的请求对象</param>
     /// <returns>表示请求发送结果的操作结果</returns>
     [HttpPost("requests")]
+    [Filters.Idempotent]
     public async Task<IActionResult> SendFriendRequest(
         [FromBody] SendFriendRequestRequest request,
         CancellationToken cancellationToken)
@@ -96,6 +97,16 @@ public class FriendshipController(
     {
         var result = await friendshipService.DeclineRequestAsync(
             GetCurrentUserId(), requesterId, blockAfterDecline, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    /// <summary>撤回自己发出的待处理好友申请。</summary>
+    [HttpDelete("requests/{targetUserId:long}")]
+    public async Task<IActionResult> WithdrawFriendRequest(
+        [FromRoute] long targetUserId, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.WithdrawRequestAsync(
+            GetCurrentUserId(), targetUserId, cancellationToken);
         return HandleServiceResult(result);
     }
 
@@ -233,6 +244,64 @@ public class FriendshipController(
             GetCurrentUserId(), friendId, request.GroupId, cancellationToken);
         return HandleServiceResult(result);
     }
+
+    [HttpPost("groups")]
+    public async Task<IActionResult> CreateGroup(
+        [FromBody] CreateFriendGroupRequest request, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.CreateGroupAsync(
+            GetCurrentUserId(), request.GroupName, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    [HttpGet("groups")]
+    public async Task<IActionResult> ListGroups(CancellationToken cancellationToken)
+    {
+        var groups = await friendshipService.ListGroupsAsync(GetCurrentUserId(), cancellationToken);
+        return Ok(groups);
+    }
+
+    [HttpPut("groups/reorder")]
+    public async Task<IActionResult> ReorderGroups(
+        [FromBody] ReorderFriendGroupsRequest request, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.ReorderGroupsAsync(
+            GetCurrentUserId(), request.GroupIdsInOrder, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    [HttpPut("groups/default")]
+    public async Task<IActionResult> SetDefaultGroup(
+        [FromBody] SetDefaultFriendGroupRequest request, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.SetDefaultGroupAsync(
+            GetCurrentUserId(), request.GroupId, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    [HttpPut("groups/{groupId:int}")]
+    public async Task<IActionResult> RenameGroup(
+        [FromRoute] int groupId, [FromBody] RenameFriendGroupRequest request, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.RenameGroupAsync(
+            GetCurrentUserId(), groupId, request.GroupName, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    [HttpDelete("groups/{groupId:int}")]
+    public async Task<IActionResult> DeleteGroup([FromRoute] int groupId, CancellationToken cancellationToken)
+    {
+        var result = await friendshipService.DeleteGroupAsync(GetCurrentUserId(), groupId, cancellationToken);
+        return HandleServiceResult(result);
+    }
+
+    [HttpGet("groups/{groupId:int}/friends")]
+    public Task<CursorPage<FriendDto>> GetFriendsInGroup(
+        [FromRoute] int groupId,
+        [FromQuery] string? cursor = null,
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
+        => friendshipService.GetFriendsInGroupAsync(GetCurrentUserId(), groupId, cursor, limit, cancellationToken);
 
     /// <summary>
     /// 搜索好友（支持名称/备注搜索）

@@ -37,6 +37,9 @@ public interface IFriendshipService
     Task<FriendshipOperationResult> DeclineRequestAsync(long declinerId, long requesterId,
         bool blockAfterDecline = false, CancellationToken ct = default);
 
+    /// <summary>请求方撤回待处理申请。</summary>
+    Task<FriendshipOperationResult> WithdrawRequestAsync(long requesterId, long targetUserId, CancellationToken ct = default);
+
     /// <summary>
     /// 拉黑用户
     /// </summary>
@@ -105,6 +108,23 @@ public interface IFriendshipService
     /// 设置好友分组
     /// </summary>
     Task<FriendshipOperationResult> AssignFriendToGroupAsync(long userId, long friendId, int groupId,CancellationToken ct = default);
+
+    Task<FriendshipOperationResult<FriendGroupDto>> CreateGroupAsync(long userId, string groupName, CancellationToken ct = default);
+
+    Task<IReadOnlyList<FriendGroupDto>> ListGroupsAsync(long userId, CancellationToken ct = default);
+
+    Task<FriendshipOperationResult> RenameGroupAsync(long userId, int groupId, string newName, CancellationToken ct = default);
+
+    Task<FriendshipOperationResult> ReorderGroupsAsync(long userId, IReadOnlyList<int> groupIdsInOrder, CancellationToken ct = default);
+
+    Task<FriendshipOperationResult> SetDefaultGroupAsync(long userId, int groupId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 删除分组并将成员的 GroupId 置空（默认分组）。
+    /// </summary>
+    Task<FriendshipOperationResult> DeleteGroupAsync(long userId, int groupId, CancellationToken ct = default);
+
+    Task<CursorPage<FriendDto>> GetFriendsInGroupAsync(long userId, int groupId, string? cursor = null, int limit = 50, CancellationToken ct = default);
 
     /// <summary>
     /// 搜索好友（支持名称/备注搜索，游标分页）

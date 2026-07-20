@@ -3,6 +3,7 @@ using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models.Common;
 using Core.Models.Friend;
+using Core.Models.Identity;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -12,7 +13,11 @@ namespace Infrastructure.Services;
 /// <summary>
 /// 好友关系业务逻辑服务
 /// </summary>
-public class FriendshipService(UserDbContext context, ICacheProvider cacheService, ILogger<FriendshipService> logger)
+public class FriendshipService(
+    UserDbContext context,
+    ICacheProvider cacheService,
+    ILogger<FriendshipService> logger,
+    ISecurityNotificationService? securityNotifications = null)
     : IFriendshipService
 {
     private const string RelationshipCacheKey = "Relationship_{0}_{1}"; // {userId1}_{userId2}
@@ -41,6 +46,30 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "不能添加自己为好友");
+
+        var targetUser = await context.Users.AsNoTracking()
+            .FirstOrDefaultAsync(u => u.Id == targetUserId, ct)
+            .ConfigureAwait(false);
+        if (targetUser is null)
+            return SendFriendRequestResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "目标用户不存在");
+
+        if (targetUser.LockoutEnabled && targetUser.LockoutEnd > DateTimeOffset.UtcNow)
+            return SendFriendRequestResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "目标账户不可用");
+
+        if (targetUser.FriendRequestPolicy == FriendRequestPolicy.NoStrangers)
+        {
+            var alreadyFriends = await context.Friendships.AsNoTracking()
+                .AnyAsync(f => f.UserId == targetUserId && f.FriendId == requesterId && !f.IsDeleted, ct)
+                .ConfigureAwait(false);
+            if (!alreadyFriends)
+                return SendFriendRequestResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendRequestRejectedByPrivacy,
+                    "对方不允许陌生人添加好友");
+        }
 
         // 查询现有关系 
         var relationships = await context.Friendships
@@ -87,6 +116,25 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 .ConfigureAwait(false);
         }
 
+        // Everyone：自动通过（创建待处理申请后立即以对方身份接受）
+        if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
+        {
+            var create = await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, ct)
+                .ConfigureAwait(false);
+            if (!create.IsSuccess
+                && create.Outcome != SendFriendRequestOutcome.RequestAlreadyPending
+                && create.Outcome != SendFriendRequestOutcome.RequestSent)
+                return create;
+
+            var accept = await AcceptRequestAsync(targetUserId, requesterId, ct).ConfigureAwait(false);
+            return !accept.Succeeded
+                ? SendFriendRequestResult.Failed(accept.ErrorCode, accept.Message)
+                : SendFriendRequestResult.Success(
+                    SendFriendRequestOutcome.AcceptedDirectly,
+                    "对方允许所有人添加，已自动成为好友",
+                    accept.Data);
+        }
+
         return await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, ct)
             .ConfigureAwait(false);
     }
@@ -108,6 +156,10 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             requesterRecord.DeletedAt = null;
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -202,7 +254,32 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 "操作失败，请稍后重试");
         }
 
+        TryNotifyFriendRequest(targetUserId, requesterId);
         return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestSent);
+    }
+
+    private void TryNotifyFriendRequest(long targetUserId, long requesterId)
+    {
+        if (securityNotifications is null) return;
+        _ = NotifyFriendRequestAsync(targetUserId, requesterId);
+    }
+
+    private async Task NotifyFriendRequestAsync(long targetUserId, long requesterId)
+    {
+        try
+        {
+            var target = await context.Users.AsNoTracking()
+                .FirstOrDefaultAsync(u => u.Id == targetUserId);
+            if (target is null || !target.NotifyFriendRequests) return;
+            await securityNotifications!.NotifyAsync(
+                targetUserId, "FriendRequest", "新的好友申请",
+                $"用户 {requesterId} 向你发送了好友申请。",
+                preferEmail: false, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "好友申请通知失败 Target={Target}", targetUserId);
+        }
     }
 
     /// <summary>
@@ -217,6 +294,10 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                 cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId1, userId2), ct),
                 cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId2, userId1), ct)
             ).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -434,6 +515,10 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
                     cacheService.RemoveAsync(string.Format(RelationshipCacheKey, requesterId, declinerId), ct)
                 ).ConfigureAwait(false);
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "拒绝好友请求后缓存清理失败");
@@ -441,6 +526,40 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         }
 
         return FriendshipOperationResult.Success(request.RequesterId.ToString());
+    }
+
+    /// <inheritdoc />
+    public async Task<FriendshipOperationResult> WithdrawRequestAsync(
+        long requesterId, long targetUserId, CancellationToken ct = default)
+    {
+        var request = await context.FriendRequests
+            .FirstOrDefaultAsync(r =>
+                r.RequesterId == requesterId
+                && r.TargetUserId == targetUserId
+                && r.Status == RequestStatus.Pending, ct)
+            .ConfigureAwait(false);
+
+        if (request is null)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendshipRequestNotFound,
+                "没有待撤回的好友申请");
+
+        try
+        {
+            request.Status = RequestStatus.Withdrawn;
+            request.RespondedAt = DateTime.UtcNow;
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "撤回好友申请失败 Requester={RequesterId} Target={TargetUserId}",
+                requesterId, targetUserId);
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
+        }
+
+        return FriendshipOperationResult.Success();
     }
 
     /// <summary>
@@ -760,6 +879,10 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             friendship.Note = note.Trim();
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "更新好友备注失败，UserId={UserId}, FriendId={FriendId}",
@@ -797,12 +920,14 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
         if (friendship == null)
             return FriendshipOperationResult.Failed( FriendshipOperationResultErrorCode.FriendshipNotFound, "未找到好友关系");
 
-        var originalGroup = friendship.GroupId;
-
         try
         {
             friendship.GroupId = groupId;
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -811,20 +936,263 @@ public class FriendshipService(UserDbContext context, ICacheProvider cacheServic
             return FriendshipOperationResult.Failed( FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
         }
 
-        // 缓存清理
+        return FriendshipOperationResult.Success();
+    }
+
+    public async Task<FriendshipOperationResult<FriendGroupDto>> CreateGroupAsync(
+        long userId, string groupName, CancellationToken ct = default)
+    {
+        var name = groupName.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            return FriendshipOperationResult<FriendGroupDto>.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed, "分组名称不能为空");
+
+        if (await context.FriendGroups.AnyAsync(g => g.UserId == userId && g.GroupName == name, ct))
+            return FriendshipOperationResult<FriendGroupDto>.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
+
+        var maxSort = await context.FriendGroups
+            .Where(g => g.UserId == userId)
+            .Select(g => (int?)g.SortOrder)
+            .MaxAsync(ct)
+            .ConfigureAwait(false) ?? -1;
+
+        var group = new FriendGroup
+        {
+            UserId = userId,
+            GroupName = name,
+            CreatedAt = DateTime.UtcNow,
+            SortOrder = maxSort + 1,
+            IsDefault = false,
+        };
+
+        context.FriendGroups.Add(group);
         try
         {
-            await Task.WhenAll(
-                cacheService.RemoveAsync($"FriendGroup_{userId}_{originalGroup}", ct),
-                cacheService.RemoveAsync($"FriendGroup_{userId}_{groupId}", ct)
-            ).ConfigureAwait(false);
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
         }
+        catch (DbUpdateException ex) when (PostgresDbException.IsUniqueViolation(
+                  ex, PostgresDbException.FriendGroupNameConstraint))
+        {
+            return FriendshipOperationResult<FriendGroupDto>.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
+        }
+
+        return FriendshipOperationResult<FriendGroupDto>.Success(new FriendGroupDto
+        {
+            GroupId = group.GroupId,
+            GroupName = group.GroupName,
+            CreatedAt = group.CreatedAt,
+            MemberCount = 0,
+            SortOrder = group.SortOrder,
+            IsDefault = group.IsDefault,
+        });
+    }
+
+    public async Task<IReadOnlyList<FriendGroupDto>> ListGroupsAsync(long userId, CancellationToken ct = default)
+    {
+        var groups = await context.FriendGroups.AsNoTracking()
+            .Where(g => g.UserId == userId)
+            .OrderBy(g => g.SortOrder)
+            .ThenBy(g => g.CreatedAt)
+            .Select(g => new FriendGroupDto
+            {
+                GroupId = g.GroupId,
+                GroupName = g.GroupName,
+                CreatedAt = g.CreatedAt,
+                SortOrder = g.SortOrder,
+                IsDefault = g.IsDefault,
+                MemberCount = context.Friendships.Count(f =>
+                    f.UserId == userId && f.GroupId == g.GroupId && !f.IsDeleted),
+            })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        return groups;
+    }
+
+    public async Task<FriendshipOperationResult> ReorderGroupsAsync(
+        long userId, IReadOnlyList<int> groupIdsInOrder, CancellationToken ct = default)
+    {
+        if (groupIdsInOrder.Count == 0)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed, "分组顺序不能为空");
+
+        var groups = await context.FriendGroups
+            .Where(g => g.UserId == userId)
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        if (groups.Count != groupIdsInOrder.Count
+            || groups.Select(g => g.GroupId).Except(groupIdsInOrder).Any())
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed, "分组列表不完整或不属于当前用户");
+
+        for (var i = 0; i < groupIdsInOrder.Count; i++)
+        {
+            var g = groups.First(x => x.GroupId == groupIdsInOrder[i]);
+            g.SortOrder = i;
+        }
+
+        try
+        {
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "分配分组后缓存清理失败");
+            _logger.LogError(ex, "重排好友分组失败 UserId={UserId}", userId);
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
         }
 
         return FriendshipOperationResult.Success();
+    }
+
+    public async Task<FriendshipOperationResult> SetDefaultGroupAsync(
+        long userId, int groupId, CancellationToken ct = default)
+    {
+        var groups = await context.FriendGroups
+            .Where(g => g.UserId == userId)
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var target = groups.FirstOrDefault(g => g.GroupId == groupId);
+        if (target is null)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNotFound, "未找到好友分组");
+
+        foreach (var g in groups)
+            g.IsDefault = g.GroupId == groupId;
+
+        try
+        {
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "设置默认分组失败 UserId={UserId}", userId);
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
+        }
+
+        return FriendshipOperationResult.Success();
+    }
+
+    public async Task<FriendshipOperationResult> RenameGroupAsync(
+        long userId, int groupId, string newName, CancellationToken ct = default)
+    {
+        var name = newName.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed, "分组名称不能为空");
+
+        var group = await context.FriendGroups
+            .FirstOrDefaultAsync(g => g.GroupId == groupId && g.UserId == userId, ct)
+            .ConfigureAwait(false);
+        if (group is null)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNotFound, "未找到好友分组");
+
+        if (await context.FriendGroups.AnyAsync(
+                g => g.UserId == userId && g.GroupName == name && g.GroupId != groupId, ct))
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
+
+        group.GroupName = name;
+        try
+        {
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex) when (PostgresDbException.IsUniqueViolation(
+                  ex, PostgresDbException.FriendGroupNameConstraint))
+        {
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
+        }
+
+        return FriendshipOperationResult.Success();
+    }
+
+    public async Task<FriendshipOperationResult> DeleteGroupAsync(
+        long userId, int groupId, CancellationToken ct = default)
+    {
+        var group = await context.FriendGroups
+            .FirstOrDefaultAsync(g => g.GroupId == groupId && g.UserId == userId, ct)
+            .ConfigureAwait(false);
+        if (group is null)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.FriendGroupNotFound, "未找到好友分组");
+
+        await using var tx = await context.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await context.Friendships
+                .Where(f => f.UserId == userId && f.GroupId == groupId && !f.IsDeleted)
+                .ExecuteUpdateAsync(s => s.SetProperty(f => f.GroupId, (int?)null), ct)
+                .ConfigureAwait(false);
+
+            // ExecuteUpdate 不更新 ChangeTracker；同步本地实体，避免随后 SaveChanges 写回旧 GroupId
+            foreach (var entry in context.ChangeTracker.Entries<UserFriendEntry>())
+            {
+                if (entry.Entity.UserId == userId && entry.Entity.GroupId == groupId)
+                    entry.Entity.GroupId = null;
+            }
+
+            context.FriendGroups.Remove(group);
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception)
+        {
+            await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+
+        return FriendshipOperationResult.Success();
+    }
+
+    public async Task<CursorPage<FriendDto>> GetFriendsInGroupAsync(
+        long userId, int groupId, string? cursor = null, int limit = 50, CancellationToken ct = default)
+    {
+        var pageSize = ClampLimit(limit);
+        var cursorId = ParseCursor(cursor);
+
+        var query = context.Friendships
+            .Where(f => f.UserId == userId && f.GroupId == groupId && !f.IsDeleted);
+
+        if (cursorId.HasValue)
+            query = query.Where(f => f.FriendId > cursorId.Value);
+
+        var entries = await query
+            .OrderBy(f => f.FriendId)
+            .Take(pageSize + 1)
+            .Include(f => f.Friend)
+            .Include(f => f.Group)
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        return BuildPage(
+            entries,
+            pageSize,
+            e => e.FriendId,
+            f => new FriendDto
+            {
+                FriendId = f.FriendId,
+                FriendName = f.Friend!.UserName,
+                Note = f.Note,
+                CreatedAt = f.CreatedAt,
+                GroupId = f.GroupId,
+                GroupName = f.Group != null ? f.Group.GroupName : null,
+                AvatarUrl = f.Friend!.AvatarUrl,
+            });
     }
 
     /// <summary>

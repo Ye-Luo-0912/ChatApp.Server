@@ -1,23 +1,19 @@
 using System.ComponentModel.DataAnnotations;
-using System.Net;
+using System.Diagnostics;
 using System.Security.Claims;
+using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Core.Exceptions;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Hosting;
 
 namespace ChatApp.Server.Middlewares
 {
     /// <summary>
-    /// 全局异常处理中间件
+    /// 全局异常处理中间件（ProblemDetails）。
     /// </summary>
     public class ExceptionHandlingMiddleware(RequestDelegate next, ILogger<ExceptionHandlingMiddleware> logger)
     {
-        private readonly RequestDelegate _next = next ?? throw new ArgumentNullException(nameof(next));
-
-        private readonly ILogger<ExceptionHandlingMiddleware> _logger =
-            logger ?? throw new ArgumentNullException(nameof(logger));
-
-        /// <summary>
-        /// 处理HTTP请求管道中的异常
-        /// </summary>
         public async Task InvokeAsync(HttpContext context)
         {
             try
@@ -31,72 +27,108 @@ namespace ChatApp.Server.Middlewares
             catch (ValidationException ex)
             {
                 logger.LogWarning(ex, "业务验证错误");
-                await HandleExceptionAsync(context, HttpStatusCode.BadRequest, ex);
+                await WriteProblemAsync(context, StatusCodes.Status400BadRequest, "validation_error", ex.Message);
             }
-            catch (UnauthorizedAccessException ex)
+            catch (UnauthorizedAccessException)
             {
-                logger.LogWarning(ex, "未授权访问");
-                await HandleExceptionAsync(context, HttpStatusCode.Unauthorized, ex);
+                await WriteProblemAsync(context, StatusCodes.Status401Unauthorized, "unauthorized", "未授权访问");
             }
-            catch (KeyNotFoundException ex)
+            catch (KeyNotFoundException)
             {
-                logger.LogWarning(ex, "资源不存在");
-                await HandleExceptionAsync(context, HttpStatusCode.NotFound, ex);
+                await WriteProblemAsync(context, StatusCodes.Status404NotFound, "not_found", "资源不存在");
             }
             catch (ArgumentException ex)
             {
                 logger.LogWarning(ex, "参数错误");
-                await HandleExceptionAsync(context, HttpStatusCode.BadRequest, ex);
+                await WriteProblemAsync(context, StatusCodes.Status400BadRequest, "bad_request", ex.Message);
             }
-            catch (CacheUnavailableException ex)
+            catch (CacheUnavailableException)
             {
-                logger.LogError(ex, "缓存不可用");
-                await HandleExceptionAsync(context, HttpStatusCode.ServiceUnavailable, ex);
+                logger.LogError("缓存不可用");
+                await WriteProblemAsync(context, StatusCodes.Status503ServiceUnavailable, "cache_unavailable",
+                    "服务暂时不可用，请稍后重试");
+            }
+            catch (BadHttpRequestException ex)
+            {
+                var status = ex.StatusCode is >= 400 and < 600
+                    ? ex.StatusCode
+                    : StatusCodes.Status400BadRequest;
+                var error = status == StatusCodes.Status413PayloadTooLarge
+                    ? "payload_too_large"
+                    : "bad_request";
+                logger.LogWarning(ex, "错误的 HTTP 请求: {Status}", status);
+                await WriteProblemAsync(context, status, error, ex.Message);
             }
             catch (Exception ex)
             {
+                if (IsRequestBodyTooLarge(ex))
+                {
+                    await WriteProblemAsync(context, StatusCodes.Status413PayloadTooLarge, "payload_too_large",
+                        "请求体过大");
+                    return;
+                }
+
                 logger.LogError(ex,
                     "未处理异常 | {Method} {Path} | User: {UserId}",
                     context.Request.Method,
                     context.Request.Path,
                     context.User?.FindFirstValue(ClaimTypes.NameIdentifier) ?? "anonymous");
 
-                await HandleExceptionAsync(context, HttpStatusCode.InternalServerError, ex);
+                var includeDetail = context.RequestServices.GetService<IHostEnvironment>()?.IsEnvironment("Testing") == true
+#if DEBUG
+                                    || true
+#endif
+                    ;
+                await WriteProblemAsync(context, StatusCodes.Status500InternalServerError, "internal_error",
+                    "服务器内部错误",
+                    includeDetail ? ex.ToString() : null);
             }
         }
 
-        /// <summary>
-        /// 格式化异常响应并返回给客户端
-        /// </summary>
-        private static Task HandleExceptionAsync(
-            HttpContext context,
-            HttpStatusCode statusCode,
-            Exception exception)
+        private static bool IsRequestBodyTooLarge(Exception ex)
         {
-            //响应是否已经开始发送
-            if (context.Response.HasStarted) 
+            for (var e = ex; e is not null; e = e.InnerException)
+            {
+                if (e is BadHttpRequestException bad && bad.StatusCode == StatusCodes.Status413PayloadTooLarge)
+                    return true;
+                if (e.Message.Contains("Request body too large", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static Task WriteProblemAsync(
+            HttpContext context,
+            int statusCode,
+            string type,
+            string title,
+            string? detail = null)
+        {
+            if (context.Response.HasStarted)
                 return Task.CompletedTask;
 
-            context.Response.ContentType = "application/json";
-            context.Response.StatusCode = (int)statusCode;
-
-            var response = new
+            var problem = new ProblemDetails
             {
-                error = (int)statusCode,
-                message = statusCode switch
-                {
-                    HttpStatusCode.BadRequest => exception.Message,
-                    HttpStatusCode.Unauthorized => "未授权访问",
-                    HttpStatusCode.NotFound => "资源不存在",
-                    HttpStatusCode.ServiceUnavailable => "服务暂时不可用，请稍后重试",
-                    _ => "服务器内部错误"
-                },
-#if DEBUG
-                detail = exception.ToString()
-#endif
+                Status = statusCode,
+                Title = title,
+                Type = $"https://httpstatuses.com/{statusCode}",
+                Detail = detail,
+                Instance = context.Request.Path,
             };
+            problem.Extensions["error"] = type;
+            problem.Extensions["traceId"] = Activity.Current?.Id ?? context.TraceIdentifier;
+            if (context.Request.Headers.TryGetValue(CorrelationIdMiddleware.HeaderName, out var cid))
+                problem.Extensions["correlationId"] = cid.ToString();
 
-            return context.Response.WriteAsJsonAsync(response);
+            var payload = JsonSerializer.SerializeToUtf8Bytes(problem, new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
+            });
+            context.Response.StatusCode = statusCode;
+            context.Response.ContentType = "application/problem+json";
+            return context.Response.Body.WriteAsync(payload, context.RequestAborted).AsTask();
         }
     }
 }

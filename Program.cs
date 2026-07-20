@@ -1,6 +1,8 @@
 using System.Net;
 using System.Threading.RateLimiting;
 using ChatApp.Server.Middlewares;
+using ChatApp.Server.RateLimiting;
+using Core.Interfaces.Cache;
 using Core.Settings;
 using Infrastructure.Auth;
 using Infrastructure.Data.Configurations;
@@ -9,6 +11,8 @@ using Infrastructure.Serialization;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using NLog.Extensions.Logging;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
@@ -16,7 +20,7 @@ using OpenTelemetry.Trace;
 
 namespace ChatApp.Server;
 
-public abstract class Program
+public abstract partial class Program
 {
     public static async Task Main(string[] args)
     {
@@ -28,6 +32,17 @@ public abstract class Program
         builder.Services.AddControllers().AddJsonOptions(op =>
             AppJsonOptions.ApplyTo(op.JsonSerializerOptions));
 
+        builder.Services.AddOpenApi(options =>
+        {
+            options.AddDocumentTransformer((document, _, _) =>
+            {
+                document.Info.Title = "ChatApp.Server API";
+                document.Info.Version = "v1";
+                document.Info.Description = "当前路由前缀 api/* 即 v1；后续可用 api/v{version} 演进。";
+                return Task.CompletedTask;
+            });
+        });
+        builder.Services.AddProblemDetails();
         builder.Services.AddHttpContextAccessor();
         ConfigureForwardedHeaders(builder);
 
@@ -35,14 +50,51 @@ public abstract class Program
         var jwtSettings = config.GetSection("JwtSettings");
         var emailSettings = config.GetSection("EmailSettings");
 
-        var service = await builder.Services.AddRedisCacheServices(config).ConfigureAwait(false);
+        var service = builder.Services.AddRedisCacheServices(config);
 
         service.AddUserDbContext(config)
             .AddCoreServiceCollection();
 
-        service.Configure<JwtSettings>(jwtSettings).AddOptions<JwtSettings>();
-        service.Configure<RealtimeGatewayOptions>(config.GetSection(RealtimeGatewayOptions.SectionName));
-        service.Configure<EmailConfig>(emailSettings).AddOptions<EmailConfig>();
+        service.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
+        service.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
+
+        service.Configure<JwtSettings>(jwtSettings)
+            .AddOptions<JwtSettings>()
+            .Validate(s => !string.IsNullOrWhiteSpace(s.Issuer), "JwtSettings:Issuer 必填")
+            .Validate(s => !string.IsNullOrWhiteSpace(s.Audience), "JwtSettings:Audience 必填")
+            .Validate(s => s.AccessTokenExpirationMinutes > 0, "JwtSettings:AccessTokenExpirationMinutes 必须 > 0")
+            .ValidateOnStart();
+
+        service.Configure<SecurityOptions>(config.GetSection(SecurityOptions.SectionName));
+
+        service.Configure<RealtimeGatewayOptions>(config.GetSection(RealtimeGatewayOptions.SectionName))
+            .AddOptions<RealtimeGatewayOptions>()
+            .Validate(s => !string.IsNullOrWhiteSpace(s.Host), "RealtimeGateway:Host 必填")
+            .Validate(s => s.Port > 0, "RealtimeGateway:Port 必须 > 0")
+            .ValidateOnStart();
+
+        service.Configure<EmailConfig>(emailSettings)
+            .AddOptions<EmailConfig>()
+            .Validate(s => string.IsNullOrWhiteSpace(s.Host) || s.Port > 0, "EmailSettings:Port 无效")
+            .ValidateOnStart();
+
+        service.AddOptions<ForwardedHeadersSettings>()
+            .Bind(config.GetSection(ForwardedHeadersSettings.SectionName))
+            .Validate(s => s.KnownProxies.Length > 0 || s.KnownNetworks.Length > 0,
+                "ForwardedHeaders 必须配置 KnownProxies 或 KnownNetworks")
+            .ValidateOnStart();
+
+        // 连接串校验推迟到宿主启动（ValidateOnStart），确保 Testing 下 WebApplicationFactory
+        // 的 ConfigureAppConfiguration 覆盖已生效。
+        service.AddOptions<ConnectionStringGuard>()
+            .Configure<IConfiguration>((guard, configuration) =>
+            {
+                guard.DefaultConnection = configuration.GetConnectionString("DefaultConnection");
+                guard.Garnet = configuration.GetConnectionString("Garnet");
+            })
+            .Validate(g => !string.IsNullOrWhiteSpace(g.DefaultConnection), "缺少 ConnectionStrings:DefaultConnection")
+            .Validate(g => !string.IsNullOrWhiteSpace(g.Garnet), "缺少 ConnectionStrings:Garnet")
+            .ValidateOnStart();
 
         service.AddAuthentication("Bearer")
             .AddScheme<AuthenticationSchemeOptions, OpaqueTokenAuthHandler>("Bearer", _ => { });
@@ -70,6 +122,9 @@ public abstract class Program
 
         builder.Services.AddRateLimiter(options =>
         {
+            var rate = config.GetSection(RateLimitingOptions.SectionName).Get<RateLimitingOptions>()
+                       ?? new RateLimitingOptions();
+
             options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
             options.OnRejected = async (ctx, token) =>
             {
@@ -82,63 +137,120 @@ public abstract class Program
             };
 
             options.AddPolicy("auth-login", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    GetClientKey(httpContext),
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = 10,
-                        Window = TimeSpan.FromMinutes(1),
-                        QueueLimit = 0,
-                    }));
+            {
+                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
+                var key = GetClientKey(httpContext);
+                return RateLimitPartition.Get(
+                    $"auth-login:{key}",
+                    partition => new RedisFixedWindowRateLimiter(
+                        cache,
+                        partition,
+                        rate.AuthLoginPermitLimit,
+                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthLoginWindowSeconds))));
+            });
 
             options.AddPolicy("auth-refresh", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    GetClientKey(httpContext),
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = 30,
-                        Window = TimeSpan.FromMinutes(1),
-                        QueueLimit = 0,
-                    }));
+            {
+                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
+                var key = GetClientKey(httpContext);
+                return RateLimitPartition.Get(
+                    $"auth-refresh:{key}",
+                    partition => new RedisFixedWindowRateLimiter(
+                        cache,
+                        partition,
+                        rate.AuthRefreshPermitLimit,
+                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthRefreshWindowSeconds))));
+            });
 
             options.AddPolicy("auth-email", httpContext =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    GetClientKey(httpContext),
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = 5,
-                        Window = TimeSpan.FromMinutes(1),
-                        QueueLimit = 0,
-                    }));
+            {
+                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
+                var key = GetClientKey(httpContext);
+                return RateLimitPartition.Get(
+                    $"auth-email:{key}",
+                    partition => new RedisFixedWindowRateLimiter(
+                        cache,
+                        partition,
+                        rate.AuthEmailPermitLimit,
+                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthEmailWindowSeconds))));
+            });
+
+            // 按登录用户限流邮箱变更，防止轮换目标邮箱刷信
+            options.AddPolicy("user-email-change", httpContext =>
+            {
+                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
+                var userKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                              ?? GetClientKey(httpContext);
+                return RateLimitPartition.Get(
+                    $"email-change:{userKey}",
+                    partition => new RedisFixedWindowRateLimiter(
+                        cache,
+                        partition,
+                        rate.UserEmailChangePermitLimit,
+                        TimeSpan.FromSeconds(Math.Max(1, rate.UserEmailChangeWindowSeconds))));
+            });
         });
 
-        var garnet = config.GetConnectionString("Garnet") ?? "127.0.0.1:6379";
-        var db = config.GetConnectionString("DefaultConnection");
-
         var healthChecks = builder.Services.AddHealthChecks()
-            .AddRedis(garnet, name: "garnet", tags: ["ready"]);
-        if (!string.IsNullOrWhiteSpace(db))
-            healthChecks.AddNpgSql(db, name: "postgres", tags: ["ready"]);
+            .AddRedis(
+                sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("Garnet")
+                      ?? throw new InvalidOperationException("缺少 ConnectionStrings:Garnet"),
+                name: "garnet",
+                tags: ["ready"])
+            .AddNpgSql(
+                sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("DefaultConnection")
+                      ?? throw new InvalidOperationException("缺少 ConnectionStrings:DefaultConnection"),
+                name: "postgres",
+                tags: ["ready"]);
 
         ConfigureOpenTelemetry(builder);
 
         builder.WebHost.ConfigureKestrel(options =>
         {
-            options.Limits.MaxRequestBodySize = 16 * 1024;
+            options.Limits.MaxRequestBodySize = 3 * 1024 * 1024;
             options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(30);
             options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
         });
 
         var app = builder.Build();
 
+        if (args.Any(a => string.Equals(a, "--migrate", StringComparison.OrdinalIgnoreCase)))
+        {
+            await using var scope = app.Services.CreateAsyncScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<Infrastructure.Data.UserDbContext>();
+            await dbContext.Database.MigrateAsync().ConfigureAwait(false);
+            Console.WriteLine("Database migrations applied.");
+            return;
+        }
+
         app.UseForwardedHeaders();
+        app.UseMiddleware<CorrelationIdMiddleware>();
         app.UseMiddleware<ExceptionHandlingMiddleware>();
+        // TestServer 不完全遵循 Kestrel MaxRequestBodySize，用 Content-Length 显式拒绝超限请求
+        app.UseMiddleware<RequestBodySizeLimitMiddleware>(3L * 1024 * 1024);
         app.UseCors("AllowSpecific");
-        app.UseHttpsRedirection();
+        // 反代场景默认关闭：TLS 在 Nginx/LB 终止；需要时可设 EnableHttpsRedirection=true
+        if (builder.Configuration.GetValue("EnableHttpsRedirection", false))
+            app.UseHttpsRedirection();
         app.UseRequestTimeouts();
         app.UseRateLimiter();
         app.UseAuthentication();
         app.UseAuthorization();
+
+        var avatarRoot = builder.Configuration[$"{AvatarStorageOptions.SectionName}:LocalRootPath"]
+                         ?? "App_Data/avatars";
+        var avatarPublic = builder.Configuration[$"{AvatarStorageOptions.SectionName}:PublicBaseUrl"]
+                           ?? "/static/avatars";
+        Directory.CreateDirectory(avatarRoot);
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+                Path.GetFullPath(avatarRoot)),
+            RequestPath = avatarPublic.StartsWith('/') ? avatarPublic : "/" + avatarPublic,
+        });
+
+        if (app.Environment.IsDevelopment())
+            app.MapOpenApi();
 
         app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
@@ -151,6 +263,15 @@ public abstract class Program
         });
 
         app.MapControllers();
+
+        if (app.Environment.IsEnvironment("Testing"))
+        {
+            // 仅测试环境：用于验证 ExceptionHandlingMiddleware → ProblemDetails。
+            app.MapGet("/api/__test/problem", () =>
+            {
+                throw new ArgumentException("intentional test probe");
+            });
+        }
 
         await app.RunAsync().ConfigureAwait(false);
     }
@@ -211,7 +332,9 @@ public abstract class Program
             .ConfigureResource(r => r.AddService("ChatApp.Server"))
             .WithTracing(t =>
             {
-                t.AddAspNetCoreInstrumentation().AddHttpClientInstrumentation();
+                t.AddAspNetCoreInstrumentation()
+                    .AddHttpClientInstrumentation()
+                    .AddSource("Infrastructure.Caching.Redis");
                 if (!string.IsNullOrWhiteSpace(otlpEndpoint))
                     t.AddOtlpExporter();
             })
@@ -219,7 +342,10 @@ public abstract class Program
             {
                 m.AddAspNetCoreInstrumentation()
                     .AddHttpClientInstrumentation()
-                    .AddRuntimeInstrumentation();
+                    .AddRuntimeInstrumentation()
+                    .AddMeter("Infrastructure.Caching")
+                    .AddMeter("Infrastructure.Email.Outbox")
+                    .AddMeter("Infrastructure.Runtime");
                 if (!string.IsNullOrWhiteSpace(otlpEndpoint))
                     m.AddOtlpExporter();
             });
@@ -229,5 +355,12 @@ public abstract class Program
     {
         var ip = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         return $"{ip}:{httpContext.Request.Path}";
+    }
+
+    /// <summary>仅用于启动时校验连接串已配置（读取发生在宿主启动，晚于测试配置注入）。</summary>
+    private sealed class ConnectionStringGuard
+    {
+        public string? DefaultConnection { get; set; }
+        public string? Garnet { get; set; }
     }
 }

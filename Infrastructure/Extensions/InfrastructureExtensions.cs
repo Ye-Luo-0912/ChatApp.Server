@@ -20,37 +20,44 @@ public static class InfrastructureExtensions
     extension(IServiceCollection services)
     {
         /// <summary>
-        /// 添加用户数据库上下文和身份验证服务
+        /// 添加用户数据库上下文和身份验证服务。
+        /// 连接串在解析 DbContext 时从 <see cref="IConfiguration"/> 读取，
+        /// 以便 WebApplicationFactory 的 ConfigureAppConfiguration 覆盖能生效。
         /// </summary>
-        /// <param name="configuration"></param>
-        /// <returns></returns>
         public IServiceCollection AddUserDbContext(IConfiguration configuration)
         {
-            // 从配置中获取数据库连接字符串
-            var connectionString = configuration.GetConnectionString("DefaultConnection");
-
-            // 注册 TSID 生成器为单例服务
             services.AddSingleton<ITsidGenerator, TsidGeneratorService>();
             services.AddSingleton<RealtimeDomainOutboxInterceptor>();
-            // 连接池 + 命令超时；DbContextPool 降低上下文分配开销
-            services.AddDbContextPool<UserDbContext>((serviceProvider, options) => options
-                .UseNpgsql(connectionString, npgsql =>
+            services.AddDbContextPool<UserDbContext>((serviceProvider, options) =>
+            {
+                var connectionString = serviceProvider
+                    .GetRequiredService<IConfiguration>()
+                    .GetConnectionString("DefaultConnection");
+                if (string.IsNullOrWhiteSpace(connectionString))
+                    throw new InvalidOperationException("缺少 ConnectionStrings:DefaultConnection");
+
+                options.UseNpgsql(connectionString, npgsql =>
                 {
                     npgsql.CommandTimeout(15);
-                    npgsql.EnableRetryOnFailure(maxRetryCount: 2, maxRetryDelay: TimeSpan.FromSeconds(2), errorCodesToAdd: null);
-                })
-                .AddInterceptors(serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>()));
+                    npgsql.EnableRetryOnFailure(maxRetryCount: 2, maxRetryDelay: TimeSpan.FromSeconds(2),
+                        errorCodesToAdd: null);
+                }).AddInterceptors(serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>());
+            });
 
             return services;
         }
 
-        public async Task<IServiceCollection> AddRedisCacheServices(IConfiguration configuration)
+        /// <summary>
+        /// 注册 Redis/Garnet 缓存。连接在首次解析 <see cref="IConnectionMultiplexer"/> 时建立，
+        /// 避免在测试配置注入前连接错误的地址。
+        /// </summary>
+        public IServiceCollection AddRedisCacheServices(IConfiguration configuration)
         {
-
-            await services.AddGarnet(configuration);
+            services.AddGarnet();
             services.AddSerializer();
-            // 从配置文件 GarnetCache 节绑定选项，而不是使用默认实例
-            services.Configure<RedisCacheOptions>(configuration.GetSection(RedisCacheOptions.SectionName));
+            services.AddOptions<RedisCacheOptions>()
+                .Configure<IConfiguration>((opts, configuration) =>
+                    configuration.GetSection(RedisCacheOptions.SectionName).Bind(opts));
             services.AddSingleton<ICacheProvider, RedisCaching>();
             return services;
         }
@@ -60,23 +67,25 @@ public static class InfrastructureExtensions
             services.AddSingleton<ISerializer, TextJsonSerializer>();
         }
 
-        /// <summary>
-        /// 添加 Garnet（Redis 兼容）缓存服务到服务集合中
-        /// </summary>
-        private async Task AddGarnet(IConfiguration configuration)
+        private void AddGarnet()
         {
-            var connStr = configuration.GetConnectionString("Garnet");
-            var configurationOptions = ConfigurationOptions.Parse(connStr ?? throw new InvalidOperationException("未找到 Garnet 连接字符串"), true);
-            configurationOptions.ResolveDns = false;
-            // 总重试预算控制在约 1s 内，缓存故障时快速失败返回 503，避免打满线程池。
-            configurationOptions.ConnectTimeout = 1000;
-            configurationOptions.SyncTimeout = 1000;
-            configurationOptions.AbortOnConnectFail = false;
-            configurationOptions.ConnectRetry = 1;
-            configurationOptions.KeepAlive = 180;
+            services.AddSingleton<IConnectionMultiplexer>(sp =>
+            {
+                var configuration = sp.GetRequiredService<IConfiguration>();
+                var connStr = configuration.GetConnectionString("Garnet");
+                if (string.IsNullOrWhiteSpace(connStr))
+                    throw new InvalidOperationException("未找到 Garnet 连接字符串");
 
-            var multiplexer = await ConnectionMultiplexer.ConnectAsync(configurationOptions).ConfigureAwait(false);
-            services.AddSingleton<IConnectionMultiplexer>(multiplexer);
+                var configurationOptions = ConfigurationOptions.Parse(connStr, true);
+                configurationOptions.ResolveDns = false;
+                configurationOptions.ConnectTimeout = 1000;
+                configurationOptions.SyncTimeout = 1000;
+                configurationOptions.AbortOnConnectFail = false;
+                configurationOptions.ConnectRetry = 1;
+                configurationOptions.KeepAlive = 180;
+
+                return ConnectionMultiplexer.Connect(configurationOptions);
+            });
         }
     }
 }
