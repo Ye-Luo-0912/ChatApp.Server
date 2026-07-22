@@ -35,6 +35,7 @@ services:
       - "--aof-size-limit"
       - "64m"
       - "--recover"
+      - "--lua"
     expose:
       - "6379"
     volumes:

@@ -27,6 +27,7 @@ public partial class UserAccountService(
     IAvatarStorage avatarStorage,
     ISecurityEventStore securityEventStore,
     ISecurityNotificationService securityNotifications,
+    ITrustedDeviceService trustedDevices,
     IOptions<ProfileOptions> profileOptions,
     ILogger<UserAccountService> logger) : IUserAccountService
 {
@@ -162,7 +163,7 @@ public partial class UserAccountService(
     }
 
     public async Task<AuthOperationResult?> ConfirmAvatarAsync(
-        long userId, string objectKey, CancellationToken cancellationToken = default)
+        long userId, string objectKey, string? ticket = null, CancellationToken cancellationToken = default)
     {
         var user = await userRepository.FindByIdAsync(userId, cancellationToken);
         if (user is null) return null;
@@ -171,7 +172,8 @@ public partial class UserAccountService(
             return AuthOperationResult.Fail("InvalidObjectKey", "无效的头像对象键");
 
         var oldUrl = user.AvatarUrl;
-        var (ok, publicUrl, error) = await avatarStorage.ConfirmObjectAsync(userId, objectKey, cancellationToken);
+        var (ok, publicUrl, error) = await avatarStorage.ConfirmObjectAsync(
+            userId, objectKey, ticket, cancellationToken);
         if (!ok)
             return AuthOperationResult.Fail("ConfirmFailed", error ?? "头像确认失败");
 
@@ -349,10 +351,10 @@ public partial class UserAccountService(
                 return null;
 
             if (string.IsNullOrEmpty(user.PasswordHash)
-                || !passwordHasher.VerifyPassword(currentPassword, user.PasswordHash))
+                || !await passwordHasher.VerifyPasswordAsync(currentPassword, user.PasswordHash, cancellationToken))
                 return AuthOperationResult.Fail("PasswordMismatch", "当前密码不正确");
 
-            user.PasswordHash = passwordHasher.HashPassword(newPassword);
+            user.PasswordHash = await passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
             user.SecurityStamp = Guid.NewGuid().ToString();
             user.AccessFailedCount = 0;
             user.MustChangePassword = false;
@@ -363,18 +365,23 @@ public partial class UserAccountService(
 
             var currentDevice = deviceInfo.GetDeviceId();
             await sessionStore.RevokeAllSessionsAsync(userId.ToString(), currentDevice, cancellationToken);
+            await trustedDevices.RevokeAllAsync(userId, cancellationToken);
             await securityEventStore.RecordAsync(
                 userId, SecurityEventType.PasswordChanged, currentDevice, deviceInfo.GenerateDeviceInfo().IpAddress,
                 cancellationToken: cancellationToken);
 
             await securityNotifications.NotifyAsync(
                 userId, "PasswordChanged", "密码已修改",
-                "您的账号密码已修改，其他设备已下线。", preferEmail: true, cancellationToken);
+                "您的账号密码已修改，其他设备已下线，全部可信设备已失效。", preferEmail: true, cancellationToken);
 
-            logger.LogInformation("用户 {UserId} 密码修改成功，已撤销其他设备会话", userId);
+            logger.LogInformation("用户 {UserId} 密码修改成功，已撤销其他设备会话与可信设备", userId);
             return AuthOperationResult.Success();
         }
         catch (OperationCanceledException) { throw; }
+        catch (PasswordVerifyOverloadedException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "修改用户 {UserId} 密码时发生异常", userId);
@@ -552,6 +559,7 @@ public partial class UserAccountService(
             await sessionStore.RevokeSessionAsync(userId.ToString(), evt.DeviceId, cancellationToken);
 
         await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
+        await trustedDevices.RevokeAllAsync(userId, cancellationToken);
         user.MustChangePassword = true;
         user.SecurityStamp = Guid.NewGuid().ToString();
         await userRepository.UpdateAsync(user, cancellationToken);
@@ -562,7 +570,7 @@ public partial class UserAccountService(
 
         await securityNotifications.NotifyAsync(
             userId, "NotMeReported", "已标记非本人操作",
-            "已撤销相关设备并要求修改密码。请立即通过“忘记密码”或登录后的改密流程更新密码。",
+            "已撤销相关设备、可信设备，并要求修改密码。请立即通过“忘记密码”或登录后的改密流程更新密码。",
             preferEmail: true, cancellationToken);
 
         return AuthOperationResult.Success();

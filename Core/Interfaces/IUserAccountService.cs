@@ -25,7 +25,8 @@ public interface IUserAccountService
     Task<AvatarPresignResponse?> CreateAvatarUploadTicketAsync(
         long userId, string contentType, long contentLength, CancellationToken cancellationToken = default);
 
-    Task<AuthOperationResult?> ConfirmAvatarAsync(long userId, string objectKey, CancellationToken cancellationToken = default);
+    Task<AuthOperationResult?> ConfirmAvatarAsync(
+        long userId, string objectKey, string? ticket = null, CancellationToken cancellationToken = default);
 
     Task<AuthOperationResult?> UploadAvatarBytesAsync(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default);

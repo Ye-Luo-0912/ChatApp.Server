@@ -98,10 +98,40 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
             (false, null, "S3 模式请直传预签名 URL，再调用 confirm"));
 
     public async Task<(bool Ok, string? PublicUrl, string? Error)> ConfirmObjectAsync(
-        long userId, string objectKey, CancellationToken cancellationToken = default)
+        long userId, string objectKey, string? ticket = null, CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(ticket))
+            return (false, null, "确认头像须提供上传票");
+
+        var ticketKey = $"avatar:ticket:{ticket}";
+        // 先原子消费票，避免并发 confirm 双重 finalize / 孤儿对象
+        var info = await _cache.TryGetAndDeleteStringPayloadAsync<LocalAvatarStorage.AvatarTicketInfo>(
+                ticketKey, cancellationToken)
+            .ConfigureAwait(false);
+        if (info is null)
+            return (false, null, "上传票无效或已过期");
+        if (info.UserId != userId)
+            return (false, null, "上传票与用户不匹配");
+        if (!string.Equals(info.ObjectKey, objectKey, StringComparison.Ordinal))
+            return (false, null, "对象键与上传票不匹配");
+
         var (ok, _, publicUrl, error) = await ValidateAndFinalizeAsync(userId, objectKey, cancellationToken)
             .ConfigureAwait(false);
+        if (!ok)
+        {
+            // 校验失败时写回票，允许客户端重试（TTL 缩短）
+            try
+            {
+                await _cache.SetStringPayloadAsync(
+                    ticketKey, info, TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "头像确认失败后写回上传票失败");
+            }
+        }
+
         return (ok, publicUrl, error);
     }
 

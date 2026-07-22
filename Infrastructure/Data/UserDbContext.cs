@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using Core.Models.Email;
+using Core.Models.Export;
 using Core.Models.Friend;
 using Core.Models.Identity;
 using Core.Models.Moderation;
@@ -29,6 +30,10 @@ namespace Infrastructure.Data
         public DbSet<InAppNotification> InAppNotifications { get; set; }
         public DbSet<UserReport> UserReports { get; set; }
         public DbSet<TrustedDevice> TrustedDevices { get; set; }
+        public DbSet<DataExportJob> DataExportJobs { get; set; }
+        public DbSet<AccountCleanupSaga> AccountCleanupSagas { get; set; }
+        public DbSet<AccountCleanupInboxEntry> AccountCleanupInbox { get; set; }
+        public DbSet<AccountCleanupDeadLetter> AccountCleanupDeadLetters { get; set; }
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -134,6 +139,64 @@ namespace Infrastructure.Data
                 e.Property(x => x.ClientIp).HasMaxLength(64);
                 e.HasIndex(x => x.TokenHash).IsUnique().HasDatabaseName("IX_TrustedDevice_TokenHash");
                 e.HasIndex(x => new { x.UserId, x.ExpiresAt }).HasDatabaseName("IX_TrustedDevice_User_Expires");
+            });
+
+            builder.Entity<DataExportJob>(e =>
+            {
+                e.ToTable("T_DataExportJob");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).HasMaxLength(32);
+                e.Property(x => x.Status).HasMaxLength(32).IsRequired();
+                e.Property(x => x.ObjectKey).HasMaxLength(512);
+                e.Property(x => x.Error).HasMaxLength(500);
+                e.Property(x => x.LeaseOwner).HasMaxLength(64);
+                e.HasIndex(x => new { x.Status, x.LeaseUntil, x.CreatedAt })
+                    .HasDatabaseName("IX_DataExportJob_Claim");
+                e.HasIndex(x => new { x.UserId, x.Status, x.CreatedAt })
+                    .HasDatabaseName("IX_DataExportJob_User_Status");
+                // 每用户至多一个未消费的活跃导出（Pending/Processing/Ready）
+                e.HasIndex(x => x.UserId)
+                    .IsUnique()
+                    .HasFilter(
+                        "\"ConsumedAt\" IS NULL AND \"Status\" IN ('Pending', 'Processing', 'Ready')")
+                    .HasDatabaseName("UX_DataExportJob_OneActive");
+            });
+
+            builder.Entity<AccountCleanupSaga>(e =>
+            {
+                e.ToTable("T_AccountCleanupSaga");
+                e.HasKey(x => x.UserId);
+                e.Property(x => x.UserId).ValueGeneratedNever();
+                e.Property(x => x.EventId).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Status).HasMaxLength(32).IsRequired();
+                e.Property(x => x.LastError).HasMaxLength(500);
+                e.HasIndex(x => new { x.Status, x.CreatedAt })
+                    .HasDatabaseName("IX_AccountCleanupSaga_Status_Created");
+            });
+
+            builder.Entity<AccountCleanupInboxEntry>(e =>
+            {
+                e.ToTable("T_AccountCleanupInbox");
+                e.HasKey(x => x.EventId);
+                e.Property(x => x.EventId).HasMaxLength(128);
+                e.Property(x => x.Outcome).HasMaxLength(64).IsRequired();
+                e.HasIndex(x => new { x.UserId, x.ProcessedAt })
+                    .HasDatabaseName("IX_AccountCleanupInbox_User_Processed");
+            });
+
+            builder.Entity<AccountCleanupDeadLetter>(e =>
+            {
+                e.ToTable("T_AccountCleanupDeadLetter");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.EventId).HasMaxLength(128).IsRequired();
+                e.Property(x => x.ReasonCode).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Reason).HasMaxLength(500).IsRequired();
+                e.Property(x => x.PayloadJson).HasMaxLength(4000);
+                e.HasIndex(x => new { x.EventId, x.ReasonCode })
+                    .IsUnique()
+                    .HasDatabaseName("UX_AccountCleanupDeadLetter_Event_Reason");
+                e.HasIndex(x => x.CreatedAt)
+                    .HasDatabaseName("IX_AccountCleanupDeadLetter_Created");
             });
 
             builder.Ignore<Capture>();

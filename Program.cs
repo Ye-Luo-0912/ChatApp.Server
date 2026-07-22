@@ -1,5 +1,6 @@
 using System.Net;
 using System.Threading.RateLimiting;
+using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
 using Core.Interfaces.Cache;
@@ -60,6 +61,10 @@ public abstract partial class Program
         service.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
         service.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
         service.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
+        service.Configure<DataExportStorageOptions>(config.GetSection(DataExportStorageOptions.SectionName));
+        service.Configure<AccountCleanupSagaOptions>(config.GetSection(AccountCleanupSagaOptions.SectionName));
+
+        TryAddRealtimeIntegration(service, config);
 
         service.Configure<JwtSettings>(jwtSettings)
             .AddOptions<JwtSettings>()
@@ -191,6 +196,20 @@ public abstract partial class Program
                         partition,
                         rate.UserEmailChangePermitLimit,
                         TimeSpan.FromSeconds(Math.Max(1, rate.UserEmailChangeWindowSeconds))));
+            });
+
+            options.AddPolicy("user-sensitive", httpContext =>
+            {
+                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
+                var userKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                              ?? GetClientKey(httpContext);
+                return RateLimitPartition.Get(
+                    $"sensitive:{userKey}",
+                    partition => new RedisFixedWindowRateLimiter(
+                        cache,
+                        partition,
+                        rate.UserSensitivePermitLimit,
+                        TimeSpan.FromSeconds(Math.Max(1, rate.UserSensitiveWindowSeconds))));
             });
         });
 
@@ -348,10 +367,42 @@ public abstract partial class Program
                     .AddRuntimeInstrumentation()
                     .AddMeter("Infrastructure.Caching")
                     .AddMeter("Infrastructure.Email.Outbox")
+                    .AddMeter("Infrastructure.Notification.Outbox")
+                    .AddMeter("Infrastructure.Avatar.Reencode")
+                    .AddMeter("Infrastructure.Moderation.Evidence")
+                    .AddMeter("Infrastructure.Auth")
+                    .AddMeter("Infrastructure.PasswordHashing")
+                    .AddMeter("Infrastructure.TrustedDevice")
+                    .AddMeter("Infrastructure.DataExport")
+                    .AddMeter("Infrastructure.LoginRisk")
                     .AddMeter("Infrastructure.Runtime");
                 if (!string.IsNullOrWhiteSpace(otlpEndpoint))
                     m.AddOtlpExporter();
             });
+    }
+
+    private static void TryAddRealtimeIntegration(IServiceCollection services, IConfiguration config)
+    {
+        var section = config.GetSection(RealtimeIntegrationHostOptions.SectionName);
+        var hostOpts = section.Get<RealtimeIntegrationHostOptions>() ?? new RealtimeIntegrationHostOptions();
+        if (string.IsNullOrWhiteSpace(hostOpts.Url))
+            return;
+
+        services.AddChatAppRealtimeIntegration(new ChatApp.Realtime.Integration.Configuration.RealtimeIntegrationOptions
+        {
+            Url = hostOpts.Url,
+            ClientName = string.IsNullOrWhiteSpace(hostOpts.ClientName) ? "chatapp-server" : hostOpts.ClientName,
+            InstanceId = string.IsNullOrWhiteSpace(hostOpts.InstanceId)
+                ? Environment.MachineName
+                : hostOpts.InstanceId,
+            AccountCleanupSubject = hostOpts.AccountCleanupSubject,
+            AccountCleanupConsumerName = hostOpts.AccountCleanupConsumerName,
+            RealtimeEventsSubject = hostOpts.RealtimeEventsSubject,
+            RealtimeEventsStream = hostOpts.RealtimeEventsStream,
+            DeadLettersSubject = hostOpts.DeadLettersSubject,
+            DeadLettersStream = hostOpts.DeadLettersStream,
+            ManageStreams = false,
+        });
     }
 
     private static string GetClientKey(HttpContext httpContext)

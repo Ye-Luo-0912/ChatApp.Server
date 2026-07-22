@@ -40,6 +40,8 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         Assert.False(await db.TrustedDevices.AnyAsync(d => d.UserId == victim.Id));
         Assert.True(await db.Users.AnyAsync(u => u.Id == peer.Id));
         Assert.True(await db.RealtimeOutbox.AnyAsync(o => o.PayloadJson!.Contains(victim.Id.ToString())));
+        Assert.True(await db.AccountCleanupSagas.AnyAsync(s =>
+            s.UserId == victim.Id && s.Status == Core.Models.Export.AccountCleanupSagaStatus.Pending));
     }
 
     [SkippableFact]
@@ -62,6 +64,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
                 cancelDb,
                 CreateTokenService(),
                 new SecurityEventStore(cancelDb, NullLogger<SecurityEventStore>.Instance),
+                new NoopExportBlob(),
                 NullLogger<AccountLifecycleService>.Instance);
             var cancel = await cancelSvc.CancelDeletionAsync(victim.Id, ct);
             Assert.True(cancel.Succeeded);
@@ -93,9 +96,11 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         await using var dbB = postgres.CreateContext();
         var workerA = new AccountLifecycleService(
             dbA, CreateTokenService(), new SecurityEventStore(dbA, NullLogger<SecurityEventStore>.Instance),
+            new NoopExportBlob(),
             NullLogger<AccountLifecycleService>.Instance);
         var workerB = new AccountLifecycleService(
             dbB, CreateTokenService(), new SecurityEventStore(dbB, NullLogger<SecurityEventStore>.Instance),
+            new NoopExportBlob(),
             NullLogger<AccountLifecycleService>.Instance);
 
         var results = await Task.WhenAll(
@@ -131,6 +136,66 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         Assert.Contains($"anonymized-user:{victim.Id}", audit.Detail ?? "", StringComparison.Ordinal);
     }
 
+    [SkippableFact]
+    public async Task AccountCleanupCompleted_MarksSagaCompleted_AndIsIdempotent()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var (victim, _, lifecycle) = await SeedScheduledUserAsync(db, "saga");
+        await db.SaveChangesAsync();
+
+        Assert.True(await lifecycle.ProcessDueDeletionsAsync() >= 1);
+
+        var saga = await db.AccountCleanupSagas.AsNoTracking()
+            .SingleAsync(s => s.UserId == victim.Id);
+        Assert.Equal(Core.Models.Export.AccountCleanupSagaStatus.Pending, saga.Status);
+
+        var completer = new AccountCleanupSagaService(
+            db, NullLogger<AccountCleanupSagaService>.Instance);
+        var completedEventId = $"cleanup-done:{saga.EventId}";
+
+        Assert.Equal(
+            Core.Models.Export.AccountCleanupApplyResult.Completed,
+            await completer.TryCompleteAsync(victim.Id, completedEventId));
+        Assert.Equal(
+            Core.Models.Export.AccountCleanupApplyResult.DuplicateDelivery,
+            await completer.TryCompleteAsync(victim.Id, completedEventId));
+
+        var done = await db.AccountCleanupSagas.AsNoTracking()
+            .SingleAsync(s => s.UserId == victim.Id);
+        Assert.Equal(Core.Models.Export.AccountCleanupSagaStatus.Completed, done.Status);
+        Assert.NotNull(done.CompletedAt);
+        Assert.Null(done.LastError);
+    }
+
+    [SkippableFact]
+    public async Task AccountCleanupSaga_FailStalePending_MarksFailed()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var userId = new TsidGeneratorService().GenerateTsid();
+        db.AccountCleanupSagas.Add(new Core.Models.Export.AccountCleanupSaga
+        {
+            UserId = userId,
+            EventId = Guid.NewGuid().ToString("N"),
+            Status = Core.Models.Export.AccountCleanupSagaStatus.Pending,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-5),
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+        var affected = await svc.FailStalePendingAsync(TimeSpan.FromHours(72));
+        Assert.True(affected >= 1);
+
+        var saga = await db.AccountCleanupSagas.AsNoTracking().SingleAsync(s => s.UserId == userId);
+        Assert.Equal(Core.Models.Export.AccountCleanupSagaStatus.Failed, saga.Status);
+        Assert.Equal("pending_timeout", saga.LastError);
+        Assert.NotNull(saga.CompletedAt);
+    }
+
     private async Task<(ApplicationUser Victim, ApplicationUser Peer, AccountLifecycleService Lifecycle)>
         SeedScheduledUserAsync(UserDbContext db, string prefix)
     {
@@ -145,7 +210,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             Email = $"{prefix}-{suffix}@ex.com",
             NormalizedEmail = $"{prefix}-{suffix}@EX.COM",
             EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
+            PasswordHash = await hasher.HashPasswordAsync("Passw0rd!"),
             SecurityStamp = Guid.NewGuid().ToString(),
             LockoutEnabled = true,
             DeletionScheduledAt = DateTimeOffset.UtcNow.AddMinutes(-1),
@@ -158,7 +223,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             Email = $"{prefix}-p-{suffix}@ex.com",
             NormalizedEmail = $"{prefix}-P-{suffix}@EX.COM",
             EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
+            PasswordHash = await hasher.HashPasswordAsync("Passw0rd!"),
             SecurityStamp = Guid.NewGuid().ToString(),
             LockoutEnabled = true,
         };
@@ -169,6 +234,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             db,
             CreateTokenService(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
+            new NoopExportBlob(),
             NullLogger<AccountLifecycleService>.Instance);
         return (victim, peer, lifecycle);
     }
@@ -232,4 +298,14 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
                 Secret = "test-deletion-jwt-secret-please-change",
             }),
             NullLogger<TokenService>.Instance);
+
+    private sealed class NoopExportBlob : Infrastructure.Services.IDataExportBlobStore
+    {
+        public Task WriteAsync(string objectKey, Stream content, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+        public Task<Stream?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default)
+            => Task.FromResult<Stream?>(null);
+        public Task DeleteAsync(string objectKey, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+    }
 }

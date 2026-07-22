@@ -18,6 +18,7 @@ public sealed class AccountLifecycleService(
     UserDbContext db,
     ISessionStore sessionStore,
     ISecurityEventStore securityEventStore,
+    IDataExportBlobStore dataExportBlobs,
     ILogger<AccountLifecycleService> logger) : IAccountLifecycleService
 {
     public static readonly TimeSpan CoolDown = TimeSpan.FromDays(14);
@@ -205,16 +206,6 @@ public sealed class AccountLifecycleService(
                 return false;
             }
 
-            // Redis 会话在事务外尽力撤销；失败不阻断 DB 清理（用户行删除后令牌也会失效）。
-            try
-            {
-                await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "注销前撤销会话失败 UserId={UserId}，继续清理数据库", userId);
-            }
-
             await db.Friendships
                 .Where(f => f.UserId == userId || f.FriendId == userId)
                 .ExecuteDeleteAsync(cancellationToken);
@@ -246,6 +237,20 @@ public sealed class AccountLifecycleService(
                 .Where(ur => ur.UserId == userId)
                 .ExecuteDeleteAsync(cancellationToken);
 
+            // 导出作业：事务内仅标 PendingDelete 墓碑，提交后再删 blob；成功后再删行。
+            await db.DataExportJobs
+                .Where(j => j.UserId == userId && j.ObjectKey != null)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(j => j.Status, Core.Models.Export.DataExportJobStatus.PendingDelete)
+                        .SetProperty(j => j.ConsumedAt, now)
+                        .SetProperty(j => j.LeaseOwner, (string?)null)
+                        .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
+                        .SetProperty(j => j.Error, "account_deletion_pending_blob_delete"),
+                    cancellationToken);
+            await db.DataExportJobs
+                .Where(j => j.UserId == userId && j.ObjectKey == null)
+                .ExecuteDeleteAsync(cancellationToken);
+
             // 审计日志：匿名化保留（不物理删除），满足合规追溯。
             await db.Database.ExecuteSqlInterpolatedAsync($"""
                 UPDATE "T_AdminAuditLog"
@@ -256,9 +261,10 @@ public sealed class AccountLifecycleService(
                 """, cancellationToken);
 
             // Realtime 消息/会话清理：可靠 Outbox 事件（Saga 由 Realtime 侧消费）。
+            var cleanupEventId = Guid.NewGuid().ToString("N");
             var evt = new RealtimeEvent
             {
-                EventId = Guid.NewGuid().ToString("N"),
+                EventId = cleanupEventId,
                 Type = RealtimeEventType.UserAccountDeleted,
                 TargetUserId = userId,
                 ActorUserId = userId,
@@ -272,6 +278,13 @@ public sealed class AccountLifecycleService(
                 }),
             };
             db.RealtimeOutbox.Add(RealtimeIntegrationOutboxItem.FromEvent(evt));
+            db.AccountCleanupSagas.Add(new Core.Models.Export.AccountCleanupSaga
+            {
+                UserId = userId,
+                EventId = cleanupEventId,
+                Status = Core.Models.Export.AccountCleanupSagaStatus.Pending,
+                CreatedAt = DateTimeOffset.UtcNow,
+            });
 
             var deleted = await db.Users
                 .Where(u => u.Id == userId
@@ -288,6 +301,46 @@ public sealed class AccountLifecycleService(
 
             await db.SaveChangesAsync(cancellationToken);
             await tx.CommitAsync(cancellationToken);
+
+            // Redis / 导出 blob 在 DB 事务提交后再撤销，避免持行锁等待外部 IO。
+            try
+            {
+                await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "注销后撤销会话失败 UserId={UserId}（DB 已清理）", userId);
+            }
+
+            var pendingExports = await db.DataExportJobs
+                .Where(j => j.UserId == userId && j.Status == Core.Models.Export.DataExportJobStatus.PendingDelete)
+                .ToListAsync(cancellationToken);
+            foreach (var job in pendingExports)
+            {
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(job.ObjectKey))
+                        await dataExportBlobs.DeleteAsync(job.ObjectKey, cancellationToken);
+                    AuthSecurityMetrics.ExportBlobDelete("success");
+                    db.DataExportJobs.Remove(job);
+                }
+                catch (Exception ex)
+                {
+                    AuthSecurityMetrics.ExportBlobDelete("failed");
+                    AuthSecurityMetrics.ExportPendingDeleteDelta(1);
+                    job.AttemptCount = Math.Max(1, job.AttemptCount + 1);
+                    job.Error = ex.Message.Length > 500 ? ex.Message[..500] : ex.Message;
+                    logger.LogWarning(
+                        ex,
+                        "注销后删除导出对象失败，保留 PendingDelete 墓碑 UserId={UserId} Key={Key}",
+                        userId,
+                        job.ObjectKey);
+                }
+            }
+
+            if (pendingExports.Count > 0)
+                await db.SaveChangesAsync(cancellationToken);
+
             return true;
         });
     }

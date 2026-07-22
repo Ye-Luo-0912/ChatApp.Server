@@ -36,11 +36,37 @@ public sealed class AvatarPresignResponse
 public sealed class ConfirmAvatarRequest
 {
     public string ObjectKey { get; set; } = string.Empty;
+
+    /// <summary>S3 预签名上传后确认时必填；须与 CreateUploadTicket 返回的 ticket 一致。</summary>
+    public string? Ticket { get; set; }
 }
 
 public sealed class TrustDeviceRequest
 {
     public string? Label { get; set; }
+
+    /// <summary>当前密码；与 StepUpToken / 最近 MFA 三选一。</summary>
+    public string? Password { get; set; }
+
+    /// <summary>启用 MFA 时与密码一并提交。</summary>
+    public string? MfaCode { get; set; }
+
+    /// <summary>短期 step-up 令牌（由 /me/step-up 签发）。</summary>
+    public string? StepUpToken { get; set; }
+}
+
+public sealed class StepUpRequest
+{
+    public string? Password { get; set; }
+    public string? MfaCode { get; set; }
+    public string? StepUpToken { get; set; }
+}
+
+public sealed class AcknowledgeSecurityEventRequest
+{
+    public string? Password { get; set; }
+    public string? MfaCode { get; set; }
+    public string? StepUpToken { get; set; }
 }
 
 public sealed class MarkNotificationsReadRequest

@@ -1,6 +1,7 @@
 ﻿using ChatApp.Server.Models.Requests;
 using Core.Interfaces;
 using Core.Models.User;
+using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -19,6 +20,7 @@ public class UsersController(
     INotificationQuery notifications,
     IAdminAuditQuery adminAuditQuery,
     ITrustedDeviceService trustedDevices,
+    IDataExportService dataExport,
     IDeviceInfo deviceInfo) : BaseApiController
 {
     [HttpGet("me")]
@@ -123,7 +125,8 @@ public class UsersController(
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await userAccountService.ConfirmAvatarAsync(userId, model.ObjectKey, cancellationToken);
+        var result = await userAccountService.ConfirmAvatarAsync(
+            userId, model.ObjectKey, model.Ticket, cancellationToken);
         if (result is null) return NotFound();
         return result.Succeeded ? Ok(new { Message = "头像已更新" }) : BadRequest(result.Errors);
     }
@@ -154,15 +157,17 @@ public class UsersController(
     }
 
     [HttpPost("me/security-events/{eventId:long}/acknowledge")]
-    public async Task<IActionResult> AcknowledgeSecurityEvent(long eventId, CancellationToken cancellationToken)
+    public async Task<IActionResult> AcknowledgeSecurityEvent(
+        long eventId, [FromBody] AcknowledgeSecurityEventRequest? body, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await trustedDevices.AcknowledgeUnusualLoginAsync(
-            userId, eventId, deviceInfo.GetDeviceId(), deviceInfo.GenerateDeviceInfo().IpAddress, cancellationToken);
+        var (result, plainToken) = await trustedDevices.AcknowledgeUnusualLoginAsync(
+            userId, eventId, deviceInfo.GetDeviceId(), deviceInfo.GenerateDeviceInfo().IpAddress,
+            body?.Password, body?.MfaCode, body?.StepUpToken, cancellationToken);
         return result.Succeeded
-            ? Ok(new { Message = "已确认本人操作，并签发可信设备令牌" })
+            ? Ok(new { Message = "已确认本人操作，并签发可信设备令牌", TrustedDeviceToken = plainToken })
             : BadRequest(result.Errors);
     }
 
@@ -174,7 +179,23 @@ public class UsersController(
         return Ok(await trustedDevices.ListAsync(userId, cancellationToken));
     }
 
+    [HttpPost("me/step-up")]
+    [EnableRateLimiting("user-sensitive")]
+    public async Task<IActionResult> CreateStepUp(
+        [FromBody] StepUpRequest body, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var (result, token) = await trustedDevices.CreateStepUpTokenAsync(
+            userId, body.Password, body.MfaCode, cancellationToken);
+        return result.Succeeded
+            ? Ok(new { StepUpToken = token, ExpiresInSeconds = (int)TrustedDeviceService.StepUpTtl.TotalSeconds })
+            : BadRequest(result.Errors);
+    }
+
     [HttpPost("me/trusted-devices")]
+    [EnableRateLimiting("user-sensitive")]
     public async Task<IActionResult> TrustCurrentDevice(
         [FromBody] TrustDeviceRequest? body, CancellationToken cancellationToken)
     {
@@ -182,7 +203,8 @@ public class UsersController(
             return Unauthorized();
 
         var (result, plainToken) = await trustedDevices.TrustCurrentAsync(
-            userId, deviceInfo.GetDeviceId(), body?.Label, deviceInfo.GenerateDeviceInfo().IpAddress, cancellationToken);
+            userId, deviceInfo.GetDeviceId(), body?.Label, deviceInfo.GenerateDeviceInfo().IpAddress,
+            body?.Password, body?.MfaCode, body?.StepUpToken, cancellationToken);
         return result.Succeeded
             ? Ok(new { Message = "设备已信任", TrustedDeviceToken = plainToken })
             : BadRequest(result.Errors);
@@ -257,12 +279,47 @@ public class UsersController(
     }
 
     [HttpGet("me/export")]
-    public async Task<IActionResult> ExportData(CancellationToken cancellationToken)
+    public async Task<IActionResult> ExportDataLegacy(CancellationToken cancellationToken)
     {
+        // 保留同步精简导出以兼容旧客户端；完整导出走异步作业。
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
         var data = await accountLifecycle.ExportAsync(userId, cancellationToken);
         return data is null ? NotFound() : Ok(data);
+    }
+
+    [HttpPost("me/export/jobs")]
+    [EnableRateLimiting("user-sensitive")]
+    public async Task<IActionResult> StartExportJob(
+        [FromBody] StepUpRequest? body, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+        var (result, jobId) = await dataExport.EnqueueAsync(
+            userId, body?.Password, body?.MfaCode, body?.StepUpToken, cancellationToken);
+        if (!result.Succeeded)
+            return BadRequest(result.Errors);
+        return Accepted(new { JobId = jobId, StatusUrl = $"/api/users/me/export/jobs/{jobId}" });
+    }
+
+    [HttpGet("me/export/jobs/{jobId}")]
+    public async Task<IActionResult> GetExportJob(string jobId, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+        var status = await dataExport.GetStatusAsync(userId, jobId, cancellationToken);
+        return status is null ? NotFound() : Ok(status);
+    }
+
+    [HttpGet("me/export/jobs/{jobId}/download")]
+    public async Task<IActionResult> DownloadExportJob(string jobId, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+        var (stream, fileName, error) = await dataExport.OpenDownloadAsync(userId, jobId, cancellationToken);
+        if (stream is null)
+            return BadRequest(new { Message = error ?? "无法下载" });
+        return File(stream, "application/json", fileName);
     }
 
     [HttpPost("me/email/request-change")]

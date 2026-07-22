@@ -34,6 +34,7 @@ public static class AddServices
 
         services.AddScoped<IAuthService, AuthService>();
         services.AddSingleton<IMfaSecretProtector, AesGcmMfaSecretProtector>();
+        services.AddSingleton<IRecoveryCodeHasher, HmacRecoveryCodeHasher>();
         services.AddScoped<IMfaService, MfaService>();
         services.AddScoped<ISecurityNotificationService, SecurityNotificationService>();
         services.AddScoped<IAdminAuditQuery, AdminAuditQuery>();
@@ -53,8 +54,21 @@ public static class AddServices
         });
         services.AddScoped<IModerationService, ModerationService>();
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
+        services.AddScoped<AccountCleanupSagaService>();
+        services.AddScoped<IAccountCleanupSagaService>(sp => sp.GetRequiredService<AccountCleanupSagaService>());
+        services.AddHostedService(sp => new AccountCleanupSagaWorker(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>(),
+            sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.AccountCleanupSagaOptions>>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<AccountCleanupSagaWorker>>()));
         services.AddScoped<INotificationQuery, NotificationQuery>();
         services.AddScoped<ITrustedDeviceService, TrustedDeviceService>();
+        services.AddSingleton<LoginRiskAnalyzer>();
+        services.AddSingleton<ILoginRiskAnalyzer>(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
+        services.AddHostedService(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
+        services.AddSingleton<IDataExportBlobStore, LocalDataExportBlobStore>();
+        services.AddScoped<IDataExportService, DataExportService>();
+        services.AddHostedService<DataExportWorker>();
         services.AddScoped<IUserRepository, UserRepository>();
         services.AddScoped<IUserAccountService, UserAccountService>();
         services.AddScoped<IFriendshipService, FriendshipService>();

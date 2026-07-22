@@ -58,19 +58,26 @@ public sealed class LocalAvatarStorage(
     public async Task<(bool Ok, string? PublicUrl, string? Error)> StoreAsync(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
     {
-        var info = await cache.GetStringPayloadAsync<AvatarTicketInfo>(TicketKey(ticket), cancellationToken)
+        var ticketKey = TicketKey(ticket);
+        var info = await cache.TryGetAndDeleteStringPayloadAsync<AvatarTicketInfo>(ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
             return (false, null, "上传票无效或已过期");
         if (info.UserId != userId)
             return (false, null, "上传票与用户不匹配");
         if (!IsAllowedContentType(contentType))
+        {
+            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
             return (false, null, "不支持的头像格式");
+        }
 
         await using var buffer = new MemoryStream();
         await content.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
         if (buffer.Length <= 0 || buffer.Length > MaxBytes)
+        {
+            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
             return (false, null, "头像大小超限");
+        }
 
         buffer.Position = 0;
         byte[] encoded;
@@ -84,29 +91,30 @@ public sealed class LocalAvatarStorage(
         }
         catch (UnknownImageFormatException)
         {
+            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
             return (false, null, "无法解码为有效图片");
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "头像解码失败");
+            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
             return (false, null, "图片处理失败");
         }
 
-        var root = Path.GetFullPath(_options.LocalRootPath);
+        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
         var fullPath = Path.GetFullPath(Path.Combine(root, info.ObjectKey.Replace('/', Path.DirectorySeparatorChar)));
-        if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        if (!IsUnderRoot(root, fullPath))
             return (false, null, "非法对象键");
 
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         await File.WriteAllBytesAsync(fullPath, encoded, cancellationToken).ConfigureAwait(false);
-        await cache.RemoveAsync(TicketKey(ticket), cancellationToken).ConfigureAwait(false);
 
         var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{info.ObjectKey}";
         return (true, publicUrl, null);
     }
 
     public async Task<(bool Ok, string? PublicUrl, string? Error)> ConfirmObjectAsync(
-        long userId, string objectKey, CancellationToken cancellationToken = default)
+        long userId, string objectKey, string? ticket = null, CancellationToken cancellationToken = default)
     {
         if (!objectKey.StartsWith($"{userId}/", StringComparison.Ordinal))
             return (false, null, "无效的头像对象键");
@@ -117,9 +125,9 @@ public sealed class LocalAvatarStorage(
 
     public Task<bool> ObjectExistsAsync(string objectKey, CancellationToken cancellationToken = default)
     {
-        var root = Path.GetFullPath(_options.LocalRootPath);
+        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
         var fullPath = Path.GetFullPath(Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar)));
-        if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+        if (!IsUnderRoot(root, fullPath))
             return Task.FromResult(false);
         return Task.FromResult(File.Exists(fullPath));
     }
@@ -139,9 +147,9 @@ public sealed class LocalAvatarStorage(
             if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 key = key[prefix.Length..];
 
-            var root = Path.GetFullPath(_options.LocalRootPath);
+            var root = EnsureDirectoryBoundary(_options.LocalRootPath);
             var fullPath = Path.GetFullPath(Path.Combine(root, key.Replace('/', Path.DirectorySeparatorChar)));
-            if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(fullPath))
+            if (IsUnderRoot(root, fullPath) && File.Exists(fullPath))
                 File.Delete(fullPath);
         }
         catch (Exception ex)
@@ -150,6 +158,24 @@ public sealed class LocalAvatarStorage(
         }
 
         return Task.CompletedTask;
+    }
+
+    private async Task RestoreTicketAsync(
+        string ticketKey, AvatarTicketInfo info, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await cache.SetStringPayloadAsync(
+                    ticketKey,
+                    info,
+                    TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "头像上传失败后写回上传票失败");
+        }
     }
 
     private static async Task<byte[]> ReencodeAsync(Stream input, CancellationToken cancellationToken)
@@ -168,6 +194,23 @@ public sealed class LocalAvatarStorage(
         await image.SaveAsJpegAsync(output, new JpegEncoder { Quality = 85 }, cancellationToken)
             .ConfigureAwait(false);
         return output.ToArray();
+    }
+
+    /// <summary>确保根路径以分隔符结尾，并用相对路径检测逃逸。</summary>
+    private static string EnsureDirectoryBoundary(string rootPath)
+    {
+        var full = Path.GetFullPath(rootPath);
+        return full.EndsWith(Path.DirectorySeparatorChar)
+            ? full
+            : full + Path.DirectorySeparatorChar;
+    }
+
+    private static bool IsUnderRoot(string rootWithSep, string fullPath)
+    {
+        var relative = Path.GetRelativePath(rootWithSep, fullPath);
+        return relative != ".."
+               && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+               && !Path.IsPathRooted(relative);
     }
 
     private static string TicketKey(string ticket) => $"avatar:ticket:{ticket}";
