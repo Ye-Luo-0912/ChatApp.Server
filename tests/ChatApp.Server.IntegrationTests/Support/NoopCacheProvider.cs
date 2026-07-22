@@ -91,6 +91,10 @@ internal sealed class NoopCacheProvider : ICacheProvider
     public Task<T?> GetStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default)
         => Task.FromResult<T?>(default);
 
+    public Task<T?> TryGetAndDeleteStringPayloadAsync<T>(
+        string key, CancellationToken cancellationToken = default)
+        => Task.FromResult<T?>(default);
+
     public Task SetManyAsync(
         IReadOnlyList<CacheSetRequest> writes,
         CancellationToken cancellationToken = default)

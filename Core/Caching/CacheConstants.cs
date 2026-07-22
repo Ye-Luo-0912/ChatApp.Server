@@ -22,4 +22,8 @@ public static class CacheConstants
     // ── MFA 登录挑战 ─────────────────────────────────────────────
     public const string MfaPendingPrefix = "mfa:pending:";
     public const string MfaAttemptsPrefix = "mfa:attempts:";
+
+    // ── 敏感操作 step-up ─────────────────────────────────────────
+    public const string StepUpPrefix = "stepup:token:";
+    public const string RecentMfaPrefix = "stepup:recent-mfa:";
 }

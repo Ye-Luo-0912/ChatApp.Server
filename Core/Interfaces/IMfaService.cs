@@ -32,13 +32,15 @@ public interface ISecurityNotificationService
     /// <summary>仅挂起到当前 DbContext，不 SaveChanges（供登录等热路径合并提交）。</summary>
     void StageNotify(long userId, string type, string title, string body, bool preferEmail);
 
+    /// <param name="idempotencyKey">可选幂等键；为空时按「用户+类型+分钟」去重。</param>
     Task NotifyAsync(
         long userId,
         string type,
         string title,
         string body,
         bool preferEmail,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? idempotencyKey = null);
 }
 
 public interface IAdminAuditQuery

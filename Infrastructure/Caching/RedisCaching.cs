@@ -866,6 +866,52 @@ public class RedisCaching : ICacheProvider
     }
 
     /// <inheritdoc />
+    public async Task<T?> TryGetAndDeleteStringPayloadAsync<T>(
+        string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key))
+            return default;
+
+        var fullKey = NormalizeKey(key);
+        try
+        {
+            // GET + DEL 原子化，避免并发 confirm 双重消费
+            var value = await ExecuteWithRetry(
+                    () => _db.ScriptEvaluateAsync(
+                        """
+                        local v = redis.call('GET', KEYS[1])
+                        if v then
+                          redis.call('DEL', KEYS[1])
+                        end
+                        return v
+                        """,
+                        [fullKey],
+                        []),
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (value.IsNull)
+                return default;
+
+            var bytes = (byte[]?)value;
+            if (bytes is null || bytes.Length == 0)
+                return default;
+
+            return _serializer.Deserialize<T>(bytes);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogError(ex, "Redis 连接失败（StringPayload GETDEL）: {Key}", key);
+            throw new CacheUnavailableException("Redis 服务不可用", ex);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "反序列化失败（StringPayload GETDEL）: {Key}", key);
+            throw new CacheCorruptedException("缓存数据损坏", ex);
+        }
+    }
+
+    /// <inheritdoc />
     public async Task SetManyAsync(
         IReadOnlyList<CacheSetRequest> writes,
         CancellationToken cancellationToken = default)

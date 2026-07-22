@@ -8,7 +8,11 @@ namespace Core.Interfaces;
 /// </summary>
 public interface IAuthService
 {
-    Task<LoginResult> LoginAsync(string account, string password, CancellationToken cancellationToken = default);
+    Task<LoginResult> LoginAsync(
+        string account,
+        string password,
+        string? trustedDeviceToken = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>完成 MFA 挑战后签发令牌。</summary>
     Task<LoginResult> VerifyMfaAsync(string mfaToken, string code, CancellationToken cancellationToken = default);

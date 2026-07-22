@@ -69,10 +69,10 @@ public class ApplicationUser
     /// <summary>待确认的 TOTP 密钥（加密）；确认前不覆盖 <see cref="TotpSecret"/>。</summary>
     public string? PendingTotpSecret { get; set; }
 
-    /// <summary>恢复码哈希列表（JSON 数组，BCrypt）。</summary>
+    /// <summary>恢复码 HMAC 摘要列表（JSON 数组，格式 v{version}:{base64url}）。</summary>
     public string? RecoveryCodesHashJson { get; set; }
 
-    /// <summary>待确认的恢复码哈希（确认 MFA 后写入 <see cref="RecoveryCodesHashJson"/>）。</summary>
+    /// <summary>待确认的恢复码摘要（确认 MFA 后写入 <see cref="RecoveryCodesHashJson"/>）。</summary>
     public string? PendingRecoveryCodesHashJson { get; set; }
 
     /// <summary>计划注销时间；到点后由后台任务删除。</summary>

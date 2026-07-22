@@ -11,6 +11,7 @@ using Core.Models.Security;
 using Core.Models.Token;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -32,6 +33,8 @@ public class AuthService(
     IMfaService mfaService,
     ICacheProvider cache,
     ISecurityNotificationService securityNotifications,
+    ITrustedDeviceService trustedDevices,
+    ILoginRiskAnalyzer loginRiskAnalyzer,
     IOptions<RealtimeGatewayOptions> realtimeGatewayOptions,
     ILogger<AuthService> logger) : IAuthService
 {
@@ -50,7 +53,11 @@ public class AuthService(
     private readonly RealtimeGatewayOptions _realtimeGateway = realtimeGatewayOptions.Value;
 
     /// <inheritdoc />
-    public async Task<LoginResult> LoginAsync(string account, string password, CancellationToken cancellationToken = default)
+    public async Task<LoginResult> LoginAsync(
+        string account,
+        string password,
+        string? trustedDeviceToken = null,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(account) || string.IsNullOrWhiteSpace(password))
             return LoginResult.Fail("账号或密码不能为空", LoginCheckStatus.InvalidCredentials);
@@ -61,22 +68,45 @@ public class AuthService(
             if (status == LoginCheckStatus.Overloaded)
                 return LoginResult.Fail("服务繁忙，请稍后重试", LoginCheckStatus.Overloaded);
             if (user is null)
+            {
+                AuthSecurityMetrics.RecordLogin(status == LoginCheckStatus.LockedOut ? "locked" : "invalid");
                 return LoginResult.Fail("用户名或密码错误 / 账户已被锁定", status);
+            }
 
             if (user.MustChangePassword)
+            {
+                AuthSecurityMetrics.RecordLogin("must_change_password");
                 return LoginResult.Fail("检测到异常登录，请先重置或修改密码后再登录", LoginCheckStatus.NotAllowed);
+            }
 
+            string? rotatedTrustedToken = null;
             if (user.TwoFactorEnabled && !string.IsNullOrWhiteSpace(user.TotpSecret))
             {
+                // 仅高熵可信设备令牌可跳过 MFA；绝不信任可伪造的 X-Device-Id。
+                if (!string.IsNullOrWhiteSpace(trustedDeviceToken))
+                {
+                    var (trusted, rotated) = await trustedDevices.ValidateAndRotateAsync(
+                        user.Id, trustedDeviceToken, rotate: true, cancellationToken);
+                    if (trusted)
+                    {
+                        _logger.LogInformation("用户 {UserId} 经可信设备令牌跳过 MFA", user.Id);
+                        AuthSecurityMetrics.RecordLogin("trusted_skip_mfa");
+                        rotatedTrustedToken = rotated;
+                        return await CompleteLoginAsync(user, account, cancellationToken, rotatedTrustedToken);
+                    }
+                }
+
                 var mfaToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
                     .TrimEnd('=').Replace('+', '-').Replace('/', '_');
                 var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, mfaToken);
                 await cache.StringSetAsync(key, user.Id.ToString(), MfaChallengeTtl, cancellationToken);
                 _logger.LogInformation("用户 {UserId} 需要 MFA 验证", user.Id);
+                AuthSecurityMetrics.RecordLogin("mfa_required");
                 return LoginResult.RequireMfa(user.Id, mfaToken);
             }
 
-            return await CompleteLoginAsync(user, account, cancellationToken);
+            AuthSecurityMetrics.RecordLogin("success");
+            return await CompleteLoginAsync(user, account, cancellationToken, rotatedTrustedToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -127,11 +157,16 @@ public class AuthService(
 
         await cache.RemoveAsync(key, cancellationToken);
         await cache.RemoveAsync(attemptsKey, cancellationToken);
+        AuthSecurityMetrics.RecordLogin("mfa_success");
+        await trustedDevices.MarkRecentMfaAsync(userId, cancellationToken);
         return await CompleteLoginAsync(user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
     }
 
     private async Task<LoginResult> CompleteLoginAsync(
-        ApplicationUser user, string account, CancellationToken cancellationToken)
+        ApplicationUser user,
+        string account,
+        CancellationToken cancellationToken,
+        string? trustedDeviceToken = null)
     {
         var userIdString = user.Id.ToString();
         var currentDevice = _deviceInfo.GetDeviceId();
@@ -145,20 +180,21 @@ public class AuthService(
 
         var isNewDevice = string.IsNullOrWhiteSpace(currentDevice) || currentSession is null;
 
-        var isUnusualLocation = false;
+        // IP 变化仅为风险信号；异常地点最终判定/通知由 LoginRiskAnalyzer 异步完成，避免重复告警。
+        var ipChanged = false;
         if (!string.IsNullOrWhiteSpace(currentIp))
         {
             if (currentSession is not null)
             {
                 // 同设备：与该会话上次 IP 比较即可（热路径不扫全量会话）
-                isUnusualLocation = string.IsNullOrWhiteSpace(currentSession.ClientIp)
+                ipChanged = string.IsNullOrWhiteSpace(currentSession.ClientIp)
                     || !string.Equals(currentSession.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase);
             }
             else
             {
                 // 新设备：与既有会话 IP 集合比较
                 var existingSessions = await _sessionStore.ListSessionsAsync(userIdString, cancellationToken);
-                isUnusualLocation = existingSessions.Count > 0
+                ipChanged = existingSessions.Count > 0
                     && existingSessions.All(s =>
                         string.IsNullOrWhiteSpace(s.ClientIp)
                         || !string.Equals(s.ClientIp, currentIp, StringComparison.OrdinalIgnoreCase));
@@ -179,8 +215,8 @@ public class AuthService(
         };
 
         _logger.LogInformation(
-            "用户 {Username} 登录成功 IsNewDevice={IsNewDevice} UnusualLocation={UnusualLocation}",
-            account, isNewDevice, isUnusualLocation);
+            "用户 {Username} 登录成功 IsNewDevice={IsNewDevice} IpChanged={IpChanged}",
+            account, isNewDevice, ipChanged);
 
         var loginEvents = new List<SecurityEvent>
         {
@@ -209,19 +245,22 @@ public class AuthService(
                 $"检测到新设备登录，IP：{currentIp ?? "未知"}。", preferEmail: true);
         }
 
-        if (isUnusualLocation)
+        var requiresRecoveryCodeRegeneration =
+            HmacRecoveryCodeHasher.ContainsLegacyDigestsStatic(user.RecoveryCodesHashJson);
+        if (requiresRecoveryCodeRegeneration)
         {
             loginEvents.Add(new SecurityEvent
             {
                 UserId = user.Id,
-                EventType = SecurityEventType.LoginUnusualLocation,
+                EventType = SecurityEventType.MfaRecoveryCodesUpgradeRequired,
                 DeviceId = currentDevice,
                 ClientIp = currentIp,
+                Detail = "legacy-bcrypt-recovery-codes",
                 CreatedAt = DateTimeOffset.UtcNow,
             });
             securityNotifications.StageNotify(
-                user.Id, "LoginUnusualLocation", "异常地点登录",
-                $"检测到与既有会话不一致的 IP：{currentIp ?? "未知"}。", preferEmail: true);
+                user.Id, "MfaRecoveryCodesUpgrade", "请重新生成恢复码",
+                "检测到旧版恢复码格式，请尽快在安全设置中重新生成。", preferEmail: false);
         }
 
         securityEventStore.StageLoginEvents(loginEvents);
@@ -244,6 +283,10 @@ public class AuthService(
             }
         }
 
+        // 地理/ASN 风险分析移出登录热路径；IP 变化仅作为信号传入。
+        loginRiskAnalyzer.Enqueue(new LoginRiskWorkItem(
+            user.Id, currentIp, currentDevice, isNewDevice, tokens.SessionId, ipChanged));
+
         return LoginResult.Success(
             user,
             previousLoginDate,
@@ -256,7 +299,9 @@ public class AuthService(
             ref tcpServer,
             currentIp,
             isNewDevice,
-            isUnusualLocation);
+            ipChanged,
+            trustedDeviceToken,
+            requiresRecoveryCodeRegeneration);
     }
 
     public async Task LogoutAsync(long userId, string refreshToken, CancellationToken cancellationToken = default)
@@ -296,7 +341,7 @@ public class AuthService(
             Email              = email.Trim(),
             NormalizedEmail    = normalizedEmail,
             EmailConfirmed     = true,
-            PasswordHash   = _passwordHasher.HashPassword(password),
+            PasswordHash   = await _passwordHasher.HashPasswordAsync(password, cancellationToken),
             SecurityStamp  = Guid.NewGuid().ToString(),
             LockoutEnabled = true
         };
@@ -384,7 +429,7 @@ public class AuthService(
         if (user is null)
             return AuthOperationResult.Fail("UserNotFound", "用户不存在");
 
-        user.PasswordHash = _passwordHasher.HashPassword(newPassword);
+        user.PasswordHash = await _passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
         user.SecurityStamp = Guid.NewGuid().ToString();
         user.AccessFailedCount = 0;
         user.LockoutEnd = null;
@@ -392,12 +437,13 @@ public class AuthService(
 
         await _db.SaveChangesAsync(cancellationToken);
         await _sessionStore.RevokeAllSessionsAsync(user.Id.ToString(), cancellationToken: cancellationToken);
+        await trustedDevices.RevokeAllAsync(user.Id, cancellationToken);
 
         await securityNotifications.NotifyAsync(
             user.Id, "PasswordChanged", "密码已重置",
-            "您的账号密码已通过邮箱验证码重置。", preferEmail: true, cancellationToken);
+            "您的账号密码已通过邮箱验证码重置，全部可信设备已失效。", preferEmail: true, cancellationToken);
 
-        _logger.LogInformation("用户 {UserId} 通过邮箱验证码重置密码，已撤销全部会话", user.Id);
+        _logger.LogInformation("用户 {UserId} 通过邮箱验证码重置密码，已撤销全部会话与可信设备", user.Id);
         return AuthOperationResult.Success();
     }
 
@@ -435,7 +481,8 @@ public class AuthService(
         try
         {
             isPasswordValid = !string.IsNullOrEmpty(user.PasswordHash)
-                              && _passwordHasher.VerifyPassword(password, user.PasswordHash);
+                              && await _passwordHasher.VerifyPasswordAsync(
+                                  password, user.PasswordHash!, cancellationToken);
         }
         catch (PasswordVerifyOverloadedException)
         {

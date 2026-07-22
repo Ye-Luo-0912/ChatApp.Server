@@ -1,12 +1,12 @@
-using Core.Interfaces;
 using System.Diagnostics;
+using Core.Interfaces;
 using Core.Settings;
 using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services.Auth;
 
 /// <summary>
-/// 使用 BCrypt 实现密码哈希和验证（work factor = 10），并带进程内并发闸门。
+/// 使用 BCrypt 实现密码哈希和验证（work factor = 10），异步有界闸门。
 /// </summary>
 public sealed class BcryptPasswordHasher : IPasswordHasher
 {
@@ -22,51 +22,61 @@ public sealed class BcryptPasswordHasher : IPasswordHasher
         _acquireTimeout = TimeSpan.FromMilliseconds(Math.Max(0, opts.AcquireTimeoutMilliseconds));
     }
 
-    public string HashPassword(string password)
+    public async Task<string> HashPasswordAsync(string password, CancellationToken cancellationToken = default)
     {
-        if (!TryEnter())
-            throw new PasswordVerifyOverloadedException();
+        await EnterAsync("hash", cancellationToken).ConfigureAwait(false);
+        var sw = Stopwatch.StartNew();
         try
         {
-            return BCrypt.Net.BCrypt.HashPassword(password, WorkFactor);
+            return await Task.Run(() => BCrypt.Net.BCrypt.HashPassword(password, WorkFactor), cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
+            AuthSecurityMetrics.EndPasswordOp("hash", sw.Elapsed.TotalMilliseconds);
             _gate.Release();
         }
     }
 
-    public bool VerifyPassword(string password, string passwordHash)
+    public async Task<bool> VerifyPasswordAsync(
+        string password, string passwordHash, CancellationToken cancellationToken = default)
     {
-        if (!TryEnter())
-            throw new PasswordVerifyOverloadedException();
+        await EnterAsync("verify", cancellationToken).ConfigureAwait(false);
+        var sw = Stopwatch.StartNew();
         try
         {
-            return BCrypt.Net.BCrypt.Verify(password, passwordHash);
+            return await Task.Run(() => BCrypt.Net.BCrypt.Verify(password, passwordHash), cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
+            AuthSecurityMetrics.EndPasswordOp("verify", sw.Elapsed.TotalMilliseconds);
             _gate.Release();
         }
     }
 
-    private bool TryEnter()
+    private async Task EnterAsync(string op, CancellationToken cancellationToken)
     {
+        var waitSw = Stopwatch.StartNew();
+        bool acquired;
         if (_acquireTimeout <= TimeSpan.Zero)
         {
-            _gate.Wait();
-            return true;
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            acquired = true;
+        }
+        else
+        {
+            acquired = await _gate.WaitAsync(_acquireTimeout, cancellationToken).ConfigureAwait(false);
         }
 
-        return _gate.Wait(_acquireTimeout);
-    }
-}
+        AuthSecurityMetrics.RecordPasswordWait(op, waitSw.Elapsed.TotalMilliseconds);
 
-/// <summary>BCrypt 闸门过载：调用方应快速失败，避免拖垮线程池。</summary>
-public sealed class PasswordVerifyOverloadedException : Exception
-{
-    public PasswordVerifyOverloadedException()
-        : base("密码校验过载，请稍后重试")
-    {
+        if (!acquired)
+        {
+            AuthSecurityMetrics.RecordPasswordOverloaded(op);
+            throw new Core.Exceptions.PasswordVerifyOverloadedException();
+        }
+
+        AuthSecurityMetrics.BeginPasswordOp();
     }
 }

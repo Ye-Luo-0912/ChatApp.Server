@@ -139,6 +139,12 @@ public interface ICacheProvider
     Task<T?> GetStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 原子 GETDEL JSON 载荷：并发调用同一键时至多一个调用者拿到值，其余得到默认值。
+    /// 用于头像上传票等必须单次消费的场景。
+    /// </summary>
+    Task<T?> TryGetAndDeleteStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 在同一 MULTI/EXEC 事务中写入多条缓存（登录建会话等）。
     /// </summary>
     Task SetManyAsync(

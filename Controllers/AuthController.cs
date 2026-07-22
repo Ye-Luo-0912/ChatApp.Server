@@ -20,6 +20,7 @@ namespace ChatApp.Server.Controllers;
 public class AuthController(
     IAuthService authService,
     IMfaService mfaService,
+    ITrustedDeviceService trustedDevices,
     ILogger<AuthController> logger,
     IEmailVerificationService emailVerificationService) : BaseApiController
 {
@@ -37,7 +38,8 @@ public class AuthController(
 
         try
         {
-            var result = await authService.LoginAsync(model.Username, model.Password, cancellationToken);
+            var trusted = Request.Headers["X-Trusted-Device-Token"].FirstOrDefault();
+            var result = await authService.LoginAsync(model.Username, model.Password, trusted, cancellationToken);
             if (result.IsSuccess)
                 return Ok(result);
             if (result.LoginCheckStatus == LoginCheckStatus.Overloaded)
@@ -293,7 +295,11 @@ public class AuthController(
             return BadRequest(ModelState);
 
         var result = await mfaService.DisableAsync(userId, model.Password, model.Code, cancellationToken);
-        return result.Succeeded ? Ok(new { Message = "MFA 已关闭" }) : BadRequest(result.Errors);
+        if (!result.Succeeded)
+            return BadRequest(result.Errors);
+
+        await trustedDevices.RevokeAllAsync(userId, cancellationToken);
+        return Ok(new { Message = "MFA 已关闭，全部可信设备已失效" });
     }
 
     /// <summary>重新生成恢复码（旧码全部作废）。</summary>

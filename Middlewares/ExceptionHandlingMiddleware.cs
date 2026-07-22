@@ -48,6 +48,18 @@ namespace ChatApp.Server.Middlewares
                 await WriteProblemAsync(context, StatusCodes.Status503ServiceUnavailable, "cache_unavailable",
                     "服务暂时不可用，请稍后重试");
             }
+            catch (PasswordVerifyOverloadedException)
+            {
+                logger.LogWarning("密码校验过载");
+                await WriteProblemAsync(context, StatusCodes.Status503ServiceUnavailable, "password_verify_overloaded",
+                    "服务繁忙，请稍后重试");
+            }
+            catch (TimeoutException ex)
+            {
+                logger.LogWarning(ex, "操作超时");
+                await WriteProblemAsync(context, StatusCodes.Status503ServiceUnavailable, "timeout",
+                    ex.Message);
+            }
             catch (BadHttpRequestException ex)
             {
                 var status = ex.StatusCode is >= 400 and < 600

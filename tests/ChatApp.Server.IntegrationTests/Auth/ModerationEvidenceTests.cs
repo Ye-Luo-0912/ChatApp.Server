@@ -154,7 +154,7 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
             Email = $"{prefix}-{suffix}@ex.com",
             NormalizedEmail = $"{prefix}-{suffix}@EX.COM",
             EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword("Passw0rd!"),
+            PasswordHash = await hasher.HashPasswordAsync("Passw0rd!"),
             SecurityStamp = Guid.NewGuid().ToString(),
         };
         db.Users.Add(user);

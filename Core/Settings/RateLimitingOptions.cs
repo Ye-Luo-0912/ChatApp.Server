@@ -16,4 +16,8 @@ public sealed class RateLimitingOptions
 
     public int UserEmailChangePermitLimit { get; set; } = 3;
     public int UserEmailChangeWindowSeconds { get; set; } = 900;
+
+    /// <summary>敏感操作（step-up / 可信设备签发）每用户窗口限额。</summary>
+    public int UserSensitivePermitLimit { get; set; } = 10;
+    public int UserSensitiveWindowSeconds { get; set; } = 900;
 }

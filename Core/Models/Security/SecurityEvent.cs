@@ -23,6 +23,8 @@ public enum SecurityEventType : short
     UnusualLoginAcknowledged = 19,
     TrustedDeviceAdded = 20,
     TrustedDeviceRemoved = 21,
+    /// <summary>检测到旧版 BCrypt 恢复码，需客户端引导重新生成。</summary>
+    MfaRecoveryCodesUpgradeRequired = 22,
 }
 
 /// <summary>持久化安全事件（不依赖会过期的 Redis 会话）。</summary>

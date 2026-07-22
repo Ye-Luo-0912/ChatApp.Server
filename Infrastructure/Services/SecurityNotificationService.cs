@@ -35,14 +35,17 @@ public sealed class SecurityNotificationService(
         string title,
         string body,
         bool preferEmail,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? idempotencyKey = null)
     {
         var now = DateTimeOffset.UtcNow;
-        var idempotencyKey = $"{userId}:{type}:{now:yyyyMMddHHmm}";
+        var key = string.IsNullOrWhiteSpace(idempotencyKey)
+            ? $"{userId}:{type}:{now:yyyyMMddHHmm}"
+            : Truncate(idempotencyKey, 88);
         try
         {
             var exists = await db.NotificationOutbox.AsNoTracking().AnyAsync(
-                x => x.IdempotencyKey == idempotencyKey
+                x => x.IdempotencyKey == key
                      && (x.Status == NotificationOutboxStatus.Pending
                          || x.Status == NotificationOutboxStatus.Processing
                          || x.Status == NotificationOutboxStatus.Failed),
@@ -57,7 +60,7 @@ public sealed class SecurityNotificationService(
                 Body = Truncate(body, 2000),
                 PreferEmail = preferEmail,
                 Status = NotificationOutboxStatus.Pending,
-                IdempotencyKey = idempotencyKey,
+                IdempotencyKey = key,
                 CreatedAt = now,
                 UpdatedAt = now,
                 NextAttemptAt = now,

@@ -24,8 +24,20 @@ public sealed class LoginResult
     public string? ClientIp { get; init; }
     /// <summary>是否为该设备首次出现的会话（新设备登录提醒）。</summary>
     public bool IsNewDevice { get; init; }
-    /// <summary>当前 IP 是否与既有活跃会话均不一致（异常地点提醒）。</summary>
+    /// <summary>
+    /// 热路径 IP 粗信号：当前 IP 与既有会话不一致。
+    /// 正式「异常地点」判定与通知由异步 LoginRiskAnalyzer（地理 + 可信设备/历史）完成。
+    /// </summary>
     public bool IsUnusualLocation { get; init; }
+
+    /// <summary>登录时轮换后的可信设备令牌（明文仅此一次）；客户端应覆盖本地存储。</summary>
+    public string? TrustedDeviceToken { get; init; }
+
+    /// <summary>
+    /// 仍存有旧版 BCrypt 恢复码摘要时为 true；客户端应引导用户重新生成恢复码（新码为 HMAC）。
+    /// </summary>
+    public bool RequiresRecoveryCodeRegeneration { get; init; }
+
     /// <summary>本次登录的会话唯一标识；TCP 握手时可携带，用于会话关联。</summary>
     public string? SessionId { get; init; }
     /// <summary>
@@ -97,7 +109,9 @@ public sealed class LoginResult
         ref ServerEndPoint server,
         string? clientIp = null,
         bool isNewDevice = false,
-        bool isUnusualLocation = false
+        bool isUnusualLocation = false,
+        string? trustedDeviceToken = null,
+        bool requiresRecoveryCodeRegeneration = false
     ) => new()
     {
         IsSuccess = true,
@@ -107,6 +121,8 @@ public sealed class LoginResult
         ClientIp                 = clientIp,
         IsNewDevice              = isNewDevice,
         IsUnusualLocation        = isUnusualLocation,
+        TrustedDeviceToken       = trustedDeviceToken,
+        RequiresRecoveryCodeRegeneration = requiresRecoveryCodeRegeneration,
         SessionId                = sessionId,
         DeviceIdHash             = deviceIdHash,
         UserId                   = user.Id,

@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text.Json;
 using Core.Interfaces;
 using Core.Models.Auth;
@@ -14,12 +13,14 @@ namespace Infrastructure.Services.Auth;
 public sealed class MfaService(
     UserDbContext db,
     IPasswordHasher passwordHasher,
+    IRecoveryCodeHasher recoveryCodeHasher,
     IMfaSecretProtector secretProtector,
     ISecurityEventStore securityEventStore,
     ILogger<MfaService> logger) : IMfaService
 {
     private const string Issuer = "ChatApp";
     private const int MaxRecoveryConsumeAttempts = 3;
+    private const int RecoveryCodeCount = 8;
 
     public async Task<(string SharedKey, string OtpAuthUri, string[] RecoveryCodes)> BeginSetupAsync(
         long userId, string password, CancellationToken cancellationToken = default)
@@ -29,17 +30,17 @@ public sealed class MfaService(
 
         if (string.IsNullOrWhiteSpace(password)
             || string.IsNullOrWhiteSpace(user.PasswordHash)
-            || !passwordHasher.VerifyPassword(password, user.PasswordHash))
+            || !await passwordHasher.VerifyPasswordAsync(password, user.PasswordHash, cancellationToken))
             throw new UnauthorizedAccessException("密码验证失败");
 
         var key = KeyGeneration.GenerateRandomKey(20);
         var base32 = Base32Encoding.ToString(key);
-        var codes = Enumerable.Range(0, 8).Select(_ => GenerateRecoveryCode()).ToArray();
+        var codes = Enumerable.Range(0, RecoveryCodeCount).Select(_ => recoveryCodeHasher.GeneratePlainCode()).ToArray();
 
         // 仅写入待确认字段，保留已启用的旧 MFA
         user.PendingTotpSecret = secretProtector.Protect(base32);
         user.PendingRecoveryCodesHashJson =
-            JsonSerializer.Serialize(codes.Select(passwordHasher.HashPassword).ToArray());
+            JsonSerializer.Serialize(codes.Select(recoveryCodeHasher.Hash).ToArray());
         await db.SaveChangesAsync(cancellationToken);
 
         var account = user.Email ?? user.UserName ?? userId.ToString();
@@ -91,7 +92,7 @@ public sealed class MfaService(
 
         if (string.IsNullOrWhiteSpace(password)
             || string.IsNullOrWhiteSpace(user.PasswordHash)
-            || !passwordHasher.VerifyPassword(password, user.PasswordHash))
+            || !await passwordHasher.VerifyPasswordAsync(password, user.PasswordHash, cancellationToken))
             return AuthOperationResult.Fail("InvalidPassword", "密码验证失败");
 
         var ok = VerifyTotpForUser(user, codeOrRecovery)
@@ -151,7 +152,7 @@ public sealed class MfaService(
                 var matchIndex = -1;
                 for (var i = 0; i < hashes.Length; i++)
                 {
-                    if (passwordHasher.VerifyPassword(code.Trim(), hashes[i]))
+                    if (recoveryCodeHasher.Verify(code, hashes[i]))
                     {
                         matchIndex = i;
                         break;
@@ -199,7 +200,7 @@ public sealed class MfaService(
 
         if (string.IsNullOrWhiteSpace(password)
             || string.IsNullOrWhiteSpace(user.PasswordHash)
-            || !passwordHasher.VerifyPassword(password, user.PasswordHash))
+            || !await passwordHasher.VerifyPasswordAsync(password, user.PasswordHash, cancellationToken))
             return (AuthOperationResult.Fail("InvalidPassword", "密码验证失败"), null);
 
         var ok = VerifyTotpForUser(user, codeOrRecovery)
@@ -209,9 +210,9 @@ public sealed class MfaService(
 
         // 消费恢复码后需重新加载用户
         user = await db.Users.FirstAsync(u => u.Id == userId, cancellationToken);
-        var codes = Enumerable.Range(0, 8).Select(_ => GenerateRecoveryCode()).ToArray();
+        var codes = Enumerable.Range(0, RecoveryCodeCount).Select(_ => recoveryCodeHasher.GeneratePlainCode()).ToArray();
         user.RecoveryCodesHashJson =
-            JsonSerializer.Serialize(codes.Select(passwordHasher.HashPassword).ToArray());
+            JsonSerializer.Serialize(codes.Select(recoveryCodeHasher.Hash).ToArray());
         await db.SaveChangesAsync(cancellationToken);
         await securityEventStore.RecordAsync(
             userId, SecurityEventType.MfaRecoveryCodesRegenerated,
@@ -232,11 +233,5 @@ public sealed class MfaService(
         {
             return false;
         }
-    }
-
-    private static string GenerateRecoveryCode()
-    {
-        var bytes = RandomNumberGenerator.GetBytes(5);
-        return Convert.ToHexString(bytes);
     }
 }
