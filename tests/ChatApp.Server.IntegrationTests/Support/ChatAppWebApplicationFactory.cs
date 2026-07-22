@@ -90,6 +90,8 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
                 ["RateLimiting:AuthEmailWindowSeconds"] = "60",
                 ["RateLimiting:UserEmailChangePermitLimit"] = "1000",
                 ["RateLimiting:UserEmailChangeWindowSeconds"] = "60",
+                ["RateLimiting:UserSensitivePermitLimit"] = "1000",
+                ["RateLimiting:UserSensitiveWindowSeconds"] = "60",
                 ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "",
             };
 
@@ -131,6 +133,6 @@ internal sealed class NoopSecurityNotificationService : ISecurityNotificationSer
 
     public Task NotifyAsync(
         long userId, string type, string title, string body, bool preferEmail,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, string? idempotencyKey = null)
         => Task.CompletedTask;
 }

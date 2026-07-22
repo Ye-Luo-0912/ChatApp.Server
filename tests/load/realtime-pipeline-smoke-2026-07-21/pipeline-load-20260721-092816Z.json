@@ -1,0 +1,81 @@
+{
+  "GeneratedAtUtc": "2026-07-21T09:28:16.3310521+00:00",
+  "Configuration": {
+    "NatsUrl": "nats://127.0.0.1:4222",
+    "WarmupSeconds": 5,
+    "DurationSeconds": 30,
+    "Concurrency": 4,
+    "TargetOperationsPerSecond": 4,
+    "PayloadBytes": 512,
+    "OperationTimeoutSeconds": 15,
+    "BaseUserId": 9200000000
+  },
+  "Environment": {
+    "Framework": ".NET 11.0.0-preview.6.26359.118",
+    "OperatingSystem": "Microsoft Windows 10.0.26300",
+    "Architecture": "X64",
+    "ProcessorCount": 16,
+    "ServerGc": false,
+    "TotalAvailableMemoryBytes": 33599430656
+  },
+  "NatsPingMs": 1.1741,
+  "ElapsedSeconds": 30.3077195,
+  "Started": 124,
+  "Succeeded": 124,
+  "Failed": 0,
+  "ErrorRatePercent": 0,
+  "CompletedPipelinesPerSecond": 4.091366887568033,
+  "GeneratorAllocatedBytes": 9288696,
+  "GeneratorWorkingSetBytes": 62009344,
+  "Latencies": {
+    "message_publish_ack": {
+      "Count": 124,
+      "AverageMs": 2.0041532258064514,
+      "P50Ms": 2,
+      "P95Ms": 5.5,
+      "P99Ms": 7,
+      "MaximumMs": 8.472
+    },
+    "message_persisted_outbox": {
+      "Count": 124,
+      "AverageMs": 24.891137096774195,
+      "P50Ms": 27.5,
+      "P95Ms": 40.5,
+      "P99Ms": 57.5,
+      "MaximumMs": 58.74
+    },
+    "receipt_publish_ack": {
+      "Count": 124,
+      "AverageMs": 1.0301854838709676,
+      "P50Ms": 1,
+      "P95Ms": 2,
+      "P99Ms": 2,
+      "MaximumMs": 1.746
+    },
+    "receipt_persisted_outbox": {
+      "Count": 124,
+      "AverageMs": 19.49391129032258,
+      "P50Ms": 19.5,
+      "P95Ms": 23,
+      "P99Ms": 26,
+      "MaximumMs": 32.332
+    },
+    "history_query": {
+      "Count": 124,
+      "AverageMs": 3.715306451612903,
+      "P50Ms": 3.5,
+      "P95Ms": 5,
+      "P99Ms": 9.5,
+      "MaximumMs": 18.643
+    },
+    "complete_pipeline": {
+      "Count": 124,
+      "AverageMs": 48.159532258064516,
+      "P50Ms": 50,
+      "P95Ms": 68,
+      "P99Ms": 82.5,
+      "MaximumMs": 109.738
+    }
+  },
+  "ErrorSamples": []
+}

@@ -216,6 +216,45 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
     }
 
     [SkippableFact]
+    public async Task Avatar_Ticket_ConcurrentUpload_OnlyOneSucceeds()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var sharedPrefix = $"waf-av-race:{Guid.NewGuid():N}:";
+        var avatarRoot = Path.Combine(Path.GetTempPath(), "chatapp-waf-avatars", Guid.NewGuid().ToString("N"));
+        await using var factory = CreateFactory(sharedPrefix, avatarRoot);
+
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        await using (var db = postgres.CreateContext())
+            await WafTestHelpers.SeedUserAsync(db, $"avr-{suffix}", $"avr-{suffix}@ex.com", "Passw0rd!");
+
+        using var client = factory.CreateClientWithDevice($"dev-avr-{Guid.NewGuid():N}"[..24]);
+        var login = await WafTestHelpers.LoginAsync(client, $"avr-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+
+        var jpeg = WafTestHelpers.CreateJpeg(64, 64);
+        var presign = await client.PostAsJsonAsync("/api/users/me/avatar/presign",
+            new { contentType = "image/jpeg", contentLength = jpeg.Length }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, presign.StatusCode);
+        var ticket = (await presign.Content.ReadFromJsonAsync<AvatarTicketDto>(WafTestHelpers.Json))!.Ticket;
+
+        using var c1 = new ByteArrayContent(jpeg);
+        c1.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+        using var c2 = new ByteArrayContent(jpeg);
+        c2.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+        var url = $"/api/users/me/avatar/upload?ticket={Uri.EscapeDataString(ticket)}";
+
+        var t1 = client.PutAsync(url, c1);
+        var t2 = client.PutAsync(url, c2);
+        await Task.WhenAll(t1, t2);
+
+        var statuses = new[] { t1.Result.StatusCode, t2.Result.StatusCode };
+        Assert.Contains(HttpStatusCode.OK, statuses);
+        Assert.Contains(HttpStatusCode.BadRequest, statuses);
+    }
+
+    [SkippableFact]
     public async Task Search_ExcludesDisabledUsers()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);

@@ -1,0 +1,1 @@
+﻿{"runtime":{"persisted":148,"duplicates":0,"receiptsApplied":148,"receiptDuplicates":0,"failures":0,"deadLetters":0,"outboxPublished":314,"outboxFailures":0,"historyQueries":148,"historyQueryFailures":0,"historyQueryQueueDepth":0,"historyQueriesInFlight":0,"generatedAtMs":1784626096559},"outbox":{"pendingCount":0,"oldestPendingAtMs":null,"maxAttemptCount":0}}

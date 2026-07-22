@@ -42,7 +42,7 @@ internal static class WafTestHelpers
             Email = email,
             NormalizedEmail = email.ToUpperInvariant(),
             EmailConfirmed = true,
-            PasswordHash = hasher.HashPassword(password),
+            PasswordHash = await hasher.HashPasswordAsync(password),
             SecurityStamp = Guid.NewGuid().ToString(),
             LockoutEnabled = true,
             AllowBeSearched = allowSearch,

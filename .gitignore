@@ -7,4 +7,14 @@ riderModule.iml
 .env
 .env.*
 !.env.example
+# Runtime / local junk
+Logs/
+*.pid
 
+# Load-test temp artifacts (keep curated reports under tests/load/ and README.Performance.md)
+tests/load/*.pid
+tests/load/*.log
+tests/load/*.log.err
+tests/load/k6-smoke-*.txt
+tmp_*.txt
+tmp_*.csproj.txt
