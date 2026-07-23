@@ -18,6 +18,9 @@ public sealed class AccountCleanupSaga
     public string EventId { get; set; } = "";
     public string Status { get; set; } = AccountCleanupSagaStatus.Pending;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? CompletedAt { get; set; }
     public string? LastError { get; set; }
+    /// <summary>运维人工重放次数（不含首次投递）。</summary>
+    public int ReplayCount { get; set; }
 }

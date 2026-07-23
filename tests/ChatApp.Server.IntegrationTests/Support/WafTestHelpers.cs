@@ -33,7 +33,7 @@ internal static class WafTestHelpers
     public static async Task<ApplicationUser> SeedUserAsync(
         UserDbContext db, string name, string email, string password, bool allowSearch = true)
     {
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var user = new ApplicationUser
         {
             Id = new TsidGeneratorService().GenerateTsid(),

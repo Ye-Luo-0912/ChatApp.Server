@@ -17,6 +17,37 @@ public sealed class DataExportStorageOptions
     /// <summary>
     /// 本地落盘是否 AES-GCM 加密（默认 true）。
     /// 使用 <c>Security:SecretEncryptionKey</c>；关闭仅用于调试。
+    /// 格式：CAE3 分块 AES-GCM + 认证 EOF（流式读写）；仍可读遗留 CAE2 / CAE1 / 明文。
     /// </summary>
     public bool EncryptAtRest { get; set; } = true;
+
+    /// <summary>CAE3 明文分块大小（字节）；默认 64KiB。</summary>
+    public int EncryptChunkBytes { get; set; } = 64 * 1024;
+
+    /// <summary>
+    /// 生产切 S3 时：关闭本地信封加密（EncryptAtRest=false），改用桶级 SSE-S3 或 SSE-KMS；
+    /// blob store 实现应流式 PutObject/GetObject，勿缓冲整对象。
+    /// </summary>
+    public string? S3SseMode { get; set; }
+
+    /// <summary>
+    /// 可选：覆盖 MessageEvidence 的 Realtime Postgres 连接串，专供导出直读 messages。
+    /// 为空时回退 MessageEvidence:RealtimeConnectionString，再回退 NATS 历史查询。
+    /// </summary>
+    public string? RealtimeConnectionString { get; set; }
+
+    /// <summary>是否在导出包中包含聊天正文/回执/附件清单（默认 true）。</summary>
+    public bool IncludeChatContent { get; set; } = true;
+
+    /// <summary>直连 Postgres 时每页条数（默认 200，上限 500）。</summary>
+    public int ChatExportPageSize { get; set; } = 200;
+
+    /// <summary>单次导出消息上限，防止异常大账号拖垮 Worker（默认 200000）。</summary>
+    public int ChatExportMaxMessages { get; set; } = 200_000;
+
+    /// <summary>附件 URL 去重集合上限；超出后停止扫描并在 chatExport 中注明。</summary>
+    public int ChatExportMaxAttachmentUrls { get; set; } = 50_000;
+
+    /// <summary>正文超过该字符数时跳过 http URL 扫描（仍解析 JSON attachments）。</summary>
+    public int ChatExportUrlScanMaxContentChars { get; set; } = 64 * 1024;
 }

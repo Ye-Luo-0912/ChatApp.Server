@@ -19,6 +19,8 @@ public sealed class AccountLifecycleService(
     ISessionStore sessionStore,
     ISecurityEventStore securityEventStore,
     IDataExportBlobStore dataExportBlobs,
+    IAttachmentMetadataStore attachmentMetadata,
+    IAttachmentBlobDeleteService attachmentBlobDeletes,
     ILogger<AccountLifecycleService> logger) : IAccountLifecycleService
 {
     public static readonly TimeSpan CoolDown = TimeSpan.FromDays(14);
@@ -206,6 +208,22 @@ public sealed class AccountLifecycleService(
                 return false;
             }
 
+            // 在 Realtime DeleteByUser 删行之前先快照 object_key，提交后再删 blob。
+            IReadOnlyList<string> attachmentObjectKeys = [];
+            if (attachmentMetadata.IsAvailable)
+            {
+                try
+                {
+                    attachmentObjectKeys = await attachmentMetadata
+                        .ListObjectKeysForUserAsync(userId, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "列举附件 object_key 失败 UserId={UserId}", userId);
+                }
+            }
+
             await db.Friendships
                 .Where(f => f.UserId == userId || f.FriendId == userId)
                 .ExecuteDeleteAsync(cancellationToken);
@@ -278,12 +296,14 @@ public sealed class AccountLifecycleService(
                 }),
             };
             db.RealtimeOutbox.Add(RealtimeIntegrationOutboxItem.FromEvent(evt));
+            var sagaNow = DateTimeOffset.UtcNow;
             db.AccountCleanupSagas.Add(new Core.Models.Export.AccountCleanupSaga
             {
                 UserId = userId,
                 EventId = cleanupEventId,
                 Status = Core.Models.Export.AccountCleanupSagaStatus.Pending,
-                CreatedAt = DateTimeOffset.UtcNow,
+                CreatedAt = sagaNow,
+                UpdatedAt = sagaNow,
             });
 
             var deleted = await db.Users
@@ -302,7 +322,7 @@ public sealed class AccountLifecycleService(
             await db.SaveChangesAsync(cancellationToken);
             await tx.CommitAsync(cancellationToken);
 
-            // Redis / 导出 blob 在 DB 事务提交后再撤销，避免持行锁等待外部 IO。
+            // Redis / 导出 blob / 附件 blob 在 DB 事务提交后再撤销，避免持行锁等待外部 IO。
             try
             {
                 await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
@@ -310,6 +330,33 @@ public sealed class AccountLifecycleService(
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "注销后撤销会话失败 UserId={UserId}（DB 已清理）", userId);
+            }
+
+            // 附件 blob GC：入队墓碑（可重试），再 MarkAbandoned；不再仅 fire-and-forget。
+            try
+            {
+                if (attachmentObjectKeys.Count > 0)
+                {
+                    await attachmentBlobDeletes.EnqueueAsync(
+                            attachmentObjectKeys,
+                            userId,
+                            attachmentId: null,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                    // 立即尝试一轮；失败留 Pending + LastError 由 Worker 退避重试。
+                    await attachmentBlobDeletes.ProcessDueAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                if (attachmentMetadata.IsAvailable)
+                {
+                    await attachmentMetadata.MarkAbandonedByUploaderAsync(userId, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "注销后附件 blob GC 入队/处理失败 UserId={UserId}", userId);
             }
 
             var pendingExports = await db.DataExportJobs

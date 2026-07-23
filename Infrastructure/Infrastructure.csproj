@@ -38,4 +38,8 @@
       </ProjectReference>
     </ItemGroup>
 
+    <ItemGroup>
+      <InternalsVisibleTo Include="ChatApp.Server.IntegrationTests" />
+    </ItemGroup>
+
 </Project>

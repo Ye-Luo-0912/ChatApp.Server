@@ -149,12 +149,186 @@ public sealed class AccountCleanupSagaServiceTests
         await db.SaveChangesAsync();
 
         var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
-        Assert.True(await svc.TryReplayAsync(userId));
+        var replay = await svc.TryReplayAsync(userId);
+        Assert.Equal(AccountCleanupReplayOutcome.Replayed, replay.Outcome);
+        Assert.NotNull(replay.Item);
+        Assert.Equal(1, replay.Item!.ReplayCount);
 
         var saga = await db.AccountCleanupSagas.AsNoTracking().SingleAsync(s => s.UserId == userId);
         Assert.Equal(AccountCleanupSagaStatus.Pending, saga.Status);
         Assert.Null(saga.LastError);
+        Assert.Equal(1, saga.ReplayCount);
         Assert.True(await db.RealtimeOutbox.AnyAsync(o => o.EventId == eventId));
+    }
+
+    [Fact]
+    public async Task TryReplay_Completed_Rejected()
+    {
+        await using var db = CreateDb();
+        const long userId = 78;
+        db.AccountCleanupSagas.Add(new AccountCleanupSaga
+        {
+            UserId = userId,
+            EventId = "done-evt",
+            Status = AccountCleanupSagaStatus.Completed,
+            CreatedAt = DateTimeOffset.UtcNow.AddDays(-1),
+            UpdatedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            CompletedAt = DateTimeOffset.UtcNow.AddHours(-1),
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+        var replay = await svc.TryReplayAsync(userId);
+        Assert.Equal(AccountCleanupReplayOutcome.AlreadyCompleted, replay.Outcome);
+        Assert.False(await db.RealtimeOutbox.AnyAsync());
+    }
+
+    [Fact]
+    public async Task List_FiltersByStatusAndUser()
+    {
+        await using var db = CreateDb();
+        var now = DateTimeOffset.UtcNow;
+        db.AccountCleanupSagas.AddRange(
+            new AccountCleanupSaga
+            {
+                UserId = 1, EventId = "a", Status = AccountCleanupSagaStatus.Pending,
+                CreatedAt = now, UpdatedAt = now,
+            },
+            new AccountCleanupSaga
+            {
+                UserId = 2, EventId = "b", Status = AccountCleanupSagaStatus.Failed,
+                CreatedAt = now, UpdatedAt = now, LastError = "pending_timeout",
+            },
+            new AccountCleanupSaga
+            {
+                UserId = 3, EventId = "c", Status = AccountCleanupSagaStatus.Completed,
+                CreatedAt = now, UpdatedAt = now, CompletedAt = now,
+            });
+        db.AccountCleanupDeadLetters.Add(new AccountCleanupDeadLetter
+        {
+            EventId = "cleanup-done:b",
+            UserId = 2,
+            ReasonCode = AccountCleanupDeadLetterReason.EventIdMismatch,
+            Reason = "mismatch",
+            CreatedAt = now,
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+
+        var failed = await svc.ListAsync(AccountCleanupSagaStatus.Failed, null, 0, 50);
+        Assert.Equal(1, failed.Total);
+        Assert.Equal(2, failed.Items[0].UserId);
+
+        var byUser = await svc.ListAsync(null, 1, 0, 50);
+        Assert.Equal(1, byUser.Total);
+        Assert.Equal(AccountCleanupSagaStatus.Pending, byUser.Items[0].SagaStatus);
+
+        var dlq = await svc.ListAsync(AccountCleanupDisplayStatus.DeadLetter, null, 0, 50);
+        Assert.Equal(1, dlq.Total);
+        Assert.Equal(2, dlq.Items[0].UserId);
+        Assert.Equal(AccountCleanupDisplayStatus.DeadLetter, dlq.Items[0].DisplayStatus);
+        Assert.Equal(AccountCleanupDeadLetterReason.EventIdMismatch, dlq.Items[0].DeadLetterReasonCode);
+    }
+
+    [Fact]
+    public async Task GetStatus_ReturnsEnrichment()
+    {
+        await using var db = CreateDb();
+        const long userId = 9;
+        const string eventId = "src9";
+        var now = DateTimeOffset.UtcNow;
+        db.AccountCleanupSagas.Add(new AccountCleanupSaga
+        {
+            UserId = userId,
+            EventId = eventId,
+            Status = AccountCleanupSagaStatus.Pending,
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+        var status = await svc.GetStatusAsync(userId);
+        Assert.NotNull(status);
+        Assert.Equal(eventId, status!.SourceEventId);
+        Assert.Equal(AccountCleanupSagaStatus.Pending, status.SagaStatus);
+        Assert.False(status.HasCompletedInboxEvidence);
+    }
+
+    [Fact]
+    public async Task TryReconcile_MarksCompletedFromInboxEvidence()
+    {
+        await using var db = CreateDb();
+        const long userId = 101;
+        const string eventId = "recon-src";
+        var now = DateTimeOffset.UtcNow;
+        db.AccountCleanupSagas.Add(new AccountCleanupSaga
+        {
+            UserId = userId,
+            EventId = eventId,
+            Status = AccountCleanupSagaStatus.Failed,
+            CreatedAt = now.AddHours(-2),
+            UpdatedAt = now.AddHours(-1),
+            CompletedAt = now.AddHours(-1),
+            LastError = "pending_timeout",
+        });
+        db.AccountCleanupInbox.Add(new AccountCleanupInboxEntry
+        {
+            EventId = $"cleanup-done:{eventId}",
+            UserId = userId,
+            Outcome = AccountCleanupInboxOutcome.Completed,
+            ProcessedAt = now.AddMinutes(-30),
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+        var result = await svc.TryReconcileAsync(userId);
+        Assert.Equal(AccountCleanupReconcileOutcome.MarkedCompletedFromInbox, result.Outcome);
+
+        var saga = await db.AccountCleanupSagas.AsNoTracking().SingleAsync(s => s.UserId == userId);
+        Assert.Equal(AccountCleanupSagaStatus.Completed, saga.Status);
+        Assert.Null(saga.LastError);
+        Assert.NotNull(saga.CompletedAt);
+        Assert.True(result.Item!.HasCompletedInboxEvidence);
+    }
+
+    [Fact]
+    public async Task TryReconcile_MarksFailedFromOutboxDead()
+    {
+        await using var db = CreateDb();
+        const long userId = 102;
+        const string eventId = "dead-outbox";
+        var now = DateTimeOffset.UtcNow;
+        db.AccountCleanupSagas.Add(new AccountCleanupSaga
+        {
+            UserId = userId,
+            EventId = eventId,
+            Status = AccountCleanupSagaStatus.Pending,
+            CreatedAt = now.AddHours(-3),
+            UpdatedAt = now.AddHours(-3),
+        });
+        db.RealtimeOutbox.Add(new ChatApp.Realtime.Integration.Outbox.RealtimeIntegrationOutboxItem
+        {
+            EventId = eventId,
+            PayloadJson = "{}",
+            TargetUserId = userId,
+            EventType = (short)RealtimeEventType.UserAccountDeleted,
+            Status = (short)ChatApp.Realtime.Abstractions.Stores.RealtimeOutboxStatus.Dead,
+            CreatedAtMs = now.ToUnixTimeMilliseconds(),
+            NextAttemptAtMs = now.ToUnixTimeMilliseconds(),
+            AttemptCount = 10,
+            LastError = "max attempts",
+        });
+        await db.SaveChangesAsync();
+
+        var svc = new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance);
+        var result = await svc.TryReconcileAsync(userId);
+        Assert.Equal(AccountCleanupReconcileOutcome.MarkedFailedFromOutboxDead, result.Outcome);
+
+        var saga = await db.AccountCleanupSagas.AsNoTracking().SingleAsync(s => s.UserId == userId);
+        Assert.Equal(AccountCleanupSagaStatus.Failed, saga.Status);
+        Assert.Equal("outbox_dead", saga.LastError);
     }
 
     [Fact]

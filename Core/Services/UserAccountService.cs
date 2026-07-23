@@ -576,6 +576,65 @@ public partial class UserAccountService(
         return AuthOperationResult.Success();
     }
 
+    public async Task<AuthOperationResult?> RejectSuspiciousLoginAsync(
+        long userId, long securityEventId, CancellationToken cancellationToken = default)
+    {
+        var page = await userRepository.ListSecurityEventsAsync(userId, null, 200, cancellationToken);
+        var evt = page.Items.FirstOrDefault(e => e.Id == securityEventId);
+        if (evt is null)
+            return AuthOperationResult.Fail("NotFound", "安全事件不存在");
+
+        if (evt.EventType is not (SecurityEventType.LoginUnusualLocation or SecurityEventType.LoginNewDevice
+            or SecurityEventType.LoginSuccess))
+            return AuthOperationResult.Fail("InvalidEvent", "仅可拒绝新设备/异常登录类事件");
+
+        var user = await userRepository.FindByIdAsync(userId, cancellationToken);
+        if (user is null) return null;
+
+        // 优先撤销该次登录的设备会话；Detail 中若含 session= 则一并记录。
+        if (!string.IsNullOrWhiteSpace(evt.DeviceId))
+            await sessionStore.RevokeSessionAsync(userId.ToString(), evt.DeviceId, cancellationToken);
+
+        // 匹配 DeviceIdHint 的可信设备一并吊销（不核销全部）。
+        if (!string.IsNullOrWhiteSpace(evt.DeviceId))
+        {
+            var devices = await trustedDevices.ListAsync(userId, cancellationToken);
+            foreach (var d in devices.Where(d =>
+                         string.Equals(d.DeviceIdHint, evt.DeviceId, StringComparison.Ordinal)))
+            {
+                await trustedDevices.RemoveAsync(userId, d.Id, cancellationToken);
+            }
+        }
+
+        var sessionHint = ExtractSessionId(evt.Detail);
+        await securityEventStore.RecordAsync(
+            userId, SecurityEventType.LoginRejected, evt.DeviceId, evt.ClientIp,
+            detail: $"sourceEvent={securityEventId};session={sessionHint ?? "-"}",
+            cancellationToken: cancellationToken);
+
+        await securityNotifications.NotifyAsync(
+            userId, "LoginRejected", "已拒绝可疑登录",
+            "已撤销该次登录关联的设备会话。若仍有异常，请使用「非本人」撤销全部会话并修改密码。",
+            preferEmail: true, cancellationToken);
+
+        return AuthOperationResult.Success();
+    }
+
+    private static string? ExtractSessionId(string? detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            return null;
+        const string marker = "session=";
+        var idx = detail.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        var start = idx + marker.Length;
+        var end = start;
+        while (end < detail.Length && !char.IsWhiteSpace(detail[end]) && detail[end] is not ';' and not ',')
+            end++;
+        var value = detail[start..end].Trim();
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
     private async Task<AuthOperationResult> TryChangeUserNameAsync(
         ApplicationUser user, string newName, CancellationToken cancellationToken)
     {

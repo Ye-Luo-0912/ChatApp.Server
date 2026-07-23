@@ -112,8 +112,31 @@ public sealed class AccountCleanupSagaWorkerTests
         Assert.Equal(1, await db.AccountCleanupInbox.CountAsync());
     }
 
+    [Fact]
+    public async Task Handle_AttachmentBlobsPurge_EnqueuesTombstonesAndAcks()
+    {
+        await using var db = CreateDb();
+        var enqueued = new List<string>();
+        var (worker, acked, naked) = CreateWorker(db, enqueued);
+
+        var evt = new RealtimeEvent
+        {
+            EventId = "attach-purge:1",
+            Type = RealtimeEventType.AttachmentBlobsPurge,
+            TargetUserId = 99,
+            OccurredAtMs = 1,
+            PayloadJson = """{"UserId":99,"ObjectKeys":["a/1.png","a/2.bin"],"ChunkIndex":0,"ChunkCount":1}""",
+        };
+
+        await InvokeHandleAsync(worker, CreateDelivery(evt, 1, acked, naked));
+
+        Assert.Single(acked);
+        Assert.Empty(naked);
+        Assert.Equal(["a/1.png", "a/2.bin"], enqueued);
+    }
+
     private static (AccountCleanupSagaWorker Worker, List<string> Acked, List<string> Naked)
-        CreateWorker(UserDbContext db, int maxMissing = 5)
+        CreateWorker(UserDbContext db, List<string>? enqueued = null, int maxMissing = 5)
     {
         var acked = new List<string>();
         var naked = new List<string>();
@@ -123,6 +146,8 @@ public sealed class AccountCleanupSagaWorkerTests
             new AccountCleanupSagaService(db, NullLogger<AccountCleanupSagaService>.Instance));
         services.AddScoped<AccountCleanupSagaService>(sp =>
             (AccountCleanupSagaService)sp.GetRequiredService<IAccountCleanupSagaService>());
+        services.AddScoped<IAttachmentBlobDeleteService>(_ =>
+            new CaptureAttachmentBlobDeleteService(enqueued ?? []));
         var provider = services.BuildServiceProvider();
         var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
 
@@ -173,5 +198,30 @@ public sealed class AccountCleanupSagaWorkerTests
             .UseInMemoryDatabase(Guid.NewGuid().ToString("N"))
             .Options;
         return new UserDbContext(options);
+    }
+
+    private sealed class CaptureAttachmentBlobDeleteService(List<string> enqueued) : IAttachmentBlobDeleteService
+    {
+        public Task EnqueueAsync(
+            IEnumerable<string> objectKeys,
+            long? userId = null,
+            string? attachmentId = null,
+            CancellationToken cancellationToken = default)
+        {
+            enqueued.AddRange(objectKeys);
+            return Task.CompletedTask;
+        }
+
+        public Task EnqueueAsync(
+            IEnumerable<(string ObjectKey, string? AttachmentId)> items,
+            long? userId = null,
+            CancellationToken cancellationToken = default)
+        {
+            enqueued.AddRange(items.Select(i => i.ObjectKey));
+            return Task.CompletedTask;
+        }
+
+        public Task<int> ProcessDueAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
     }
 }

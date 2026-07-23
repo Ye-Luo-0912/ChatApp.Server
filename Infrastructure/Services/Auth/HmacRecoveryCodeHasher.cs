@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Core.Interfaces;
 using Core.Settings;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,8 +19,11 @@ public interface IRecoveryCodeHasher
     /// <summary>计算版本化 HMAC 摘要，格式 <c>v{version}:{base64url}</c>。</summary>
     string Hash(string plainCode);
 
-    /// <summary>恒定时间比对明文与已存摘要（支持当前/上一密钥版本；兼容旧版 BCrypt）。</summary>
-    bool Verify(string plainCode, string storedDigest);
+    /// <summary>
+    /// 恒定时间比对明文与已存摘要（支持当前/上一密钥版本；兼容旧版 BCrypt）。
+    /// 遗留 BCrypt 走共享 Auth CPU 闸门；HMAC 路径不占闸门。
+    /// </summary>
+    Task<bool> VerifyAsync(string plainCode, string storedDigest, CancellationToken cancellationToken = default);
 
     /// <summary>是否为旧版 BCrypt 摘要（<c>$2a$</c>/<c>$2b$</c>/<c>$2y$</c>）。</summary>
     bool IsLegacyDigest(string storedDigest);
@@ -32,13 +37,16 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
     private const int EntropyBytes = 16; // 128-bit
     private readonly Dictionary<int, byte[]> _keysByVersion;
     private readonly int _currentVersion;
+    private readonly IAuthCpuLimiter _cpuLimiter;
 
     public HmacRecoveryCodeHasher(
         IOptions<SecurityOptions> security,
         IOptions<JwtSettings> jwt,
         IHostEnvironment env,
+        IAuthCpuLimiter cpuLimiter,
         ILogger<HmacRecoveryCodeHasher> logger)
     {
+        _cpuLimiter = cpuLimiter;
         var opts = security.Value;
         _currentVersion = opts.KeyVersion <= 0 ? 1 : opts.KeyVersion;
         _keysByVersion = new Dictionary<int, byte[]>();
@@ -84,14 +92,15 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
         return $"v{_currentVersion}:{Base64Url(digest)}";
     }
 
-    public bool Verify(string plainCode, string storedDigest)
+    public async Task<bool> VerifyAsync(
+        string plainCode, string storedDigest, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(plainCode) || string.IsNullOrWhiteSpace(storedDigest))
             return false;
 
-        // 旧版 BCrypt：兼容校验；新生成一律走 HMAC。
+        // 旧版 BCrypt：兼容校验；与密码校验共用 CPU 闸门。
         if (IsLegacyDigest(storedDigest))
-            return VerifyBcryptCompat(plainCode, storedDigest);
+            return await VerifyBcryptCompatAsync(plainCode, storedDigest, cancellationToken).ConfigureAwait(false);
 
         if (!TrySplitVersioned(storedDigest, out var version, out var payload)
             || !_keysByVersion.TryGetValue(version, out var key))
@@ -144,21 +153,34 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
     /// <summary>
     /// 旧版可能以「带连字符原文」或「规范化大写」写入 BCrypt；展开候选后逐一校验。
     /// </summary>
-    private static bool VerifyBcryptCompat(string plainCode, string bcryptHash)
+    private async Task<bool> VerifyBcryptCompatAsync(
+        string plainCode, string bcryptHash, CancellationToken cancellationToken)
     {
+        await _cpuLimiter.EnterAsync("recovery_bcrypt", cancellationToken).ConfigureAwait(false);
+        var sw = Stopwatch.StartNew();
         try
         {
-            foreach (var candidate in ExpandBcryptPlainCandidates(plainCode))
+            return await Task.Run(() =>
             {
-                if (BCrypt.Net.BCrypt.Verify(candidate, bcryptHash))
-                    return true;
-            }
+                try
+                {
+                    foreach (var candidate in ExpandBcryptPlainCandidates(plainCode))
+                    {
+                        if (BCrypt.Net.BCrypt.Verify(candidate, bcryptHash))
+                            return true;
+                    }
 
-            return false;
+                    return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }, cancellationToken).ConfigureAwait(false);
         }
-        catch
+        finally
         {
-            return false;
+            _cpuLimiter.Exit("recovery_bcrypt", sw.Elapsed.TotalMilliseconds);
         }
     }
 

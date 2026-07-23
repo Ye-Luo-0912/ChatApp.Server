@@ -31,6 +31,7 @@ namespace Infrastructure.Data
         public DbSet<UserReport> UserReports { get; set; }
         public DbSet<TrustedDevice> TrustedDevices { get; set; }
         public DbSet<DataExportJob> DataExportJobs { get; set; }
+        public DbSet<AttachmentBlobDeleteJob> AttachmentBlobDeleteJobs { get; set; }
         public DbSet<AccountCleanupSaga> AccountCleanupSagas { get; set; }
         public DbSet<AccountCleanupInboxEntry> AccountCleanupInbox { get; set; }
         public DbSet<AccountCleanupDeadLetter> AccountCleanupDeadLetters { get; set; }
@@ -162,6 +163,23 @@ namespace Infrastructure.Data
                     .HasDatabaseName("UX_DataExportJob_OneActive");
             });
 
+            builder.Entity<AttachmentBlobDeleteJob>(e =>
+            {
+                e.ToTable("T_AttachmentBlobDeleteJob");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.ObjectKey).HasMaxLength(512).IsRequired();
+                e.Property(x => x.AttachmentId).HasMaxLength(64);
+                e.Property(x => x.Status).HasMaxLength(32).IsRequired();
+                e.Property(x => x.LastError).HasMaxLength(500);
+                e.HasIndex(x => new { x.Status, x.NextAttemptAt })
+                    .HasDatabaseName("IX_AttachmentBlobDeleteJob_Due");
+                e.HasIndex(x => x.ObjectKey)
+                    .HasDatabaseName("IX_AttachmentBlobDeleteJob_ObjectKey");
+                e.HasIndex(x => x.UserId)
+                    .HasDatabaseName("IX_AttachmentBlobDeleteJob_UserId");
+            });
+
             builder.Entity<AccountCleanupSaga>(e =>
             {
                 e.ToTable("T_AccountCleanupSaga");
@@ -170,6 +188,7 @@ namespace Infrastructure.Data
                 e.Property(x => x.EventId).HasMaxLength(64).IsRequired();
                 e.Property(x => x.Status).HasMaxLength(32).IsRequired();
                 e.Property(x => x.LastError).HasMaxLength(500);
+                e.Property(x => x.ReplayCount).HasDefaultValue(0);
                 e.HasIndex(x => new { x.Status, x.CreatedAt })
                     .HasDatabaseName("IX_AccountCleanupSaga_Status_Created");
             });

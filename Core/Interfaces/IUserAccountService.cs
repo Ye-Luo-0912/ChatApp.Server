@@ -68,4 +68,10 @@ public interface IUserAccountService
 
     /// <summary>标记安全事件“不是本人”：撤销对应设备、全部会话，并要求修改密码。</summary>
     Task<AuthOperationResult?> ReportNotMeAsync(long userId, long securityEventId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 拒绝可疑登录：仅撤销该安全事件关联的设备会话（及匹配的可信设备），不强制改密。
+    /// </summary>
+    Task<AuthOperationResult?> RejectSuspiciousLoginAsync(
+        long userId, long securityEventId, CancellationToken cancellationToken = default);
 }

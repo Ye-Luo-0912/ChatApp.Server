@@ -11,8 +11,11 @@ using Microsoft.Extensions.Options;
 namespace Infrastructure.Services;
 
 /// <summary>
-/// 消费 Realtime AccountCleanupCompleted，推进 AccountCleanupSaga；
+/// 消费 Realtime AccountCleanupCompleted / AttachmentBlobsPurge：
+/// - Completed：推进 AccountCleanupSaga；
+/// - AttachmentBlobsPurge：入队附件 blob 删除墓碑；
 /// 乱序有限 NAK；非法 / 耗尽 → Server DLQ + ACK；周期性将超时 Pending 标为 Failed。
+/// 若 RealtimeIntegration:Url 未配置，则无总线消费（本 Worker 仅跑 stale-fail；附件 GC 依赖账号删除本地入队）。
 /// </summary>
 public sealed class AccountCleanupSagaWorker(
     IServiceScopeFactory scopeFactory,
@@ -27,12 +30,20 @@ public sealed class AccountCleanupSagaWorker(
             ? Task.CompletedTask
             : RunConsumeLoopAsync(bus, stoppingToken);
 
+        if (bus is null)
+        {
+            logger.LogInformation(
+                "RealtimeIntegration:Url 未配置，跳过 AccountCleanup / AttachmentBlobsPurge 消费；" +
+                "附件 blob 删除依赖账号注销本地墓碑入队");
+        }
+
         await Task.WhenAll(staleTask, consumeTask);
     }
 
     private async Task RunConsumeLoopAsync(IRealtimeMessageBus messageBus, CancellationToken stoppingToken)
     {
-        logger.LogInformation("AccountCleanupSagaWorker 开始消费 AccountCleanupCompleted");
+        logger.LogInformation(
+            "AccountCleanupSagaWorker 开始消费 AccountCleanupCompleted / AttachmentBlobsPurge");
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -73,6 +84,12 @@ public sealed class AccountCleanupSagaWorker(
     private async Task HandleDeliveryAsync(RealtimeEventDelivery delivery, CancellationToken ct)
     {
         var evt = delivery.Event;
+        if (evt.Type == RealtimeEventType.AttachmentBlobsPurge)
+        {
+            await HandleAttachmentBlobsPurgeAsync(delivery, ct);
+            return;
+        }
+
         if (evt.Type != RealtimeEventType.AccountCleanupCompleted)
         {
             // UserAccountDeleted 由 Realtime AccountCleanupWorker 处理；Server 直接 ACK。
@@ -151,6 +168,61 @@ public sealed class AccountCleanupSagaWorker(
                 await delivery.NakAsync(TimeSpan.FromSeconds(5), ct);
                 return;
         }
+    }
+
+    private async Task HandleAttachmentBlobsPurgeAsync(RealtimeEventDelivery delivery, CancellationToken ct)
+    {
+        var evt = delivery.Event;
+        if (string.IsNullOrWhiteSpace(evt.PayloadJson))
+        {
+            logger.LogWarning(
+                "AttachmentBlobsPurge 缺少 PayloadJson，ACK 跳过。EventId={EventId}",
+                evt.EventId);
+            await delivery.AckAsync(ct);
+            return;
+        }
+
+        AttachmentBlobsPurgePayload? payload;
+        try
+        {
+            payload = System.Text.Json.JsonSerializer.Deserialize<AttachmentBlobsPurgePayload>(
+                evt.PayloadJson,
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "AttachmentBlobsPurge PayloadJson 反序列化失败，ACK 跳过。EventId={EventId}",
+                evt.EventId);
+            await delivery.AckAsync(ct);
+            return;
+        }
+
+        if (payload?.ObjectKeys is null || payload.ObjectKeys.Count == 0)
+        {
+            await delivery.AckAsync(ct);
+            return;
+        }
+
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var deletes = scope.ServiceProvider.GetRequiredService<IAttachmentBlobDeleteService>();
+        await deletes.EnqueueAsync(
+                payload.ObjectKeys,
+                userId: payload.UserId != 0 ? payload.UserId : evt.TargetUserId,
+                attachmentId: null,
+                ct)
+            .ConfigureAwait(false);
+
+        logger.LogInformation(
+            "AttachmentBlobsPurge 已入队墓碑 UserId={UserId} Keys={Count} Chunk={Index}/{Total} EventId={EventId}",
+            payload.UserId,
+            payload.ObjectKeys.Count,
+            payload.ChunkIndex,
+            payload.ChunkCount,
+            evt.EventId);
+
+        await delivery.AckAsync(ct);
     }
 
     private async Task RunStaleFailLoopAsync(CancellationToken stoppingToken)

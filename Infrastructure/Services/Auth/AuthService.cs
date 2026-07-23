@@ -143,8 +143,10 @@ public class AuthService(
         if (user is null || !user.TwoFactorEnabled || string.IsNullOrWhiteSpace(user.TotpSecret))
             return LoginResult.Fail("MFA 不可用", LoginCheckStatus.InvalidCredentials);
 
-        var ok = mfaService.VerifyTotpForUser(user, code)
-                 || await mfaService.TryConsumeRecoveryCodeAsync(userId, code, cancellationToken);
+        var ok = await mfaService.TryVerifyAndConsumeTotpForUserAsync(user, code, cancellationToken)
+                     .ConfigureAwait(false)
+                 || await mfaService.TryConsumeRecoveryCodeAsync(userId, code, cancellationToken)
+                     .ConfigureAwait(false);
         if (!ok)
             return LoginResult.Fail("验证码或恢复码无效", LoginCheckStatus.InvalidCredentials);
 
@@ -158,8 +160,15 @@ public class AuthService(
         await cache.RemoveAsync(key, cancellationToken);
         await cache.RemoveAsync(attemptsKey, cancellationToken);
         AuthSecurityMetrics.RecordLogin("mfa_success");
-        await trustedDevices.MarkRecentMfaAsync(userId, cancellationToken);
-        return await CompleteLoginAsync(user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
+        var login = await CompleteLoginAsync(
+            user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
+        if (login.IsSuccess)
+        {
+            await trustedDevices.MarkRecentMfaAsync(
+                userId, login.SessionId, _deviceInfo.GetDeviceId(), cancellationToken);
+        }
+
+        return login;
     }
 
     private async Task<LoginResult> CompleteLoginAsync(

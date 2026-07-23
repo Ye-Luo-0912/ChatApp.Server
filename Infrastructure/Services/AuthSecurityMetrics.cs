@@ -42,6 +42,13 @@ public static class AuthSecurityMetrics
         ExportMeter.CreateCounter<long>("data_export.blob_delete", "ops", "导出 blob 删除结果");
     private static long _exportPendingDelete;
 
+    private static readonly Meter AttachmentMeter = new("Infrastructure.Attachments");
+    private static readonly Counter<long> AttachmentBlobDeletes =
+        AttachmentMeter.CreateCounter<long>("attachment.blob_delete", "ops", "附件 blob 删除结果");
+    private static readonly Counter<long> AttachmentScans =
+        AttachmentMeter.CreateCounter<long>("attachment.scan", "ops", "附件内容扫描状态变迁");
+    private static long _attachmentPendingDelete;
+
     static AuthSecurityMetrics()
     {
         PasswordMeter.CreateObservableGauge(
@@ -59,6 +66,11 @@ public static class AuthSecurityMetrics
             () => Volatile.Read(ref _exportPendingDelete),
             "jobs",
             "blob 删除失败墓碑数（告警钩子）");
+        AttachmentMeter.CreateObservableGauge(
+            "attachment.pending_delete",
+            () => Volatile.Read(ref _attachmentPendingDelete),
+            "jobs",
+            "附件 blob 删除墓碑数（告警钩子）");
     }
 
     public static void RecordLogin(string outcome)
@@ -107,4 +119,13 @@ public static class AuthSecurityMetrics
 
     public static void ExportPendingDeleteDelta(int delta)
         => Interlocked.Add(ref _exportPendingDelete, delta);
+
+    public static void AttachmentBlobDelete(string outcome)
+        => AttachmentBlobDeletes.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
+
+    public static void AttachmentScan(string outcome)
+        => AttachmentScans.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
+
+    public static void AttachmentPendingDeleteDelta(int delta)
+        => Interlocked.Add(ref _attachmentPendingDelete, delta);
 }

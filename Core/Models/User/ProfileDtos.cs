@@ -60,6 +60,9 @@ public sealed class StepUpRequest
     public string? Password { get; set; }
     public string? MfaCode { get; set; }
     public string? StepUpToken { get; set; }
+
+    /// <summary>绑定用途：<c>trusted-device</c> 或 <c>data-export</c>。</summary>
+    public string? Purpose { get; set; }
 }
 
 public sealed class AcknowledgeSecurityEventRequest

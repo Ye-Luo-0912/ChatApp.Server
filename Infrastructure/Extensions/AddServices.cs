@@ -20,6 +20,7 @@ public static class AddServices
     public static void AddCoreServiceCollection(this IServiceCollection services)
     {
         services.AddSingleton<IDeviceInfo, DeviceInfoService>();
+        services.AddSingleton<IAuthCpuLimiter, AuthCpuLimiter>();
         services.AddSingleton<IPasswordHasher, BcryptPasswordHasher>();
         services.AddSingleton<NotificationOutboxMetrics>();
         services.AddSingleton<AvatarReencodeMetrics>();
@@ -56,6 +57,8 @@ public static class AddServices
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
         services.AddScoped<AccountCleanupSagaService>();
         services.AddScoped<IAccountCleanupSagaService>(sp => sp.GetRequiredService<AccountCleanupSagaService>());
+        services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
+        services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
         services.AddHostedService(sp => new AccountCleanupSagaWorker(
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>(),
@@ -63,10 +66,29 @@ public static class AddServices
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<AccountCleanupSagaWorker>>()));
         services.AddScoped<INotificationQuery, NotificationQuery>();
         services.AddScoped<ITrustedDeviceService, TrustedDeviceService>();
+        services.AddScoped<IRealtimeOutboxAdminService, RealtimeOutboxAdminService>();
         services.AddSingleton<LoginRiskAnalyzer>();
         services.AddSingleton<ILoginRiskAnalyzer>(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
         services.AddHostedService(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
         services.AddSingleton<IDataExportBlobStore, LocalDataExportBlobStore>();
+        services.AddSingleton<IRealtimeChatExportReader>(sp =>
+        {
+            var evidence = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>().Value;
+            var export = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.DataExportStorageOptions>>().Value;
+            var bus = sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>();
+            if (!string.IsNullOrWhiteSpace(export.RealtimeConnectionString)
+                || !string.IsNullOrWhiteSpace(evidence.RealtimeConnectionString)
+                || bus is not null)
+            {
+                return new RealtimeChatExportReader(
+                    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.DataExportStorageOptions>>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RealtimeChatExportReader>>(),
+                    bus);
+            }
+
+            return new UnavailableRealtimeChatExportReader();
+        });
         services.AddScoped<IDataExportService, DataExportService>();
         services.AddHostedService<DataExportWorker>();
         services.AddScoped<IUserRepository, UserRepository>();
@@ -75,6 +97,7 @@ public static class AddServices
         services.AddScoped<ISecurityEventStore, SecurityEventStore>();
         services.AddSingleton<AvatarReencodeQueue>();
         services.AddHostedService<AvatarCleanupWorker>();
+        services.AddHostedService<AttachmentCleanupWorker>();
         services.AddHostedService<SecurityEventArchiveWorker>();
         services.AddHostedService<AccountDeletionWorker>();
         services.AddHostedService<NotificationDispatchWorker>();
@@ -87,6 +110,31 @@ public static class AddServices
                 return ActivatorUtilities.CreateInstance<S3AvatarStorage>(sp);
             return ActivatorUtilities.CreateInstance<LocalAvatarStorage>(sp);
         });
+
+        services.AddSingleton<IAttachmentContentScanner, DenyListAttachmentContentScanner>();
+        services.AddSingleton<IAttachmentStorage>(sp =>
+        {
+            var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.AttachmentStorageOptions>>().Value;
+            if (string.Equals(opts.Provider, "S3", StringComparison.OrdinalIgnoreCase))
+                return ActivatorUtilities.CreateInstance<S3AttachmentStorage>(sp);
+            return ActivatorUtilities.CreateInstance<LocalAttachmentStorage>(sp);
+        });
+        services.AddSingleton<IAttachmentMetadataStore>(sp =>
+        {
+            var evidence = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>().Value;
+            var export = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.DataExportStorageOptions>>().Value;
+            if (!string.IsNullOrWhiteSpace(export.RealtimeConnectionString)
+                || !string.IsNullOrWhiteSpace(evidence.RealtimeConnectionString))
+            {
+                return new RealtimeAttachmentMetadataStore(
+                    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.DataExportStorageOptions>>(),
+                    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RealtimeAttachmentMetadataStore>>());
+            }
+
+            return new UnavailableAttachmentMetadataStore();
+        });
+        services.AddScoped<IAttachmentService, AttachmentService>();
 
         // 使用命名 HttpClient，IHttpClientFactory 管理连接池，避免套接字耗尽
         services.AddHttpClient(nameof(GeoLocationService), client =>

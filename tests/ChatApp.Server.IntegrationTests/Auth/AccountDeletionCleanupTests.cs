@@ -65,6 +65,8 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
                 CreateTokenService(),
                 new SecurityEventStore(cancelDb, NullLogger<SecurityEventStore>.Instance),
                 new NoopExportBlob(),
+                UnavailableAttachmentMetadataStore.Instance,
+                new NoopAttachmentBlobDeleteService(),
                 NullLogger<AccountLifecycleService>.Instance);
             var cancel = await cancelSvc.CancelDeletionAsync(victim.Id, ct);
             Assert.True(cancel.Succeeded);
@@ -97,10 +99,14 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         var workerA = new AccountLifecycleService(
             dbA, CreateTokenService(), new SecurityEventStore(dbA, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
+            UnavailableAttachmentMetadataStore.Instance,
+            new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
         var workerB = new AccountLifecycleService(
             dbB, CreateTokenService(), new SecurityEventStore(dbB, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
+            UnavailableAttachmentMetadataStore.Instance,
+            new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
 
         var results = await Task.WhenAll(
@@ -201,7 +207,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
     {
         var tsid = new TsidGeneratorService();
         var suffix = Guid.NewGuid().ToString("N")[..8];
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var victim = new ApplicationUser
         {
             Id = tsid.GenerateTsid(),
@@ -235,6 +241,8 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             CreateTokenService(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
+            UnavailableAttachmentMetadataStore.Instance,
+            new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
         return (victim, peer, lifecycle);
     }
@@ -307,5 +315,24 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             => Task.FromResult<Stream?>(null);
         public Task DeleteAsync(string objectKey, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
+    }
+
+    private sealed class NoopAttachmentBlobDeleteService : IAttachmentBlobDeleteService
+    {
+        public Task EnqueueAsync(
+            IEnumerable<string> objectKeys,
+            long? userId = null,
+            string? attachmentId = null,
+            CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task EnqueueAsync(
+            IEnumerable<(string ObjectKey, string? AttachmentId)> items,
+            long? userId = null,
+            CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task<int> ProcessDueAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult(0);
     }
 }

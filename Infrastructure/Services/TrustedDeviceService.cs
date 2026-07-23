@@ -1,13 +1,18 @@
 using System.Security.Cryptography;
+using System.Security.Claims;
 using System.Text;
 using Core.Caching;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models.Auth;
 using Core.Models.Security;
+using Core.Models.Token;
+using Core.Settings;
 using Infrastructure.Data;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
@@ -17,11 +22,18 @@ public sealed class TrustedDeviceService(
     IPasswordHasher passwordHasher,
     IMfaService mfaService,
     ICacheProvider cache,
+    IDeviceInfo deviceInfo,
+    IHttpContextAccessor httpContextAccessor,
+    IOptions<TrustedDeviceOptions> trustedDeviceOptions,
     ILogger<TrustedDeviceService> logger) : ITrustedDeviceService
 {
     public static readonly TimeSpan DefaultLifetime = TimeSpan.FromDays(90);
     public static readonly TimeSpan StepUpTtl = TimeSpan.FromMinutes(10);
     public static readonly TimeSpan RecentMfaTtl = TimeSpan.FromMinutes(10);
+
+    private readonly int _maxDevices = Math.Max(1, trustedDeviceOptions.Value.MaxDevicesPerUser);
+    private readonly TimeSpan _lastSeenThrottle = TimeSpan.FromHours(
+        Math.Clamp(trustedDeviceOptions.Value.LastSeenThrottleHours, 0.05, 168));
 
     public async Task<IReadOnlyList<TrustedDeviceDto>> ListAsync(
         long userId, CancellationToken cancellationToken = default)
@@ -45,7 +57,8 @@ public sealed class TrustedDeviceService(
         string? stepUpToken,
         CancellationToken cancellationToken = default)
     {
-        var stepUp = await EnsureStepUpAsync(userId, password, mfaCode, stepUpToken, cancellationToken)
+        var stepUp = await EnsureStepUpAsync(
+                userId, password, mfaCode, stepUpToken, StepUpPurposes.TrustedDevice, cancellationToken)
             .ConfigureAwait(false);
         if (!stepUp.Succeeded)
             return (stepUp, null);
@@ -55,9 +68,9 @@ public sealed class TrustedDeviceService(
     }
 
     public Task<AuthOperationResult> VerifyStepUpAsync(
-        long userId, string? password, string? mfaCode, string? stepUpToken,
+        long userId, string? password, string? mfaCode, string? stepUpToken, string purpose,
         CancellationToken cancellationToken = default)
-        => EnsureStepUpAsync(userId, password, mfaCode, stepUpToken, cancellationToken);
+        => EnsureStepUpAsync(userId, password, mfaCode, stepUpToken, purpose, cancellationToken);
 
     public async Task<AuthOperationResult> RemoveAsync(
         long userId, long trustedDeviceId, CancellationToken cancellationToken = default)
@@ -111,7 +124,8 @@ public sealed class TrustedDeviceService(
         if (evt.EventType is not (SecurityEventType.LoginUnusualLocation or SecurityEventType.LoginNewDevice))
             return (AuthOperationResult.Fail("InvalidEvent", "仅可确认新设备或异常地点登录事件"), null);
 
-        var stepUp = await EnsureStepUpAsync(userId, password, mfaCode, stepUpToken, cancellationToken)
+        var stepUp = await EnsureStepUpAsync(
+                userId, password, mfaCode, stepUpToken, StepUpPurposes.TrustedDevice, cancellationToken)
             .ConfigureAwait(false);
         if (!stepUp.Succeeded)
             return (stepUp, null);
@@ -140,40 +154,50 @@ public sealed class TrustedDeviceService(
 
         var oldHash = HashToken(plainToken);
         var now = DateTimeOffset.UtcNow;
-        var hourFloor = new DateTimeOffset(now.Year, now.Month, now.Day, now.Hour, 0, 0, TimeSpan.Zero);
+        var lastSeenBefore = now - _lastSeenThrottle;
 
         if (!rotate)
         {
-            // 仅校验并按小时合并 LastSeenAt（条件更新，避免无意义写放大）
+            // WHERE 带时间条件：未过节流窗口则 0 行改写，避免写放大。
             var touched = await db.Database.ExecuteSqlInterpolatedAsync($"""
                 UPDATE "T_TrustedDevice"
-                SET "LastSeenAt" = CASE
-                    WHEN "LastSeenAt" < {hourFloor} THEN {now}
-                    ELSE "LastSeenAt"
-                END
+                SET "LastSeenAt" = {now}
                 WHERE "UserId" = {userId}
                   AND "TokenHash" = {oldHash}
                   AND "RevokedAt" IS NULL
                   AND "ExpiresAt" > {now}
+                  AND "LastSeenAt" < {lastSeenBefore}
                 """, cancellationToken).ConfigureAwait(false);
             if (touched > 0)
+            {
                 AuthSecurityMetrics.RecordTrusted("validate");
-            return (touched > 0, null);
+                return (true, null);
+            }
+
+            // 令牌有效但 LastSeen 仍新鲜（或令牌无效）— 廉价存在性检查，不改写行。
+            var exists = await db.TrustedDevices.AsNoTracking()
+                .AnyAsync(
+                    d => d.UserId == userId
+                         && d.TokenHash == oldHash
+                         && d.RevokedAt == null
+                         && d.ExpiresAt > now,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (exists)
+                AuthSecurityMetrics.RecordTrusted("validate");
+            return (exists, null);
         }
 
         var rotated = CreatePlainToken();
         var newHash = HashToken(rotated);
         var expires = now.Add(DefaultLifetime);
 
-        // 原子 CAS：旧哈希只能被一个并发请求成功消费
+        // 原子 CAS：旧哈希只能被一个并发请求成功消费；轮转本身必改写行，顺带刷新 LastSeen。
         var updated = await db.Database.ExecuteSqlInterpolatedAsync($"""
             UPDATE "T_TrustedDevice"
             SET "TokenHash" = {newHash},
                 "ExpiresAt" = {expires},
-                "LastSeenAt" = CASE
-                    WHEN "LastSeenAt" < {hourFloor} THEN {now}
-                    ELSE "LastSeenAt"
-                END
+                "LastSeenAt" = {now}
             WHERE "UserId" = {userId}
               AND "TokenHash" = {oldHash}
               AND "RevokedAt" IS NULL
@@ -195,34 +219,68 @@ public sealed class TrustedDeviceService(
     }
 
     public async Task<(AuthOperationResult Result, string? StepUpToken)> CreateStepUpTokenAsync(
-        long userId, string? password, string? mfaCode, CancellationToken cancellationToken = default)
+        long userId, string? password, string? mfaCode, string purpose,
+        CancellationToken cancellationToken = default)
     {
+        if (!StepUpPurposes.IsKnown(purpose))
+            return (AuthOperationResult.Fail("InvalidPurpose", "未知的 step-up 用途"), null);
+
         var verified = await VerifyPasswordAndMfaAsync(userId, password, mfaCode, cancellationToken)
             .ConfigureAwait(false);
         if (!verified.Succeeded)
             return (verified, null);
 
+        var ctx = ResolveCurrentBinding(purpose);
+        if (ctx is null)
+            return (AuthOperationResult.Fail("MissingSession", "缺少会话或设备绑定上下文"), null);
+
         var plain = CreatePlainToken();
         var key = CacheKeyBuilder.WithPrefix(CacheConstants.StepUpPrefix, HashToken(plain));
-        await cache.StringSetAsync(key, userId.ToString(), StepUpTtl, cancellationToken)
+        var payload = FormatStepUpPayload(userId, ctx.Value);
+        await cache.StringSetAsync(key, payload, StepUpTtl, cancellationToken)
             .ConfigureAwait(false);
         AuthSecurityMetrics.RecordTrusted("step_up_issued");
         return (AuthOperationResult.Success(), plain);
     }
 
-    public Task MarkRecentMfaAsync(long userId, CancellationToken cancellationToken = default)
+    public Task MarkRecentMfaAsync(
+        long userId, string? sessionId, string? deviceId, CancellationToken cancellationToken = default)
     {
-        var key = CacheKeyBuilder.WithPrefix(CacheConstants.RecentMfaPrefix, userId.ToString());
-        return cache.StringSetAsync(key, "1", RecentMfaTtl, cancellationToken);
+        var deviceHash = FormatDeviceHash(deviceId);
+        var sid = string.IsNullOrWhiteSpace(sessionId) ? "none" : sessionId.Trim();
+        var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+        var key = RecentMfaKey(userId, sid, deviceHash);
+        // value = nonce（一次性）；绑定已体现在 key 中
+        return cache.StringSetAsync(key, nonce, RecentMfaTtl, cancellationToken);
     }
 
     private async Task<(AuthOperationResult Result, string? PlainToken)> IssueTrustedDeviceAsync(
         long userId, string? deviceIdHint, string? label, string? clientIp,
         CancellationToken cancellationToken)
     {
+        // 用户行锁：并发签发时串行化 Count→Insert，避免超过 MaxDevicesPerUser
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await db.Database.ExecuteSqlInterpolatedAsync(
+                $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        var now = DateTimeOffset.UtcNow;
+        var activeCount = await db.TrustedDevices
+            .CountAsync(
+                d => d.UserId == userId && d.RevokedAt == null && d.ExpiresAt > now,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (activeCount >= _maxDevices)
+        {
+            await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return (AuthOperationResult.Fail(
+                "TrustedDeviceLimit",
+                $"最多可信任 {_maxDevices} 台设备，请先移除旧设备"), null);
+        }
+
         var plainToken = CreatePlainToken();
         var hash = HashToken(plainToken);
-        var now = DateTimeOffset.UtcNow;
 
         db.TrustedDevices.Add(new TrustedDevice
         {
@@ -235,36 +293,47 @@ public sealed class TrustedDeviceService(
             LastSeenAt = now,
             ExpiresAt = now.Add(DefaultLifetime),
         });
-        await db.SaveChangesAsync(cancellationToken);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+
         await securityEventStore.RecordAsync(
             userId, SecurityEventType.TrustedDeviceAdded, deviceIdHint, clientIp,
-            detail: label, cancellationToken: cancellationToken);
+            detail: label, cancellationToken: cancellationToken).ConfigureAwait(false);
         AuthSecurityMetrics.RecordTrusted("issued");
         logger.LogInformation("用户 {UserId} 签发可信设备令牌", userId);
         return (AuthOperationResult.Success(), plainToken);
     }
 
     private async Task<AuthOperationResult> EnsureStepUpAsync(
-        long userId, string? password, string? mfaCode, string? stepUpToken,
+        long userId, string? password, string? mfaCode, string? stepUpToken, string purpose,
         CancellationToken cancellationToken)
     {
+        if (!StepUpPurposes.IsKnown(purpose))
+            return AuthOperationResult.Fail("InvalidPurpose", "未知的 step-up 用途");
+
+        var current = ResolveCurrentBinding(purpose);
+        if (current is null)
+            return AuthOperationResult.Fail("MissingSession", "缺少会话或设备绑定上下文");
+
         if (!string.IsNullOrWhiteSpace(stepUpToken))
         {
             var key = CacheKeyBuilder.WithPrefix(CacheConstants.StepUpPrefix, HashToken(stepUpToken.Trim()));
-            var owner = await cache.StringGetAsync(key, cancellationToken: cancellationToken)
+            var stored = await cache.StringGetAsync(key, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
-            if (string.Equals(owner, userId.ToString(), StringComparison.Ordinal)
-                && await cache.TryStringCompareAndDeleteAsync(key, owner!, cancellationToken).ConfigureAwait(false))
+            if (TryParseStepUpPayload(stored, out var boundUserId, out var bound)
+                && boundUserId == userId
+                && BindingsMatch(bound, current.Value)
+                && await cache.TryStringCompareAndDeleteAsync(key, stored!, cancellationToken).ConfigureAwait(false))
             {
                 AuthSecurityMetrics.RecordTrusted("step_up_consumed");
                 return AuthOperationResult.Success();
             }
 
-            return AuthOperationResult.Fail("InvalidStepUp", "step-up 令牌无效或已过期");
+            return AuthOperationResult.Fail("InvalidStepUp", "step-up 令牌无效、已过期或绑定不匹配");
         }
 
-        // 最近一次 MFA（登录校验成功后写入），一次性消费
-        var recentKey = CacheKeyBuilder.WithPrefix(CacheConstants.RecentMfaPrefix, userId.ToString());
+        // 最近一次 MFA（登录校验成功后写入），一次性消费；绑定 session+device，用途不限（MFA 已覆盖）。
+        var recentKey = RecentMfaKey(userId, current.Value.SessionId, current.Value.DeviceHash);
         var recent = await cache.StringGetAsync(recentKey, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
         if (!string.IsNullOrEmpty(recent)
@@ -299,11 +368,79 @@ public sealed class TrustedDeviceService(
 
         if (user.TwoFactorEnabled && !string.IsNullOrWhiteSpace(user.TotpSecret))
         {
-            if (string.IsNullOrWhiteSpace(mfaCode) || !mfaService.VerifyTotpForUser(user, mfaCode))
+            if (string.IsNullOrWhiteSpace(mfaCode)
+                || !await mfaService.TryVerifyAndConsumeTotpForUserAsync(user, mfaCode, cancellationToken)
+                    .ConfigureAwait(false))
                 return AuthOperationResult.Fail("MfaRequired", "已启用 MFA，请提供当前验证码");
         }
 
         return AuthOperationResult.Success();
+    }
+
+    private (string SessionId, string DeviceHash, string Purpose, string Nonce)? ResolveCurrentBinding(string purpose)
+    {
+        var deviceId = deviceInfo.GetDeviceId();
+        var deviceHash = FormatDeviceHash(deviceId);
+        var http = httpContextAccessor.HttpContext;
+        var sessionId = http?.User?.FindFirstValue(AuthClaimTypes.SessionId);
+
+        // 已认证请求必须带 sid 声明，防止跨会话复用 step-up。
+        if (http?.User?.Identity?.IsAuthenticated == true && string.IsNullOrWhiteSpace(sessionId))
+            return null;
+
+        if (string.IsNullOrWhiteSpace(sessionId))
+            sessionId = "none";
+
+        var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+        return (sessionId.Trim(), deviceHash, purpose, nonce);
+    }
+
+    private static bool BindingsMatch(
+        (string SessionId, string DeviceHash, string Purpose, string Nonce) stored,
+        (string SessionId, string DeviceHash, string Purpose, string Nonce) current)
+        => string.Equals(stored.SessionId, current.SessionId, StringComparison.Ordinal)
+           && string.Equals(stored.DeviceHash, current.DeviceHash, StringComparison.Ordinal)
+           && string.Equals(stored.Purpose, current.Purpose, StringComparison.Ordinal);
+
+    private static string FormatStepUpPayload(
+        long userId, (string SessionId, string DeviceHash, string Purpose, string Nonce) ctx)
+        => $"v2|{userId}|{ctx.SessionId}|{ctx.DeviceHash}|{ctx.Purpose}|{ctx.Nonce}";
+
+    private static bool TryParseStepUpPayload(
+        string? payload,
+        out long userId,
+        out (string SessionId, string DeviceHash, string Purpose, string Nonce) binding)
+    {
+        userId = 0;
+        binding = default;
+        if (string.IsNullOrWhiteSpace(payload))
+            return false;
+
+        // 旧格式：仅 userId —— 拒绝（强制升级绑定）。
+        if (!payload.StartsWith("v2|", StringComparison.Ordinal))
+            return false;
+
+        var parts = payload.Split('|', 6);
+        if (parts.Length != 6)
+            return false;
+        if (!long.TryParse(parts[1], out userId))
+            return false;
+        binding = (parts[2], parts[3], parts[4], parts[5]);
+        return !string.IsNullOrWhiteSpace(binding.SessionId)
+               && !string.IsNullOrWhiteSpace(binding.DeviceHash)
+               && !string.IsNullOrWhiteSpace(binding.Purpose)
+               && !string.IsNullOrWhiteSpace(binding.Nonce);
+    }
+
+    private static string RecentMfaKey(long userId, string sessionId, string deviceHash)
+        => CacheKeyBuilder.WithPrefix(
+            CacheConstants.RecentMfaPrefix,
+            $"{userId}:{sessionId}:{deviceHash}");
+
+    private static string FormatDeviceHash(string? deviceId)
+    {
+        var hash = DeviceIdHashHelper.Compute(deviceId);
+        return hash is { } h ? h.ToString("x16") : "none";
     }
 
     private static string CreatePlainToken()

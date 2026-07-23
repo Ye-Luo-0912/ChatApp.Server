@@ -30,9 +30,9 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var password = "Passw0rd!";
         var user = await SeedUserAsync(db, $"mfa-{suffix}", $"mfa-{suffix}@ex.com", password);
 
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var protector = CreateMfaProtector();
-        var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), protector, new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance), NullLogger<MfaService>.Instance);
+        var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), protector, new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance), redis.Cache, NullLogger<MfaService>.Instance);
         var (sharedKey, _, _) = await mfa.BeginSetupAsync(user.Id, password);
         var code = new Totp(Base32Encoding.ToBytes(sharedKey)).ComputeTotp();
         Assert.True((await mfa.ConfirmSetupAsync(user.Id, code)).Succeeded);
@@ -64,10 +64,10 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var password = "Passw0rd!";
         var user = await SeedUserAsync(db, $"td-{suffix}", $"td-{suffix}@ex.com", password);
 
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), CreateMfaProtector(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
-            NullLogger<MfaService>.Instance);
+            redis.Cache, NullLogger<MfaService>.Instance);
         var (sharedKey, _, _) = await mfa.BeginSetupAsync(user.Id, password);
         var code = new Totp(Base32Encoding.ToBytes(sharedKey)).ComputeTotp();
         Assert.True((await mfa.ConfirmSetupAsync(user.Id, code)).Succeeded);
@@ -89,7 +89,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         Assert.False(string.IsNullOrWhiteSpace(withTrusted.TrustedDeviceToken));
         Assert.NotEqual(plain, withTrusted.TrustedDeviceToken);
 
-        // 旧令牌立即失效
+        // 旧令牌立即失�?
         var reused = await auth.LoginAsync(user.UserName!, password, plain);
         Assert.True(reused.RequiresTwoFactor);
 
@@ -134,7 +134,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
     }
 
     [Fact]
-    public void RecoveryCodeHasher_AcceptsLegacyBcryptDigests()
+    public async Task RecoveryCodeHasher_AcceptsLegacyBcryptDigests()
     {
         var hasher = CreateRecoveryHasher();
         const string plainDashed = "AABBCCDD-EEFF0011-22334455-66778899";
@@ -144,15 +144,15 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var bcryptNormalized = BCrypt.Net.BCrypt.HashPassword(plainNormalized, workFactor: 4);
 
         Assert.True(hasher.IsLegacyDigest(bcryptDashed));
-        Assert.True(hasher.Verify(plainDashed, bcryptDashed));
-        Assert.True(hasher.Verify(plainDashed.Replace("-", ""), bcryptDashed));
-        Assert.True(hasher.Verify(plainNormalized, bcryptNormalized));
-        Assert.False(hasher.Verify("wrong-code", bcryptDashed));
+        Assert.True(await hasher.VerifyAsync(plainDashed, bcryptDashed));
+        Assert.True(await hasher.VerifyAsync(plainDashed.Replace("-", ""), bcryptDashed));
+        Assert.True(await hasher.VerifyAsync(plainNormalized, bcryptNormalized));
+        Assert.False(await hasher.VerifyAsync("wrong-code", bcryptDashed));
 
-        // 新摘要仍为 HMAC
+        // 新摘要仍�?HMAC
         var hmac = hasher.Hash(plainDashed);
         Assert.StartsWith("v1:", hmac, StringComparison.Ordinal);
-        Assert.True(hasher.Verify(plainDashed, hmac));
+        Assert.True(await hasher.VerifyAsync(plainDashed, hmac));
         Assert.False(hasher.IsLegacyDigest(hmac));
     }
 
@@ -180,11 +180,11 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         user.RecoveryCodesHashJson = System.Text.Json.JsonSerializer.Serialize(new[] { bcryptHash, hmacOther });
         await db.SaveChangesAsync();
 
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var mfa = new MfaService(
             db, hasher, CreateRecoveryHasher(), protector,
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
-            NullLogger<MfaService>.Instance);
+            redis.Cache, NullLogger<MfaService>.Instance);
 
         Assert.True(await mfa.TryConsumeRecoveryCodeAsync(user.Id, plain));
         Assert.False(await mfa.TryConsumeRecoveryCodeAsync(user.Id, plain));
@@ -193,10 +193,10 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         Assert.Contains("v1:", stored.RecoveryCodesHashJson, StringComparison.Ordinal);
         Assert.DoesNotContain(bcryptHash, stored.RecoveryCodesHashJson, StringComparison.Ordinal);
 
-        // 仍含另一枚 HMAC；升级信号仅在仍有 BCrypt 时触发——此处已消费掉 BCrypt
+        // 仍含另一�?HMAC；升级信号仅在仍�?BCrypt 时触发——此处已消费�?BCrypt
         Assert.False(HmacRecoveryCodeHasher.ContainsLegacyDigestsStatic(stored.RecoveryCodesHashJson));
 
-        // 重新种入仅 BCrypt，走登录成功路径应带 RequiresRecoveryCodeRegeneration
+        // 重新种入�?BCrypt，走登录成功路径应带 RequiresRecoveryCodeRegeneration
         stored = await db.Users.FirstAsync(u => u.Id == user.Id);
         stored.RecoveryCodesHashJson = System.Text.Json.JsonSerializer.Serialize(new[]
         {
@@ -218,16 +218,16 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
     }
 
     [Fact]
-    public void RecoveryCodeHasher_HmacVersioning_AndConsumeOnce()
+    public async Task RecoveryCodeHasher_HmacVersioning_AndConsumeOnce()
     {
         var hasher = CreateRecoveryHasher();
         var plain = hasher.GeneratePlainCode();
         Assert.Contains('-', plain);
         var digest = hasher.Hash(plain);
         Assert.StartsWith("v1:", digest, StringComparison.Ordinal);
-        Assert.True(hasher.Verify(plain, digest));
-        Assert.True(hasher.Verify(plain.Replace("-", ""), digest));
-        Assert.False(hasher.Verify("wrong-code", digest));
+        Assert.True(await hasher.VerifyAsync(plain, digest));
+        Assert.True(await hasher.VerifyAsync(plain.Replace("-", ""), digest));
+        Assert.False(await hasher.VerifyAsync("wrong-code", digest));
 
         var rotated = new HmacRecoveryCodeHasher(
             Options.Create(new SecurityOptions
@@ -239,10 +239,40 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
             }),
             Options.Create(new JwtSettings { Secret = "unused-jwt-secret-for-rotation-test" }),
             new TestHostEnvironment(),
+            AuthTestFactories.CreateCpuLimiter(),
             NullLogger<HmacRecoveryCodeHasher>.Instance);
-        Assert.True(rotated.Verify(plain, digest));
+        Assert.True(await rotated.VerifyAsync(plain, digest));
         var v2Digest = rotated.Hash(plain);
         Assert.StartsWith("v2:", v2Digest, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RecoveryCodeHasher_LegacyBcrypt_RespectsSharedCpuGate()
+    {
+        var limiter = AuthTestFactories.CreateCpuLimiter(maxConcurrent: 1, acquireTimeoutMs: 30);
+        var hasher = new HmacRecoveryCodeHasher(
+            Options.Create(new SecurityOptions { SecretEncryptionKey = "test-mfa-encryption-key", KeyVersion = 1 }),
+            Options.Create(new JwtSettings { Secret = "test-mfa-jwt-secret-please-change" }),
+            new TestHostEnvironment(),
+            limiter,
+            NullLogger<HmacRecoveryCodeHasher>.Instance);
+
+        const string plain = "AABBCCDD-EEFF0011-22334455-66778899";
+        var bcryptHash = BCrypt.Net.BCrypt.HashPassword(plain, workFactor: 10);
+
+        await limiter.EnterAsync("hold");
+        try
+        {
+            var overload = await Assert.ThrowsAsync<Core.Exceptions.PasswordVerifyOverloadedException>(
+                () => hasher.VerifyAsync(plain, bcryptHash));
+            Assert.NotNull(overload);
+        }
+        finally
+        {
+            limiter.Exit("hold", 0);
+        }
+
+        Assert.True(await hasher.VerifyAsync(plain, bcryptHash));
     }
 
     [SkippableFact]
@@ -255,11 +285,11 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var password = "Passw0rd!";
         var user = await SeedUserAsync(db, $"rc-{suffix}", $"rc-{suffix}@ex.com", password);
 
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var mfa = new MfaService(
             db, hasher, CreateRecoveryHasher(), CreateMfaProtector(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
-            NullLogger<MfaService>.Instance);
+            redis.Cache, NullLogger<MfaService>.Instance);
         var (sharedKey, _, codes) = await mfa.BeginSetupAsync(user.Id, password);
         Assert.Equal(8, codes.Length);
         var totp = new Totp(Base32Encoding.ToBytes(sharedKey)).ComputeTotp();
@@ -270,7 +300,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
 
         var stored = await db.Users.AsNoTracking().FirstAsync(u => u.Id == user.Id);
         Assert.Contains("v1:", stored.RecoveryCodesHashJson, StringComparison.Ordinal);
-        Assert.DoesNotContain("$2", stored.RecoveryCodesHashJson); // 非 BCrypt
+        Assert.DoesNotContain("$2", stored.RecoveryCodesHashJson); // �?BCrypt
     }
 
     [SkippableFact]
@@ -341,14 +371,14 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         return new AuthService(
             db,
-            new BcryptPasswordHasher(),
+            AuthTestFactories.CreatePasswordHasher(),
             tokens,
             tokens,
             new FixedDeviceInfo("mfa-device"),
             new EmailVerificationService(new NoopEmail(), redis.Cache),
             new TsidGeneratorService(),
             security,
-            new MfaService(db, new BcryptPasswordHasher(), CreateRecoveryHasher(), CreateMfaProtector(), security, NullLogger<MfaService>.Instance),
+            new MfaService(db, AuthTestFactories.CreatePasswordHasher(), CreateRecoveryHasher(), CreateMfaProtector(), security, redis.Cache, NullLogger<MfaService>.Instance),
             redis.Cache,
             new NoopNotify(),
             CreateTrusted(db),
@@ -360,7 +390,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
     private (UserAccountService Account, IEmailVerificationService Email, TokenService Sessions)
         CreateAccount(UserDbContext db)
     {
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var repo = new UserRepository(db, new TsidGeneratorService());
         var email = new EmailVerificationService(new NoopEmail(), redis.Cache);
         var tokens = CreateTokenService("mfa-device");
@@ -385,10 +415,18 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
     private TrustedDeviceService CreateTrusted(UserDbContext db)
     {
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
-        var hasher = new BcryptPasswordHasher();
-        var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), CreateMfaProtector(), security, NullLogger<MfaService>.Instance);
+        var hasher = AuthTestFactories.CreatePasswordHasher();
+        var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), CreateMfaProtector(), security, redis.Cache, NullLogger<MfaService>.Instance);
         return new TrustedDeviceService(
-            db, security, hasher, mfa, redis.Cache, NullLogger<TrustedDeviceService>.Instance);
+            db,
+            security,
+            hasher,
+            mfa,
+            redis.Cache,
+            new FixedDeviceInfo(AuthTestFactories.StableDeviceId("mfa-tests")),
+            new Microsoft.AspNetCore.Http.HttpContextAccessor(),
+            Options.Create(new TrustedDeviceOptions()),
+            NullLogger<TrustedDeviceService>.Instance);
     }
 
     private TokenService CreateTokenService(string deviceId)
@@ -421,6 +459,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
             Options.Create(new SecurityOptions { SecretEncryptionKey = "test-mfa-encryption-key", KeyVersion = 1 }),
             Options.Create(new JwtSettings { Secret = "test-mfa-jwt-secret-please-change" }),
             new TestHostEnvironment(),
+            AuthTestFactories.CreateCpuLimiter(),
             NullLogger<HmacRecoveryCodeHasher>.Instance);
 
     private sealed class TestHostEnvironment : Microsoft.Extensions.Hosting.IHostEnvironment
@@ -435,7 +474,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
     private static async Task<ApplicationUser> SeedUserAsync(
         UserDbContext db, string name, string email, string password)
     {
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var user = new ApplicationUser
         {
             Id = new TsidGeneratorService().GenerateTsid(),

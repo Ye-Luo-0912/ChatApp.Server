@@ -1,5 +1,7 @@
 using System.Text.Json;
+using Core.Caching;
 using Core.Interfaces;
+using Core.Interfaces.Cache;
 using Core.Models.Auth;
 using Core.Models.Identity;
 using Core.Models.Security;
@@ -16,11 +18,13 @@ public sealed class MfaService(
     IRecoveryCodeHasher recoveryCodeHasher,
     IMfaSecretProtector secretProtector,
     ISecurityEventStore securityEventStore,
+    ICacheProvider cache,
     ILogger<MfaService> logger) : IMfaService
 {
     private const string Issuer = "ChatApp";
     private const int MaxRecoveryConsumeAttempts = 3;
     private const int RecoveryCodeCount = 8;
+    private static readonly TimeSpan TotpUsedTtl = TimeSpan.FromSeconds(180);
 
     public async Task<(string SharedKey, string OtpAuthUri, string[] RecoveryCodes)> BeginSetupAsync(
         long userId, string password, CancellationToken cancellationToken = default)
@@ -68,9 +72,10 @@ public sealed class MfaService(
             return AuthOperationResult.Fail("CorruptSecret", "待确认密钥无效，请重新开始设置");
         }
 
-        if (!VerifyTotpPlain(pendingPlain, code))
+        if (!TryVerifyTotpPlain(pendingPlain, code, out _))
             return AuthOperationResult.Fail("InvalidCode", "验证码无效");
 
+        // 设置确认不占用登录防重放时间步：PendingTotpSecret 清除即一次性。
         user.TotpSecret = user.PendingTotpSecret;
         user.RecoveryCodesHashJson = user.PendingRecoveryCodesHashJson;
         user.PendingTotpSecret = null;
@@ -95,8 +100,10 @@ public sealed class MfaService(
             || !await passwordHasher.VerifyPasswordAsync(password, user.PasswordHash, cancellationToken))
             return AuthOperationResult.Fail("InvalidPassword", "密码验证失败");
 
-        var ok = VerifyTotpForUser(user, codeOrRecovery)
-                 || await TryConsumeRecoveryCodeAsync(userId, codeOrRecovery, cancellationToken);
+        var ok = await TryVerifyAndConsumeTotpForUserAsync(user, codeOrRecovery, cancellationToken)
+                     .ConfigureAwait(false)
+                 || await TryConsumeRecoveryCodeAsync(userId, codeOrRecovery, cancellationToken)
+                     .ConfigureAwait(false);
         if (!ok)
             return AuthOperationResult.Fail("InvalidCode", "验证码或恢复码无效");
 
@@ -111,16 +118,35 @@ public sealed class MfaService(
         return AuthOperationResult.Success();
     }
 
-    public bool VerifyTotp(string sharedKey, string code) => VerifyTotpPlain(sharedKey, code);
+    public bool VerifyTotp(string sharedKey, string code) =>
+        TryVerifyTotpPlain(sharedKey, code, out _);
 
     public bool VerifyTotpForUser(ApplicationUser user, string code)
+    {
+        // 无防重放的同步校验仅用于只读探测；登录/敏感路径请用 TryVerifyAndConsumeTotpForUserAsync。
+        if (user is null || string.IsNullOrWhiteSpace(user.TotpSecret))
+            return false;
+        try
+        {
+            var plain = secretProtector.Unprotect(user.TotpSecret);
+            return TryVerifyTotpPlain(plain, code, out _);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<bool> TryVerifyAndConsumeTotpForUserAsync(
+        ApplicationUser user, string code, CancellationToken cancellationToken = default)
     {
         if (user is null || string.IsNullOrWhiteSpace(user.TotpSecret))
             return false;
         try
         {
             var plain = secretProtector.Unprotect(user.TotpSecret);
-            return VerifyTotpPlain(plain, code);
+            return await TryVerifyAndConsumeTotpPlainAsync(user.Id, plain, code, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch
         {
@@ -152,7 +178,8 @@ public sealed class MfaService(
                 var matchIndex = -1;
                 for (var i = 0; i < hashes.Length; i++)
                 {
-                    if (recoveryCodeHasher.Verify(code, hashes[i]))
+                    if (await recoveryCodeHasher.VerifyAsync(code, hashes[i], cancellationToken)
+                            .ConfigureAwait(false))
                     {
                         matchIndex = i;
                         break;
@@ -203,8 +230,10 @@ public sealed class MfaService(
             || !await passwordHasher.VerifyPasswordAsync(password, user.PasswordHash, cancellationToken))
             return (AuthOperationResult.Fail("InvalidPassword", "密码验证失败"), null);
 
-        var ok = VerifyTotpForUser(user, codeOrRecovery)
-                 || await TryConsumeRecoveryCodeAsync(userId, codeOrRecovery, cancellationToken);
+        var ok = await TryVerifyAndConsumeTotpForUserAsync(user, codeOrRecovery, cancellationToken)
+                     .ConfigureAwait(false)
+                 || await TryConsumeRecoveryCodeAsync(userId, codeOrRecovery, cancellationToken)
+                     .ConfigureAwait(false);
         if (!ok)
             return (AuthOperationResult.Fail("InvalidCode", "验证码或恢复码无效"), null);
 
@@ -220,14 +249,36 @@ public sealed class MfaService(
         return (AuthOperationResult.Success(), codes);
     }
 
-    private static bool VerifyTotpPlain(string sharedKey, string code)
+    private async Task<bool> TryVerifyAndConsumeTotpPlainAsync(
+        long userId,
+        string sharedKey,
+        string code,
+        CancellationToken cancellationToken)
     {
+        if (!TryVerifyTotpPlain(sharedKey, code, out var timestep))
+            return false;
+
+        var key = $"{CacheConstants.TotpUsedPrefix}{userId}:{timestep}";
+        var firstUse = await cache.StringSetIfNotExistsAsync(key, "1", TotpUsedTtl, cancellationToken)
+            .ConfigureAwait(false);
+        if (!firstUse)
+        {
+            logger.LogWarning("TOTP 时间步重放被拒绝 UserId={UserId} Timestep={Timestep}", userId, timestep);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryVerifyTotpPlain(string sharedKey, string code, out long timestep)
+    {
+        timestep = 0;
         if (string.IsNullOrWhiteSpace(sharedKey) || string.IsNullOrWhiteSpace(code))
             return false;
         try
         {
             var totp = new Totp(Base32Encoding.ToBytes(sharedKey));
-            return totp.VerifyTotp(code.Trim(), out _, new VerificationWindow(1, 1));
+            return totp.VerifyTotp(code.Trim(), out timestep, new VerificationWindow(1, 1));
         }
         catch
         {

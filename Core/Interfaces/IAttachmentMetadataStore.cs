@@ -1,0 +1,172 @@
+using Core.Models.Attachment;
+using Core.Models.Export;
+
+namespace Core.Interfaces;
+
+/// <summary>
+/// 写入 Realtime Postgres <c>realtime.attachments</c>（Migration012 契约）。
+/// 连接串取自 MessageEvidence / DataExport RealtimeConnectionString。
+/// </summary>
+public interface IAttachmentMetadataStore
+{
+    bool IsAvailable { get; }
+    string UnavailableReason { get; }
+
+    Task InsertTicketedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string objectKey,
+        string? publicUrl,
+        string contentType,
+        long sizeBytes,
+        string? originalName,
+        string? clientAttachmentId = null,
+        CancellationToken cancellationToken = default);
+
+    Task ConfirmAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string objectKey,
+        string? publicUrl,
+        string contentType,
+        long sizeBytes,
+        string? originalName = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>上传落盘后：Ticketed → Uploaded → Scanning（禁止绑定/下载直至 Confirmed）。</summary>
+    Task MarkUploadedScanningAsync(
+        string attachmentId,
+        long uploaderUserId,
+        long sizeBytes,
+        string? sha256Hex = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>扫描失败：→ Rejected。</summary>
+    Task MarkRejectedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string? reason = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 鉴权下载：Bound 须为 conversation_members 成员（或消息收发方回退）；
+    /// Confirmed 且未绑定仅上传者本人；Uploaded/Scanning 返回 NotReady。
+    /// </summary>
+    Task<AttachmentDownloadAccess> ResolveDownloadAccessAsync(
+        string attachmentId,
+        long userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>导出优先：用户上传的 Confirmed/Bound，或已绑定到其消息的附件。</summary>
+    Task<IReadOnlyList<AttachmentRecord>> ListForExportAsync(
+        long userId,
+        int maxRows = 50_000,
+        CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<string>> ListObjectKeysForUserAsync(
+        long uploaderUserId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Confirmed/Bound 的 object_key 集合（孤儿年龄扫描用）。</summary>
+    Task<IReadOnlySet<string>> ListActiveObjectKeysAsync(
+        CancellationToken cancellationToken = default);
+
+    Task MarkAbandonedAsync(
+        IReadOnlyList<string> attachmentIds,
+        CancellationToken cancellationToken = default);
+
+    Task MarkAbandonedByUploaderAsync(
+        long uploaderUserId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 上传者放弃未绑定附件（Ticketed/Confirmed 且 message_id 为空）。
+    /// 成功返回 object_key；不存在/无权/已绑定返回 null。
+    /// </summary>
+    Task<string?> TryAbandonUnboundByUploaderAsync(
+        string attachmentId,
+        long uploaderUserId,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>未配置 Realtime 连接串时的空实现。</summary>
+public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStore
+{
+    public static UnavailableAttachmentMetadataStore Instance { get; } = new();
+
+    public bool IsAvailable => false;
+    public string UnavailableReason =>
+        "未配置 MessageEvidence:RealtimeConnectionString / DataExport:RealtimeConnectionString";
+
+    public Task InsertTicketedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string objectKey,
+        string? publicUrl,
+        string contentType,
+        long sizeBytes,
+        string? originalName,
+        string? clientAttachmentId = null,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task ConfirmAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string objectKey,
+        string? publicUrl,
+        string contentType,
+        long sizeBytes,
+        string? originalName = null,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task MarkUploadedScanningAsync(
+        string attachmentId,
+        long uploaderUserId,
+        long sizeBytes,
+        string? sha256Hex = null,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task MarkRejectedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string? reason = null,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task<AttachmentDownloadAccess> ResolveDownloadAccessAsync(
+        string attachmentId,
+        long userId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new AttachmentDownloadAccess(
+            attachmentId, string.Empty, "application/octet-stream", null,
+            AttachmentDownloadDecision.Unavailable));
+
+    public Task<IReadOnlyList<AttachmentRecord>> ListForExportAsync(
+        long userId, int maxRows = 50_000, CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlyList<AttachmentRecord>>([]);
+
+    public Task<IReadOnlyList<string>> ListObjectKeysForUserAsync(
+        long uploaderUserId, CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlyList<string>>([]);
+
+    public Task<IReadOnlySet<string>> ListActiveObjectKeysAsync(
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlySet<string>>(new HashSet<string>(StringComparer.Ordinal));
+
+    public Task MarkAbandonedAsync(
+        IReadOnlyList<string> attachmentIds, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task MarkAbandonedByUploaderAsync(
+        long uploaderUserId, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task<string?> TryAbandonUnboundByUploaderAsync(
+        string attachmentId,
+        long uploaderUserId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<string?>(null);
+}

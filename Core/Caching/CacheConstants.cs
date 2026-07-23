@@ -23,7 +23,11 @@ public static class CacheConstants
     public const string MfaPendingPrefix = "mfa:pending:";
     public const string MfaAttemptsPrefix = "mfa:attempts:";
 
-    // ── 敏感操作 step-up ─────────────────────────────────────────
+    // ── 敏感操作 step-up（v2 绑定 userId+session+device+purpose+nonce）──
     public const string StepUpPrefix = "stepup:token:";
+    /// <summary>key 后缀为 <c>{userId}:{sessionId}:{deviceHash}</c>。</summary>
     public const string RecentMfaPrefix = "stepup:recent-mfa:";
+
+    /// <summary>TOTP 已用时间步：<c>totp:used:{userId}:{timestep}</c>，TTL ~3 分钟防重放。</summary>
+    public const string TotpUsedPrefix = "totp:used:";
 }

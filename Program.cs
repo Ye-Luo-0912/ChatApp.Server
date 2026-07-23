@@ -57,9 +57,11 @@ public abstract partial class Program
             .AddCoreServiceCollection();
 
         service.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
+        service.Configure<AttachmentStorageOptions>(config.GetSection(AttachmentStorageOptions.SectionName));
         service.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
         service.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
         service.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
+        service.Configure<TrustedDeviceOptions>(config.GetSection(TrustedDeviceOptions.SectionName));
         service.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
         service.Configure<DataExportStorageOptions>(config.GetSection(DataExportStorageOptions.SectionName));
         service.Configure<AccountCleanupSagaOptions>(config.GetSection(AccountCleanupSagaOptions.SectionName));
@@ -270,6 +272,31 @@ public abstract partial class Program
                 Path.GetFullPath(avatarRoot)),
             RequestPath = avatarPublic.StartsWith('/') ? avatarPublic : "/" + avatarPublic,
         });
+
+        // 私有附件禁止匿名静态挂载；须走 GET /api/attachments/{id}/download（会话成员鉴权）。
+        // 非 Development 强制关闭 UsePublicStatic，避免配置误开导致长期匿名访问。
+        var usePublicAttachments = builder.Configuration.GetValue(
+            $"{AttachmentStorageOptions.SectionName}:UsePublicStatic", false);
+        if (usePublicAttachments && !app.Environment.IsDevelopment())
+        {
+            throw new InvalidOperationException(
+                "非开发环境禁止 AttachmentStorage:UsePublicStatic=true；私有附件必须经鉴权下载接口。");
+        }
+
+        var attachmentRoot = builder.Configuration[$"{AttachmentStorageOptions.SectionName}:LocalRootPath"]
+                             ?? "App_Data/attachments";
+        Directory.CreateDirectory(attachmentRoot);
+        if (usePublicAttachments)
+        {
+            var attachmentPublic = builder.Configuration[$"{AttachmentStorageOptions.SectionName}:PublicBaseUrl"]
+                                   ?? "/static/attachments";
+            app.UseStaticFiles(new StaticFileOptions
+            {
+                FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+                    Path.GetFullPath(attachmentRoot)),
+                RequestPath = attachmentPublic.StartsWith('/') ? attachmentPublic : "/" + attachmentPublic,
+            });
+        }
 
         if (app.Environment.IsDevelopment())
             app.MapOpenApi();

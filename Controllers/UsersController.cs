@@ -1,5 +1,6 @@
 ﻿using ChatApp.Server.Models.Requests;
 using Core.Interfaces;
+using Core.Models.Auth;
 using Core.Models.User;
 using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
@@ -156,6 +157,20 @@ public class UsersController(
             : BadRequest(result.Errors);
     }
 
+    /// <summary>拒绝可疑登录：仅撤销该事件关联设备会话，不强制改密（与 not-me 区分）。</summary>
+    [HttpPost("me/security-events/{eventId:long}/reject")]
+    public async Task<IActionResult> RejectSuspiciousLogin(long eventId, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var result = await userAccountService.RejectSuspiciousLoginAsync(userId, eventId, cancellationToken);
+        if (result is null) return NotFound();
+        return result.Succeeded
+            ? Ok(new { Message = "已拒绝该次可疑登录" })
+            : BadRequest(result.Errors);
+    }
+
     [HttpPost("me/security-events/{eventId:long}/acknowledge")]
     public async Task<IActionResult> AcknowledgeSecurityEvent(
         long eventId, [FromBody] AcknowledgeSecurityEventRequest? body, CancellationToken cancellationToken)
@@ -187,10 +202,18 @@ public class UsersController(
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
+        var purpose = string.IsNullOrWhiteSpace(body.Purpose)
+            ? StepUpPurposes.TrustedDevice
+            : body.Purpose.Trim();
         var (result, token) = await trustedDevices.CreateStepUpTokenAsync(
-            userId, body.Password, body.MfaCode, cancellationToken);
+            userId, body.Password, body.MfaCode, purpose, cancellationToken);
         return result.Succeeded
-            ? Ok(new { StepUpToken = token, ExpiresInSeconds = (int)TrustedDeviceService.StepUpTtl.TotalSeconds })
+            ? Ok(new
+            {
+                StepUpToken = token,
+                Purpose = purpose,
+                ExpiresInSeconds = (int)TrustedDeviceService.StepUpTtl.TotalSeconds,
+            })
             : BadRequest(result.Errors);
     }
 
@@ -318,9 +341,26 @@ public class UsersController(
             return Unauthorized();
         var (stream, fileName, error) = await dataExport.OpenDownloadAsync(userId, jobId, cancellationToken);
         if (stream is null)
-            return BadRequest(new { Message = error ?? "无法下载" });
+        {
+            return BadRequest(new
+            {
+                Code = error ?? "download_failed",
+                Message = MapExportDownloadError(error),
+            });
+        }
+
         return File(stream, "application/json", fileName);
     }
+
+    private static string MapExportDownloadError(string? code) => code switch
+    {
+        DataExportDownloadErrors.JobNotFound => "作业不存在",
+        DataExportDownloadErrors.DownloadConsumed => "下载链接已使用",
+        DataExportDownloadErrors.Expired => "导出已过期",
+        DataExportDownloadErrors.NotReady => "导出尚未就绪",
+        DataExportDownloadErrors.BlobMissing => "导出文件缺失",
+        _ => "无法下载",
+    };
 
     [HttpPost("me/email/request-change")]
     [EnableRateLimiting("user-email-change")]

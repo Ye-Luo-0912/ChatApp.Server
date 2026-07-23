@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Integration.Outbox;
 using ChatApp.Realtime.Integration.Serialization;
 using Core.Interfaces;
@@ -70,8 +71,10 @@ public sealed class AccountCleanupSagaService(
             return AccountCleanupApplyResult.EventIdMismatch;
         }
 
+        var now = DateTimeOffset.UtcNow;
         saga.Status = AccountCleanupSagaStatus.Completed;
-        saga.CompletedAt = DateTimeOffset.UtcNow;
+        saga.CompletedAt = now;
+        saga.UpdatedAt = now;
         saga.LastError = null;
         await EnsureInboxAsync(
             completedEventId,
@@ -117,6 +120,7 @@ public sealed class AccountCleanupSagaService(
         {
             saga.Status = AccountCleanupSagaStatus.Failed;
             saga.CompletedAt = now;
+            saga.UpdatedAt = now;
             saga.LastError = error;
         }
 
@@ -201,17 +205,49 @@ public sealed class AccountCleanupSagaService(
             deliveryCount);
     }
 
-    public async Task<bool> TryReplayAsync(long userId, CancellationToken cancellationToken = default)
+    public async Task<AccountCleanupReplayResponse> TryReplayAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
     {
         if (userId <= 0)
-            return false;
+        {
+            return new AccountCleanupReplayResponse
+            {
+                Outcome = AccountCleanupReplayOutcome.InvalidUser,
+                Message = "无效的 UserId",
+            };
+        }
 
         var saga = await db.AccountCleanupSagas
             .FirstOrDefaultAsync(s => s.UserId == userId, cancellationToken);
         if (saga is null)
-            return false;
+        {
+            return new AccountCleanupReplayResponse
+            {
+                Outcome = AccountCleanupReplayOutcome.NotFound,
+                Message = "未找到账号清理 Saga",
+            };
+        }
+
+        if (saga.Status == AccountCleanupSagaStatus.Completed)
+        {
+            return new AccountCleanupReplayResponse
+            {
+                Outcome = AccountCleanupReplayOutcome.AlreadyCompleted,
+                Message = "Saga 已 Completed，拒绝不安全重放",
+                Item = await BuildItemDtoAsync(saga, cancellationToken),
+            };
+        }
+
         if (saga.Status is not (AccountCleanupSagaStatus.Failed or AccountCleanupSagaStatus.Pending))
-            return false;
+        {
+            return new AccountCleanupReplayResponse
+            {
+                Outcome = AccountCleanupReplayOutcome.NotFound,
+                Message = $"不支持的 Saga 状态：{saga.Status}",
+                Item = await BuildItemDtoAsync(saga, cancellationToken),
+            };
+        }
 
         var completedEventId = CompletedEventIdPrefix + saga.EventId;
         var staleInbox = await db.AccountCleanupInbox
@@ -221,12 +257,14 @@ public sealed class AccountCleanupSagaService(
         if (staleInbox.Count > 0)
             db.AccountCleanupInbox.RemoveRange(staleInbox);
 
+        var now = DateTimeOffset.UtcNow;
         saga.Status = AccountCleanupSagaStatus.Pending;
         saga.CompletedAt = null;
         saga.LastError = null;
-        saga.CreatedAt = DateTimeOffset.UtcNow;
+        saga.UpdatedAt = now;
+        saga.ReplayCount += 1;
 
-        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var nowMs = now.ToUnixTimeMilliseconds();
         var existingOutbox = await db.RealtimeOutbox
             .FirstOrDefaultAsync(o => o.EventId == saga.EventId, cancellationToken);
         if (existingOutbox is not null)
@@ -252,10 +290,181 @@ public sealed class AccountCleanupSagaService(
 
         AuthSecurityMetrics.RecordAccountCleanup("replay");
         logger.LogWarning(
-            "AccountCleanupSaga 人工重放。UserId={UserId}；EventId={EventId}",
+            "AccountCleanupSaga 人工重放。UserId={UserId}；EventId={EventId}；ReplayCount={ReplayCount}",
             userId,
-            saga.EventId);
-        return true;
+            saga.EventId,
+            saga.ReplayCount);
+
+        return new AccountCleanupReplayResponse
+        {
+            Outcome = AccountCleanupReplayOutcome.Replayed,
+            Message = "已重新投递 UserAccountDeleted",
+            Item = await BuildItemDtoAsync(saga, cancellationToken),
+        };
+    }
+
+    public async Task<AccountCleanupReconcileResponse> TryReconcileAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        if (userId <= 0)
+        {
+            return new AccountCleanupReconcileResponse
+            {
+                Outcome = AccountCleanupReconcileOutcome.InvalidUser,
+                Message = "无效的 UserId",
+            };
+        }
+
+        var saga = await db.AccountCleanupSagas
+            .FirstOrDefaultAsync(s => s.UserId == userId, cancellationToken);
+        if (saga is null)
+        {
+            return new AccountCleanupReconcileResponse
+            {
+                Outcome = AccountCleanupReconcileOutcome.NotFound,
+                Message = "未找到账号清理 Saga",
+            };
+        }
+
+        if (saga.Status == AccountCleanupSagaStatus.Completed)
+        {
+            return new AccountCleanupReconcileResponse
+            {
+                Outcome = AccountCleanupReconcileOutcome.AlreadyCompleted,
+                Message = "Saga 已 Completed",
+                Item = await BuildItemDtoAsync(saga, cancellationToken),
+            };
+        }
+
+        var completedEventId = CompletedEventIdPrefix + saga.EventId;
+        var inboxCompleted = await db.AccountCleanupInbox
+            .AsNoTracking()
+            .AnyAsync(
+                x => x.EventId == completedEventId
+                     && x.Outcome == AccountCleanupInboxOutcome.Completed,
+                cancellationToken);
+
+        if (inboxCompleted)
+        {
+            var now = DateTimeOffset.UtcNow;
+            saga.Status = AccountCleanupSagaStatus.Completed;
+            saga.CompletedAt = now;
+            saga.UpdatedAt = now;
+            saga.LastError = null;
+            await db.SaveChangesAsync(cancellationToken);
+            AuthSecurityMetrics.RecordAccountCleanup("reconcile_completed");
+            logger.LogWarning(
+                "AccountCleanupSaga 对账：Inbox Completed 证据推进完成。UserId={UserId}；EventId={EventId}",
+                userId,
+                saga.EventId);
+
+            return new AccountCleanupReconcileResponse
+            {
+                Outcome = AccountCleanupReconcileOutcome.MarkedCompletedFromInbox,
+                Message = "已根据 Inbox Completed 证据标为 Completed",
+                Item = await BuildItemDtoAsync(saga, cancellationToken),
+            };
+        }
+
+        var outbox = await db.RealtimeOutbox
+            .AsNoTracking()
+            .FirstOrDefaultAsync(o => o.EventId == saga.EventId, cancellationToken);
+        if (saga.Status == AccountCleanupSagaStatus.Pending
+            && outbox is not null
+            && outbox.Status == (short)RealtimeOutboxStatus.Dead)
+        {
+            var now = DateTimeOffset.UtcNow;
+            saga.Status = AccountCleanupSagaStatus.Failed;
+            saga.CompletedAt = now;
+            saga.UpdatedAt = now;
+            saga.LastError = "outbox_dead";
+            await db.SaveChangesAsync(cancellationToken);
+            AuthSecurityMetrics.RecordAccountCleanup("reconcile_outbox_dead");
+            logger.LogWarning(
+                "AccountCleanupSaga 对账：Outbox Dead，标 Failed。UserId={UserId}；EventId={EventId}",
+                userId,
+                saga.EventId);
+
+            return new AccountCleanupReconcileResponse
+            {
+                Outcome = AccountCleanupReconcileOutcome.MarkedFailedFromOutboxDead,
+                Message = "UserAccountDeleted Outbox 已 Dead，Saga 已标 Failed（可再重放）",
+                Item = await BuildItemDtoAsync(saga, cancellationToken),
+            };
+        }
+
+        return new AccountCleanupReconcileResponse
+        {
+            Outcome = AccountCleanupReconcileOutcome.NoEvidence,
+            Message = "无 Inbox Completed / Outbox Dead 证据，可人工重放或等待完成事件",
+            Item = await BuildItemDtoAsync(saga, cancellationToken),
+        };
+    }
+
+    public async Task<AccountCleanupSagaItemDto?> GetStatusAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        if (userId <= 0)
+            return null;
+
+        var saga = await db.AccountCleanupSagas
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.UserId == userId, cancellationToken);
+        if (saga is null)
+            return null;
+
+        return await BuildItemDtoAsync(saga, cancellationToken);
+    }
+
+    public async Task<AccountCleanupSagaListResponse> ListAsync(
+        string? status,
+        long? userId,
+        int offset,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        offset = Math.Max(0, offset);
+        limit = Math.Clamp(limit, 1, 200);
+
+        var normalized = string.IsNullOrWhiteSpace(status) ? null : status.Trim();
+        IQueryable<AccountCleanupSaga> query = db.AccountCleanupSagas.AsNoTracking();
+
+        if (userId is > 0)
+            query = query.Where(s => s.UserId == userId.Value);
+
+        if (string.Equals(normalized, AccountCleanupDisplayStatus.DeadLetter, StringComparison.OrdinalIgnoreCase))
+        {
+            var deadUserIds = db.AccountCleanupDeadLetters.AsNoTracking()
+                .Select(d => d.UserId)
+                .Distinct();
+            query = query.Where(s =>
+                s.Status != AccountCleanupSagaStatus.Completed
+                && deadUserIds.Contains(s.UserId));
+        }
+        else if (normalized is not null)
+        {
+            query = query.Where(s => s.Status == normalized);
+        }
+
+        var total = await query.CountAsync(cancellationToken);
+        var sagas = await query
+            .OrderByDescending(s => s.UpdatedAt)
+            .ThenByDescending(s => s.UserId)
+            .Skip(offset)
+            .Take(limit)
+            .ToListAsync(cancellationToken);
+
+        var items = await BuildItemDtosAsync(sagas, cancellationToken);
+
+        return new AccountCleanupSagaListResponse
+        {
+            Items = items,
+            Total = total,
+            Offset = offset,
+            Limit = limit,
+        };
     }
 
     public static string? TryGetSourceEventId(string completedEventId)
@@ -263,6 +472,85 @@ public sealed class AccountCleanupSagaService(
         if (completedEventId.StartsWith(CompletedEventIdPrefix, StringComparison.Ordinal))
             return completedEventId[CompletedEventIdPrefix.Length..];
         return null;
+    }
+
+    private async Task<AccountCleanupSagaItemDto> BuildItemDtoAsync(
+        AccountCleanupSaga saga,
+        CancellationToken cancellationToken)
+    {
+        var items = await BuildItemDtosAsync([saga], cancellationToken);
+        return items[0];
+    }
+
+    private async Task<IReadOnlyList<AccountCleanupSagaItemDto>> BuildItemDtosAsync(
+        IReadOnlyList<AccountCleanupSaga> sagas,
+        CancellationToken cancellationToken)
+    {
+        if (sagas.Count == 0)
+            return [];
+
+        var userIds = sagas.Select(s => s.UserId).Distinct().ToList();
+        var eventIds = sagas.Select(s => s.EventId).Distinct().ToList();
+        var completedEventIds = eventIds.Select(id => CompletedEventIdPrefix + id).ToList();
+
+        var completedInboxIds = await db.AccountCleanupInbox
+            .AsNoTracking()
+            .Where(x => completedEventIds.Contains(x.EventId)
+                        && x.Outcome == AccountCleanupInboxOutcome.Completed)
+            .Select(x => x.EventId)
+            .ToListAsync(cancellationToken);
+        var completedSet = completedInboxIds.ToHashSet(StringComparer.Ordinal);
+
+        var deadLetters = await db.AccountCleanupDeadLetters
+            .AsNoTracking()
+            .Where(d => userIds.Contains(d.UserId))
+            .OrderByDescending(d => d.CreatedAt)
+            .ThenByDescending(d => d.Id)
+            .ToListAsync(cancellationToken);
+        var latestDlqByUser = deadLetters
+            .GroupBy(d => d.UserId)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        var outboxes = await db.RealtimeOutbox
+            .AsNoTracking()
+            .Where(o => eventIds.Contains(o.EventId))
+            .ToListAsync(cancellationToken);
+        var outboxByEvent = outboxes.ToDictionary(o => o.EventId, StringComparer.Ordinal);
+
+        var result = new List<AccountCleanupSagaItemDto>(sagas.Count);
+        foreach (var saga in sagas)
+        {
+            latestDlqByUser.TryGetValue(saga.UserId, out var latestDlq);
+            outboxByEvent.TryGetValue(saga.EventId, out var outbox);
+            var hasCompletedInbox = completedSet.Contains(CompletedEventIdPrefix + saga.EventId);
+            var hasDeadLetterFacet = latestDlq is not null
+                && saga.Status != AccountCleanupSagaStatus.Completed;
+
+            result.Add(new AccountCleanupSagaItemDto
+            {
+                UserId = saga.UserId,
+                SagaStatus = saga.Status,
+                DisplayStatus = hasDeadLetterFacet
+                    ? AccountCleanupDisplayStatus.DeadLetter
+                    : saga.Status,
+                SourceEventId = saga.EventId,
+                LastError = saga.LastError,
+                ReplayCount = saga.ReplayCount,
+                OutboxAttemptCount = outbox?.AttemptCount,
+                OutboxStatus = outbox?.Status,
+                DeadLetterDeliveryCount = latestDlq?.DeliveryCount,
+                DeadLetterReasonCode = latestDlq?.ReasonCode,
+                DeadLetterReason = latestDlq?.Reason,
+                LatestDeadLetterAt = latestDlq?.CreatedAt,
+                HasDeadLetter = latestDlq is not null,
+                HasCompletedInboxEvidence = hasCompletedInbox,
+                CreatedAt = saga.CreatedAt,
+                UpdatedAt = saga.UpdatedAt,
+                CompletedAt = saga.CompletedAt,
+            });
+        }
+
+        return result;
     }
 
     private async Task EnsureInboxAsync(

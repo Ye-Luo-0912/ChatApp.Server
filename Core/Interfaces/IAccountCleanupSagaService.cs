@@ -29,7 +29,32 @@ public interface IAccountCleanupSagaService
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 人工重放：Failed（或超时 Pending）Saga 重置为 Pending，并重新投递 UserAccountDeleted。
+    /// 人工重放：Failed / Pending Saga 重置为 Pending 并重新投递 UserAccountDeleted。
+    /// Completed 拒绝（不安全）；返回明确 Outcome 供运维 UI。
     /// </summary>
-    Task<bool> TryReplayAsync(long userId, CancellationToken cancellationToken = default);
+    Task<AccountCleanupReplayResponse> TryReplayAsync(
+        long userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 对账：用 Inbox Completed 证据推进 Stuck Saga；或用 Outbox Dead 标 Failed。
+    /// </summary>
+    Task<AccountCleanupReconcileResponse> TryReconcileAsync(
+        long userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>单用户状态（含死信 / Outbox 相关字段）。</summary>
+    Task<AccountCleanupSagaItemDto?> GetStatusAsync(
+        long userId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 列表：可按 Saga 状态或 DeadLetter 分面过滤，offset/limit 分页。
+    /// </summary>
+    Task<AccountCleanupSagaListResponse> ListAsync(
+        string? status,
+        long? userId,
+        int offset,
+        int limit,
+        CancellationToken cancellationToken = default);
 }

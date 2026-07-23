@@ -59,11 +59,16 @@ public sealed class OpaqueTokenAuthHandler(
             }
 
             var roleCount = data.Roles?.Length ?? 0;
-            var claims = new List<Claim>(roleCount + 2)
+            var claims = new List<Claim>(roleCount + 4)
             {
                 new(ClaimTypes.NameIdentifier, data.UserId.ToString()),
                 new(ClaimTypes.Name, data.UserName),
             };
+
+            if (!string.IsNullOrWhiteSpace(data.SessionId))
+                claims.Add(new Claim(Core.Models.Auth.AuthClaimTypes.SessionId, data.SessionId));
+            if (data.DeviceIdHash is { } didh)
+                claims.Add(new Claim(Core.Models.Auth.AuthClaimTypes.DeviceIdHash, didh.ToString("x16")));
 
             if (data.Roles is not null)
                 claims.AddRange(data.Roles.Select(role => new Claim(ClaimTypes.Role, role)));

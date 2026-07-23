@@ -179,7 +179,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
     private (UserAccountService Account, IEmailVerificationService Email, ISessionStore Sessions)
         CreateAccountStack(UserDbContext db, string currentDeviceId = "device-a")
     {
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var repo = new UserRepository(db, new TsidGeneratorService());
         var email = new EmailVerificationService(new RecordingEmailSender(), redis.Cache);
         var tokens = CreateTokenService(currentDeviceId);
@@ -207,7 +207,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var mfa = new MfaService(
             db,
-            new BcryptPasswordHasher(),
+            AuthTestFactories.CreatePasswordHasher(),
             CreateRecoveryHasher(),
             new AesGcmMfaSecretProtector(
                 Options.Create(new SecurityOptions { SecretEncryptionKey = "test-mfa-encryption-key", KeyVersion = 1 }),
@@ -215,10 +215,11 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
                 new TestHostEnvironment(),
                 NullLogger<AesGcmMfaSecretProtector>.Instance),
             security,
+            redis.Cache,
             NullLogger<MfaService>.Instance);
         return new AuthService(
             db,
-            new BcryptPasswordHasher(),
+            AuthTestFactories.CreatePasswordHasher(),
             tokens,
             tokens,
             new FixedDeviceInfo("auth-device"),
@@ -237,7 +238,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
     private static TrustedDeviceService CreateTrusted(UserDbContext db, ICacheProvider cache)
     {
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var mfa = new MfaService(
             db, hasher,
             CreateRecoveryHasher(),
@@ -247,9 +248,18 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
                 new TestHostEnvironment(),
                 NullLogger<AesGcmMfaSecretProtector>.Instance),
             security,
+            cache,
             NullLogger<MfaService>.Instance);
         return new TrustedDeviceService(
-            db, security, hasher, mfa, cache, NullLogger<TrustedDeviceService>.Instance);
+            db,
+            security,
+            hasher,
+            mfa,
+            cache,
+            new FixedDeviceInfo(AuthTestFactories.StableDeviceId("account-sec")),
+            new Microsoft.AspNetCore.Http.HttpContextAccessor(),
+            Options.Create(new TrustedDeviceOptions()),
+            NullLogger<TrustedDeviceService>.Instance);
     }
 
     private TokenService CreateTokenService(string deviceId)
@@ -273,7 +283,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
     private static async Task<ApplicationUser> SeedUserAsync(
         UserDbContext db, string name, string email, string password)
     {
-        var hasher = new BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var user = new ApplicationUser
         {
             Id = new TsidGeneratorService().GenerateTsid(),
@@ -296,6 +306,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             Options.Create(new SecurityOptions { SecretEncryptionKey = "test-mfa-encryption-key", KeyVersion = 1 }),
             Options.Create(new JwtSettings { Secret = "test-mfa-jwt-secret-please-change" }),
             new TestHostEnvironment(),
+            AuthTestFactories.CreateCpuLimiter(),
             NullLogger<HmacRecoveryCodeHasher>.Instance);
 
     private sealed class RecordingEmailSender : IEmailSender

@@ -44,15 +44,29 @@ public interface ITrustedDeviceService
 
     /// <summary>校验敏感操作身份（密码 / MFA / step-up / 最近 MFA），不签发可信设备。</summary>
     Task<AuthOperationResult> VerifyStepUpAsync(
-        long userId, string? password, string? mfaCode, string? stepUpToken,
+        long userId,
+        string? password,
+        string? mfaCode,
+        string? stepUpToken,
+        string purpose,
         CancellationToken cancellationToken = default);
 
-    /// <summary>签发短期 step-up Token（用于可信设备/导出等敏感操作）。</summary>
+    /// <summary>签发短期 step-up Token（绑定 userId+sessionId+deviceHash+purpose+nonce）。</summary>
     Task<(AuthOperationResult Result, string? StepUpToken)> CreateStepUpTokenAsync(
-        long userId, string? password, string? mfaCode, CancellationToken cancellationToken = default);
+        long userId,
+        string? password,
+        string? mfaCode,
+        string purpose,
+        CancellationToken cancellationToken = default);
 
-    /// <summary>MFA 登录成功后写入「最近一次 MFA」标记（短 TTL，签发可信设备时可消费）。</summary>
-    Task MarkRecentMfaAsync(long userId, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// MFA 登录成功后写入「最近一次 MFA」标记（短 TTL，绑定 sessionId+deviceHash，签发可信设备/导出时可消费）。
+    /// </summary>
+    Task MarkRecentMfaAsync(
+        long userId,
+        string? sessionId,
+        string? deviceId,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed record TrustedDeviceDto(

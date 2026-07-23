@@ -145,7 +145,7 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
     {
         var tsid = new TsidGeneratorService();
         var suffix = Guid.NewGuid().ToString("N")[..8];
-        var hasher = new Infrastructure.Services.Auth.BcryptPasswordHasher();
+        var hasher = AuthTestFactories.CreatePasswordHasher();
         var user = new ApplicationUser
         {
             Id = tsid.GenerateTsid(),

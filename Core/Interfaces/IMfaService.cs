@@ -20,6 +20,12 @@ public interface IMfaService
 
     bool VerifyTotpForUser(ApplicationUser user, string code);
 
+    /// <summary>
+    /// 校验 TOTP 并原子消费该时间步（Redis SET NX），同一 timestep 不可重放。
+    /// </summary>
+    Task<bool> TryVerifyAndConsumeTotpForUserAsync(
+        ApplicationUser user, string code, CancellationToken cancellationToken = default);
+
     Task<bool> TryConsumeRecoveryCodeAsync(long userId, string code, CancellationToken cancellationToken = default);
 
     /// <summary>重新生成恢复码（需密码 + 当前 TOTP/恢复码）。</summary>
