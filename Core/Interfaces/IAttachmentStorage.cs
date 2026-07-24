@@ -36,6 +36,12 @@ public interface IAttachmentStorage
             CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 解析本地磁盘绝对路径（须在存储根下且文件存在）。S3 实现返回 null。
+    /// 供下载走 <c>PhysicalFileResult</c>，避免用户态再拷一份流。
+    /// </summary>
+    string? TryResolveLocalPhysicalPath(string objectKey);
+
+    /// <summary>
     /// 打开本地对象流。S3 实现返回 null（应改用签名 URL）。
     /// 调用方负责 Dispose Stream。
     /// </summary>

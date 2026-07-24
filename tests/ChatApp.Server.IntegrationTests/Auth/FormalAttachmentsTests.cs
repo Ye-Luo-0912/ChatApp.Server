@@ -7,6 +7,7 @@ using Core.Interfaces;
 using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Services;
+using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
 
@@ -79,12 +80,19 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
             ticket = ticket.Ticket,
             attachmentId = ticket.AttachmentId,
         }, WafTestHelpers.Json);
-        Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, confirm.StatusCode);
         var body = await confirm.Content.ReadFromJsonAsync<ConfirmDto>(WafTestHelpers.Json);
         Assert.Equal(ticket.AttachmentId, body?.AttachmentId);
         Assert.False(string.IsNullOrWhiteSpace(body?.DownloadPath));
         Assert.Contains(ticket.AttachmentId, body!.DownloadPath, StringComparison.Ordinal);
         Assert.True(string.IsNullOrEmpty(body.PublicUrl));
+        Assert.Equal("Scanning", body.Status);
+
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var scans = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+            Assert.True(await scans.ProcessDueAsync() >= 1);
+        }
 
         await using var conn = new NpgsqlConnection(postgres.ConnectionString);
         await conn.OpenAsync();
@@ -216,7 +224,8 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
     private sealed record PresignDto(
         string AttachmentId, string UploadUrl, string DownloadPath, string PublicUrl, string ObjectKey, string Ticket, DateTimeOffset ExpiresAt);
 
-    private sealed record ConfirmDto(string AttachmentId, string DownloadPath, string PublicUrl, string ObjectKey);
+    private sealed record ConfirmDto(
+        string AttachmentId, string DownloadPath, string PublicUrl, string ObjectKey, string Status);
 
     private sealed class FakeAttachmentMetadataStore(IReadOnlyList<AttachmentRecord> rows) : IAttachmentMetadataStore
     {
@@ -275,6 +284,32 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
             long uploaderUserId,
             CancellationToken cancellationToken = default)
             => Task.FromResult<string?>(null);
+
+        public Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
+            TimeSpan maxAge,
+            int batchSize,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<AttachmentAbandonBatchItem>>([]);
+
+        public Task<AttachmentOpsOrphanQueryResult> QueryOpsOrphansAsync(
+            TimeSpan orphanAge,
+            TimeSpan stuckScanningAge,
+            int sampleLimit,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(new AttachmentOpsOrphanQueryResult(
+                Available: true,
+                UnavailableReason: null,
+                ConfirmedUnboundPastAgeCount: 0,
+                AbandonedUploadingPastAgeCount: 0,
+                StuckScanningCount: 0,
+                OldestConfirmedUnboundAtMs: null,
+                OldestUploadingAtMs: null,
+                OldestStuckScanningAtMs: null,
+                ActiveAttachmentCount: rows.Count,
+                ActiveSizeBytesSum: rows.Sum(r => r.SizeBytes),
+                WorstConfirmedUnbound: [],
+                WorstUploading: [],
+                WorstStuckScanning: []));
     }
 
     private sealed class SingleMessageReader(ChatExportMessage msg) : IRealtimeChatExportReader

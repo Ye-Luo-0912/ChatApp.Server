@@ -87,7 +87,54 @@ public interface IAttachmentMetadataStore
         string attachmentId,
         long uploaderUserId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 批量放弃过期未绑定 Ticketed/Confirmed（message_id 为空），供年龄清扫入队 blob 删除。
+    /// </summary>
+    Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
+        TimeSpan maxAge,
+        int batchSize,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 运维只读：过期未绑定 Confirmed、过期 Ticketed/Uploaded、卡住 Scanning；外加 Active size 提示。
+    /// </summary>
+    Task<AttachmentOpsOrphanQueryResult> QueryOpsOrphansAsync(
+        TimeSpan orphanAge,
+        TimeSpan stuckScanningAge,
+        int sampleLimit,
+        CancellationToken cancellationToken = default);
 }
+
+/// <summary>年龄清扫放弃的一条附件元数据。</summary>
+public sealed record AttachmentAbandonBatchItem(
+    string AttachmentId,
+    string ObjectKey,
+    long UploaderUserId);
+
+/// <summary>元数据侧孤儿/卡住扫描聚合（供 Admin ops）。</summary>
+public sealed record AttachmentOpsOrphanQueryResult(
+    bool Available,
+    string? UnavailableReason,
+    long ConfirmedUnboundPastAgeCount,
+    long AbandonedUploadingPastAgeCount,
+    long StuckScanningCount,
+    long? OldestConfirmedUnboundAtMs,
+    long? OldestUploadingAtMs,
+    long? OldestStuckScanningAtMs,
+    long ActiveAttachmentCount,
+    long ActiveSizeBytesSum,
+    IReadOnlyList<AttachmentOpsOrphanSample> WorstConfirmedUnbound,
+    IReadOnlyList<AttachmentOpsOrphanSample> WorstUploading,
+    IReadOnlyList<AttachmentOpsOrphanSample> WorstStuckScanning);
+
+public sealed record AttachmentOpsOrphanSample(
+    string AttachmentId,
+    string ObjectKey,
+    long UploaderUserId,
+    short Status,
+    long SizeBytes,
+    long CreatedAtMs);
 
 /// <summary>未配置 Realtime 连接串时的空实现。</summary>
 public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStore
@@ -169,4 +216,30 @@ public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStor
         long uploaderUserId,
         CancellationToken cancellationToken = default)
         => Task.FromResult<string?>(null);
+
+    public Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
+        TimeSpan maxAge,
+        int batchSize,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlyList<AttachmentAbandonBatchItem>>([]);
+
+    public Task<AttachmentOpsOrphanQueryResult> QueryOpsOrphansAsync(
+        TimeSpan orphanAge,
+        TimeSpan stuckScanningAge,
+        int sampleLimit,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new AttachmentOpsOrphanQueryResult(
+            Available: false,
+            UnavailableReason: UnavailableReason,
+            ConfirmedUnboundPastAgeCount: 0,
+            AbandonedUploadingPastAgeCount: 0,
+            StuckScanningCount: 0,
+            OldestConfirmedUnboundAtMs: null,
+            OldestUploadingAtMs: null,
+            OldestStuckScanningAtMs: null,
+            ActiveAttachmentCount: 0,
+            ActiveSizeBytesSum: 0,
+            WorstConfirmedUnbound: [],
+            WorstUploading: [],
+            WorstStuckScanning: []));
 }

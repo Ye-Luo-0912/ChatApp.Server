@@ -131,6 +131,8 @@ public sealed class AttachmentBlobDeleteTests
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public string? TryResolveLocalPhysicalPath(string objectKey) => null;
+
         public Task<AttachmentReadResult?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default)
             => Task.FromResult<AttachmentReadResult?>(null);
 

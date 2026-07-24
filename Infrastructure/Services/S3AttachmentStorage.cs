@@ -165,10 +165,44 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         }
     }
 
-    public Task<AttachmentReadResult?> OpenReadAsync(
+    public string? TryResolveLocalPhysicalPath(string objectKey) => null;
+
+    public async Task<AttachmentReadResult?> OpenReadAsync(
         string objectKey,
         CancellationToken cancellationToken = default)
-        => Task.FromResult<AttachmentReadResult?>(null);
+    {
+        if (string.IsNullOrWhiteSpace(objectKey))
+            return null;
+
+        var key = NormalizeKey(objectKey);
+        try
+        {
+            var response = await _s3.GetObjectAsync(
+                    new GetObjectRequest
+                    {
+                        BucketName = _options.S3Bucket,
+                        Key = key,
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            var contentType = string.IsNullOrWhiteSpace(response.Headers.ContentType)
+                ? "application/octet-stream"
+                : response.Headers.ContentType;
+            var length = response.Headers.ContentLength;
+            var fileName = Path.GetFileName(key);
+            // 调用方负责 Dispose ResponseStream（经 AttachmentReadResult.Content）。
+            return new AttachmentReadResult(
+                response.ResponseStream,
+                contentType,
+                length,
+                fileName);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
 
     public async Task<AttachmentSignedUrl?> CreateSignedDownloadUrlAsync(
         string objectKey,

@@ -265,6 +265,88 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_AttachmentBlobDeleteJob", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Models.Export.AttachmentScanJob", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("AttachmentId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ContentType")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("OriginalName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AttachmentId")
+                        .HasDatabaseName("IX_AttachmentScanJob_AttachmentId");
+
+                    b.HasIndex("AttachmentId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_AttachmentScanJob_ActiveAttachment")
+                        .HasFilter("\"Status\" IN ('Pending', 'Processing', 'Finalizing')");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("IX_AttachmentScanJob_UserId");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_AttachmentScanJob_LeaseDue");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_AttachmentScanJob_Due");
+
+                    b.ToTable("T_AttachmentScanJob", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Export.AccountCleanupInboxEntry", b =>
                 {
                     b.Property<string>("EventId")

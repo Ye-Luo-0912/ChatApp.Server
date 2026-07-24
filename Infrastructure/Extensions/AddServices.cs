@@ -59,14 +59,25 @@ public static class AddServices
         services.AddScoped<IAccountCleanupSagaService>(sp => sp.GetRequiredService<AccountCleanupSagaService>());
         services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
         services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
+        services.AddScoped<AttachmentAbandonedAgeSweeper>();
+        services.AddScoped<IAttachmentScanService, AttachmentScanService>();
+        services.AddSingleton<AttachmentScanEnqueuer>();
+        services.AddSingleton<IAttachmentDownloadTicketService, AttachmentDownloadTicketService>();
         services.AddHostedService(sp => new AccountCleanupSagaWorker(
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>(),
             sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.AccountCleanupSagaOptions>>(),
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<AccountCleanupSagaWorker>>()));
+        services.AddHostedService(sp => new PresenceAuthorizeWorker(
+            sp.GetService<ChatApp.Realtime.Integration.IRealtimeMessageBus>(),
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.MessageEvidenceOptions>>(),
+            sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<Core.Settings.DataExportStorageOptions>>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PresenceAuthorizeWorker>>()));
         services.AddScoped<INotificationQuery, NotificationQuery>();
         services.AddScoped<ITrustedDeviceService, TrustedDeviceService>();
         services.AddScoped<IRealtimeOutboxAdminService, RealtimeOutboxAdminService>();
+        services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
         services.AddSingleton<LoginRiskAnalyzer>();
         services.AddSingleton<ILoginRiskAnalyzer>(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
         services.AddHostedService(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
@@ -98,6 +109,7 @@ public static class AddServices
         services.AddSingleton<AvatarReencodeQueue>();
         services.AddHostedService<AvatarCleanupWorker>();
         services.AddHostedService<AttachmentCleanupWorker>();
+        services.AddHostedService<AttachmentScanWorker>();
         services.AddHostedService<SecurityEventArchiveWorker>();
         services.AddHostedService<AccountDeletionWorker>();
         services.AddHostedService<NotificationDispatchWorker>();

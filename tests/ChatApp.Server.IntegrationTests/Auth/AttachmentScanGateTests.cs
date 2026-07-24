@@ -4,6 +4,7 @@ using System.Text;
 using ChatApp.Server.IntegrationTests.Support;
 using Core.Models.Export;
 using Infrastructure.Services;
+using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
 
@@ -90,7 +91,13 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
             ticket = ticket.Ticket,
             attachmentId = ticket.AttachmentId,
         }, WafTestHelpers.Json);
-        Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, confirm.StatusCode);
+
+        // Confirm 后仍 Scanning，直至 Worker 处理
+        var stillScanning = await client.GetAsync($"/api/attachments/{ticket.AttachmentId}/download");
+        Assert.Equal(HttpStatusCode.Conflict, stillScanning.StatusCode);
+
+        await DrainScanJobsAsync(factory);
 
         await using (var conn = new NpgsqlConnection(postgres.ConnectionString))
         {
@@ -156,7 +163,9 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
             ticket = ticket.Ticket,
             attachmentId = ticket.AttachmentId,
         }, WafTestHelpers.Json);
-        Assert.Equal(HttpStatusCode.BadRequest, confirm.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, confirm.StatusCode);
+
+        Assert.Equal(1, await DrainScanJobsAsync(factory));
 
         await using var conn = new NpgsqlConnection(postgres.ConnectionString);
         await conn.OpenAsync();
@@ -182,6 +191,16 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
                 ["MessageEvidence:RealtimeConnectionString"] = postgres.ConnectionString,
                 ["MessageEvidence:Schema"] = "realtime",
             });
+
+    private static async Task<int> DrainScanJobsAsync(ChatAppWebApplicationFactory factory)
+    {
+        await using var scope = factory.Services.CreateAsyncScope();
+        var scans = scope.ServiceProvider.GetRequiredService<Core.Interfaces.IAttachmentScanService>();
+        var total = 0;
+        for (var i = 0; i < 5; i++)
+            total += await scans.ProcessDueAsync();
+        return total;
+    }
 
     private static async Task EnsureSchemaAsync(string connectionString)
     {

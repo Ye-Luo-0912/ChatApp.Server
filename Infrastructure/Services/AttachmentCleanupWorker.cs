@@ -28,6 +28,7 @@ public sealed class AttachmentCleanupWorker(
         {
             try
             {
+                await SweepAgedUnboundAsync(stoppingToken).ConfigureAwait(false);
                 await ProcessDeleteJobsAsync(stoppingToken).ConfigureAwait(false);
 
                 var opts = options.Value;
@@ -54,6 +55,13 @@ public sealed class AttachmentCleanupWorker(
 
             await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task SweepAgedUnboundAsync(CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var sweeper = scope.ServiceProvider.GetRequiredService<AttachmentAbandonedAgeSweeper>();
+        await sweeper.SweepOnceAsync(ct).ConfigureAwait(false);
     }
 
     private async Task ProcessDeleteJobsAsync(CancellationToken ct)

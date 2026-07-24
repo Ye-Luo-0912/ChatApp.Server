@@ -48,6 +48,7 @@ public static class AuthSecurityMetrics
     private static readonly Counter<long> AttachmentScans =
         AttachmentMeter.CreateCounter<long>("attachment.scan", "ops", "附件内容扫描状态变迁");
     private static long _attachmentPendingDelete;
+    private static long _attachmentPendingScan;
 
     static AuthSecurityMetrics()
     {
@@ -71,6 +72,11 @@ public static class AuthSecurityMetrics
             () => Volatile.Read(ref _attachmentPendingDelete),
             "jobs",
             "附件 blob 删除墓碑数（告警钩子）");
+        AttachmentMeter.CreateObservableGauge(
+            "attachment.pending_scan",
+            () => Volatile.Read(ref _attachmentPendingScan),
+            "jobs",
+            "附件内容扫描待处理作业数（告警钩子）");
     }
 
     public static void RecordLogin(string outcome)
@@ -128,4 +134,7 @@ public static class AuthSecurityMetrics
 
     public static void AttachmentPendingDeleteDelta(int delta)
         => Interlocked.Add(ref _attachmentPendingDelete, delta);
+
+    public static void AttachmentPendingScanDelta(int delta)
+        => Interlocked.Add(ref _attachmentPendingScan, delta);
 }

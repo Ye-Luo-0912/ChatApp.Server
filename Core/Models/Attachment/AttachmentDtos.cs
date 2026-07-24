@@ -47,6 +47,11 @@ public sealed class ConfirmAttachmentResponse
     /// <summary>内部对象键（非公开 URL）。</summary>
     public string ObjectKey { get; init; } = string.Empty;
 
+    /// <summary>
+    /// Confirm 后内容扫描异步进行时为 <c>Scanning</c>；已确认则为 <c>Confirmed</c>。
+    /// </summary>
+    public string Status { get; init; } = "Scanning";
+
     /// <summary>已废弃：永久公开 URL。始终为空。</summary>
     [Obsolete("Use DownloadPath. Permanent PublicUrl is no longer returned.")]
     public string PublicUrl { get; init; } = string.Empty;
@@ -56,6 +61,17 @@ public sealed class AttachmentSignedDownloadResponse
 {
     public string Url { get; init; } = string.Empty;
     public DateTimeOffset ExpiresAt { get; init; }
+}
+
+/// <summary>短时下载票：绑定 userId+attachmentId，Redis TTL 内单次消费。</summary>
+public sealed class AttachmentDownloadTicketResponse
+{
+    public string AttachmentId { get; init; } = string.Empty;
+    public string Ticket { get; init; } = string.Empty;
+    public DateTimeOffset ExpiresAt { get; init; }
+
+    /// <summary>带 ticket 查询参数的下载路径。</summary>
+    public string DownloadUrl { get; init; } = string.Empty;
 }
 
 /// <summary>下载授权解析结果。</summary>
@@ -74,10 +90,15 @@ public enum AttachmentDownloadDecision
     Unavailable = 3,
     /// <summary>仍在 Uploaded/Scanning；客户端应稍后重试（HTTP 409）。</summary>
     NotReady = 4,
+    /// <summary>下载票无效、过期、已消费或与用户/附件不匹配。</summary>
+    InvalidTicket = 5,
 }
 
 public static class AttachmentApiPaths
 {
     public static string DownloadPath(string attachmentId) =>
         $"/api/attachments/{Uri.EscapeDataString(attachmentId)}/download";
+
+    public static string DownloadPathWithTicket(string attachmentId, string ticket) =>
+        $"{DownloadPath(attachmentId)}?ticket={Uri.EscapeDataString(ticket)}";
 }

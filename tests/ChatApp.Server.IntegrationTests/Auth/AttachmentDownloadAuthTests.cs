@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text;
 using ChatApp.Server.IntegrationTests.Support;
 using Core.Models.Export;
+using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
 
@@ -50,7 +51,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         ownerClient.UseBearer(ownerLogin.AccessToken!);
 
         var payload = Encoding.UTF8.GetBytes("download-auth-bytes");
-        var ticket = await PresignUploadConfirmAsync(ownerClient, payload, "photo.png", "image/png");
+        var ticket = await PresignUploadConfirmAsync(factory, ownerClient, payload, "photo.png", "image/png");
 
         // Bound + conversation membership for owner; outsider not a member.
         var conversationId = $"c-{suffix}";
@@ -90,7 +91,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         Assert.Equal(payload, bytes);
 
         // Confirmed unbound：仅上传者可下
-        var unbound = await PresignUploadConfirmAsync(ownerClient, Encoding.UTF8.GetBytes("unbound"), "note.bin", "application/octet-stream");
+        var unbound = await PresignUploadConfirmAsync(factory, ownerClient, Encoding.UTF8.GetBytes("unbound"), "note.bin", "application/octet-stream");
         var unboundOk = await ownerClient.GetAsync($"/api/attachments/{unbound.AttachmentId}/download");
         Assert.Equal(HttpStatusCode.OK, unboundOk.StatusCode);
 
@@ -122,7 +123,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         ownerClient.UseBearer(ownerLogin.AccessToken!);
 
         var payload = Encoding.UTF8.GetBytes("0123456789ABCDEF");
-        var ticket = await PresignUploadConfirmAsync(ownerClient, payload, "range.bin", "application/octet-stream");
+        var ticket = await PresignUploadConfirmAsync(factory, ownerClient, payload, "range.bin", "application/octet-stream");
 
         var conversationId = $"c-rng-{suffix}";
         await using (var conn = new NpgsqlConnection(postgres.ConnectionString))
@@ -182,7 +183,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         outsiderClient.UseBearer(outsiderLogin.AccessToken!);
 
         var ticket = await PresignUploadConfirmAsync(
-            ownerClient, Encoding.UTF8.GetBytes("abandon-me"), "gone.bin", "application/octet-stream");
+            factory, ownerClient, Encoding.UTF8.GetBytes("abandon-me"), "gone.bin", "application/octet-stream");
 
         var forbidden = await outsiderClient.PostAsync(
             $"/api/attachments/{ticket.AttachmentId}/abandon", content: null);
@@ -221,6 +222,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
     }
 
     private static async Task<(string AttachmentId, string ObjectKey, string Ticket)> PresignUploadConfirmAsync(
+        ChatAppWebApplicationFactory factory,
         HttpClient client, byte[] payload, string originalName, string contentType)
     {
         var presign = await client.PostAsJsonAsync("/api/attachments/presign", new
@@ -247,8 +249,20 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
             ticket = ticket.Ticket,
             attachmentId = ticket.AttachmentId,
         }, WafTestHelpers.Json);
-        Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, confirm.StatusCode);
+        await DrainScanJobsAsync(factory);
         return (ticket.AttachmentId, ticket.ObjectKey, ticket.Ticket);
+    }
+
+    private static async Task DrainScanJobsAsync(ChatAppWebApplicationFactory factory)
+    {
+        await using var scope = factory.Services.CreateAsyncScope();
+        var scans = scope.ServiceProvider.GetRequiredService<Core.Interfaces.IAttachmentScanService>();
+        for (var i = 0; i < 5; i++)
+        {
+            if (await scans.ProcessDueAsync() > 0)
+                return;
+        }
     }
 
     private static async Task EnsureSchemaAsync(string connectionString)

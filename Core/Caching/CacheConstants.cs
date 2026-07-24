@@ -30,4 +30,7 @@ public static class CacheConstants
 
     /// <summary>TOTP 已用时间步：<c>totp:used:{userId}:{timestep}</c>，TTL ~3 分钟防重放。</summary>
     public const string TotpUsedPrefix = "totp:used:";
+
+    /// <summary>附件鉴权下载短时票：<c>attachment:download:{ticket}</c>，单次消费。</summary>
+    public const string AttachmentDownloadTicketPrefix = "attachment:download:";
 }

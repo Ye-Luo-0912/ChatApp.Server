@@ -244,16 +244,25 @@ public sealed class LocalAttachmentStorage(
         return (true, string.Empty, objectKey, id, info?.ContentType, size, info?.OriginalName, null);
     }
 
-    public Task<AttachmentReadResult?> OpenReadAsync(
-        string objectKey,
-        CancellationToken cancellationToken = default)
+    public string? TryResolveLocalPhysicalPath(string objectKey)
     {
         if (string.IsNullOrWhiteSpace(objectKey))
-            return Task.FromResult<AttachmentReadResult?>(null);
+            return null;
 
         var root = EnsureDirectoryBoundary(_options.LocalRootPath);
         var fullPath = Path.GetFullPath(Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar)));
         if (!IsUnderRoot(root, fullPath) || !File.Exists(fullPath))
+            return null;
+
+        return fullPath;
+    }
+
+    public Task<AttachmentReadResult?> OpenReadAsync(
+        string objectKey,
+        CancellationToken cancellationToken = default)
+    {
+        var fullPath = TryResolveLocalPhysicalPath(objectKey);
+        if (fullPath is null)
             return Task.FromResult<AttachmentReadResult?>(null);
 
         var stream = new FileStream(

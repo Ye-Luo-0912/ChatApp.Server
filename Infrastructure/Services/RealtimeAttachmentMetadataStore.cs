@@ -161,12 +161,16 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        // Ticketed → Uploaded → Scanning（单语句落到 Scanning；size 有则更新）
+        // Ticketed → Uploaded → Scanning（单语句落到 Scanning；size / content_hash 有则更新）
         await using var cmd = new NpgsqlCommand(
             $"""
              UPDATE {table}
              SET status = @scanning,
-                 size_bytes = CASE WHEN @size > 0 THEN @size ELSE size_bytes END
+                 size_bytes = CASE WHEN @size > 0 THEN @size ELSE size_bytes END,
+                 content_hash = CASE
+                     WHEN @hash IS NOT NULL AND length(@hash) > 0 THEN lower(@hash)
+                     ELSE content_hash
+                 END
              WHERE attachment_id = @id
                AND uploader_user_id = @uid
                AND status IN (@ticketed, @uploaded, @scanning)
@@ -174,10 +178,12 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         cmd.Parameters.AddWithValue("id", attachmentId);
         cmd.Parameters.AddWithValue("uid", uploaderUserId);
         cmd.Parameters.AddWithValue("size", sizeBytes);
+        cmd.Parameters.AddWithValue(
+            "hash",
+            string.IsNullOrWhiteSpace(sha256Hex) ? (object)DBNull.Value : sha256Hex.Trim());
         cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
         cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
         cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
-        _ = sha256Hex; // 预留：表无 content_hash 列时仅用于调用方校验
 
         var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (rows == 0)
@@ -668,6 +674,268 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             _logger.LogDebug(ex, "attachments 表不可用，跳过 TryAbandonUnboundByUploader");
             return null;
         }
+    }
+
+    public async Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
+        TimeSpan maxAge,
+        int batchSize,
+        CancellationToken cancellationToken = default)
+    {
+        batchSize = Math.Clamp(batchSize, 1, 200);
+        if (maxAge <= TimeSpan.Zero)
+            return [];
+
+        var cs = ResolveConnectionString();
+        if (string.IsNullOrWhiteSpace(cs))
+            return [];
+
+        var cutoffMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            - (long)Math.Max(0, maxAge.TotalMilliseconds);
+        var table = TableSql();
+
+        await using var conn = new NpgsqlConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            await using var cmd = new NpgsqlCommand(
+                $"""
+                 UPDATE {table} AS a
+                 SET status = @abandoned
+                 FROM (
+                     SELECT attachment_id
+                     FROM {table}
+                     WHERE status IN (@ticketed, @confirmed)
+                       AND message_id IS NULL
+                       AND created_at_ms <= @cutoff_ms
+                     ORDER BY created_at_ms
+                     LIMIT @batch
+                     FOR UPDATE SKIP LOCKED
+                 ) AS batch
+                 WHERE a.attachment_id = batch.attachment_id
+                 RETURNING a.attachment_id, a.object_key, a.uploader_user_id;
+                 """,
+                conn,
+                tx);
+            cmd.Parameters.AddWithValue("abandoned", (short)AttachmentStatus.Abandoned);
+            cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+            cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+            cmd.Parameters.AddWithValue("cutoff_ms", cutoffMs);
+            cmd.Parameters.AddWithValue("batch", batchSize);
+
+            var items = new List<AttachmentAbandonBatchItem>(batchSize);
+            await using (var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            {
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var id = reader.GetString(0);
+                    var key = reader.GetString(1);
+                    var uploader = reader.GetInt64(2);
+                    if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(key))
+                        items.Add(new AttachmentAbandonBatchItem(id, key, uploader));
+                }
+            }
+
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return items;
+        }
+        catch (PostgresException ex) when (ex.SqlState is "42P01" or "42703")
+        {
+            await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            _logger.LogDebug(ex, "attachments 表不可用，跳过 AbandonAgedUnbound");
+            return [];
+        }
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<AttachmentOpsOrphanQueryResult> QueryOpsOrphansAsync(
+        TimeSpan orphanAge,
+        TimeSpan stuckScanningAge,
+        int sampleLimit,
+        CancellationToken cancellationToken = default)
+    {
+        sampleLimit = Math.Clamp(sampleLimit, 1, 20);
+        var cs = ResolveConnectionString();
+        if (string.IsNullOrWhiteSpace(cs))
+        {
+            return UnavailableOrphanResult(UnavailableReason);
+        }
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var orphanCutoffMs = nowMs - (long)Math.Max(0, orphanAge.TotalMilliseconds);
+        var stuckCutoffMs = nowMs - (long)Math.Max(0, stuckScanningAge.TotalMilliseconds);
+        var table = TableSql();
+
+        await using var conn = new NpgsqlConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            long confirmedUnbound = 0, uploading = 0, stuck = 0;
+            long? oldestConfirmed = null, oldestUploading = null, oldestStuck = null;
+            long activeCount = 0, activeBytes = 0;
+
+            await using (var agg = new NpgsqlCommand(
+                             $"""
+                              SELECT
+                                COUNT(*) FILTER (
+                                  WHERE status = @confirmed
+                                    AND message_id IS NULL
+                                    AND created_at_ms <= @orphanCutoff) AS confirmed_unbound,
+                                MIN(created_at_ms) FILTER (
+                                  WHERE status = @confirmed
+                                    AND message_id IS NULL
+                                    AND created_at_ms <= @orphanCutoff) AS oldest_confirmed,
+                                COUNT(*) FILTER (
+                                  WHERE status IN (@ticketed, @uploaded)
+                                    AND created_at_ms <= @orphanCutoff) AS uploading,
+                                MIN(created_at_ms) FILTER (
+                                  WHERE status IN (@ticketed, @uploaded)
+                                    AND created_at_ms <= @orphanCutoff) AS oldest_uploading,
+                                COUNT(*) FILTER (
+                                  WHERE status = @scanning
+                                    AND created_at_ms <= @stuckCutoff) AS stuck_scanning,
+                                MIN(created_at_ms) FILTER (
+                                  WHERE status = @scanning
+                                    AND created_at_ms <= @stuckCutoff) AS oldest_stuck,
+                                COUNT(*) FILTER (
+                                  WHERE status IN (@confirmed, @bound)) AS active_count,
+                                COALESCE(SUM(size_bytes) FILTER (
+                                  WHERE status IN (@confirmed, @bound)), 0) AS active_bytes
+                              FROM {table}
+                              """, conn))
+            {
+                AddOrphanParams(agg, orphanCutoffMs, stuckCutoffMs);
+                await using var reader = await agg.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    confirmedUnbound = reader.GetInt64(0);
+                    oldestConfirmed = reader.IsDBNull(1) ? null : reader.GetInt64(1);
+                    uploading = reader.GetInt64(2);
+                    oldestUploading = reader.IsDBNull(3) ? null : reader.GetInt64(3);
+                    stuck = reader.GetInt64(4);
+                    oldestStuck = reader.IsDBNull(5) ? null : reader.GetInt64(5);
+                    activeCount = reader.GetInt64(6);
+                    activeBytes = reader.GetInt64(7);
+                }
+            }
+
+            var worstConfirmed = await LoadOrphanSamplesAsync(
+                    conn,
+                    table,
+                    "status = @confirmed AND message_id IS NULL AND created_at_ms <= @orphanCutoff",
+                    orphanCutoffMs,
+                    stuckCutoffMs,
+                    sampleLimit,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var worstUploading = await LoadOrphanSamplesAsync(
+                    conn,
+                    table,
+                    "status IN (@ticketed, @uploaded) AND created_at_ms <= @orphanCutoff",
+                    orphanCutoffMs,
+                    stuckCutoffMs,
+                    sampleLimit,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var worstStuck = await LoadOrphanSamplesAsync(
+                    conn,
+                    table,
+                    "status = @scanning AND created_at_ms <= @stuckCutoff",
+                    orphanCutoffMs,
+                    stuckCutoffMs,
+                    sampleLimit,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            return new AttachmentOpsOrphanQueryResult(
+                Available: true,
+                UnavailableReason: null,
+                ConfirmedUnboundPastAgeCount: confirmedUnbound,
+                AbandonedUploadingPastAgeCount: uploading,
+                StuckScanningCount: stuck,
+                OldestConfirmedUnboundAtMs: oldestConfirmed,
+                OldestUploadingAtMs: oldestUploading,
+                OldestStuckScanningAtMs: oldestStuck,
+                ActiveAttachmentCount: activeCount,
+                ActiveSizeBytesSum: activeBytes,
+                WorstConfirmedUnbound: worstConfirmed,
+                WorstUploading: worstUploading,
+                WorstStuckScanning: worstStuck);
+        }
+        catch (PostgresException ex) when (ex.SqlState is "42P01" or "42703")
+        {
+            _logger.LogDebug(ex, "attachments 表不可用，跳过 ops orphan 查询");
+            return UnavailableOrphanResult("attachments table unavailable");
+        }
+    }
+
+    private static AttachmentOpsOrphanQueryResult UnavailableOrphanResult(string reason) =>
+        new(
+            Available: false,
+            UnavailableReason: reason,
+            ConfirmedUnboundPastAgeCount: 0,
+            AbandonedUploadingPastAgeCount: 0,
+            StuckScanningCount: 0,
+            OldestConfirmedUnboundAtMs: null,
+            OldestUploadingAtMs: null,
+            OldestStuckScanningAtMs: null,
+            ActiveAttachmentCount: 0,
+            ActiveSizeBytesSum: 0,
+            WorstConfirmedUnbound: [],
+            WorstUploading: [],
+            WorstStuckScanning: []);
+
+    private static void AddOrphanParams(NpgsqlCommand cmd, long orphanCutoffMs, long stuckCutoffMs)
+    {
+        cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+        cmd.Parameters.AddWithValue("bound", (short)AttachmentStatus.Bound);
+        cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        cmd.Parameters.AddWithValue("orphanCutoff", orphanCutoffMs);
+        cmd.Parameters.AddWithValue("stuckCutoff", stuckCutoffMs);
+    }
+
+    private static async Task<IReadOnlyList<AttachmentOpsOrphanSample>> LoadOrphanSamplesAsync(
+        NpgsqlConnection conn,
+        string table,
+        string whereSql,
+        long orphanCutoffMs,
+        long stuckCutoffMs,
+        int sampleLimit,
+        CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT attachment_id, object_key, uploader_user_id, status, size_bytes, created_at_ms
+             FROM {table}
+             WHERE {whereSql}
+             ORDER BY created_at_ms ASC
+             LIMIT @limit
+             """, conn);
+        AddOrphanParams(cmd, orphanCutoffMs, stuckCutoffMs);
+        cmd.Parameters.AddWithValue("limit", sampleLimit);
+
+        var rows = new List<AttachmentOpsOrphanSample>(sampleLimit);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            rows.Add(new AttachmentOpsOrphanSample(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetInt64(2),
+                reader.GetInt16(3),
+                reader.GetInt64(4),
+                reader.GetInt64(5)));
+        }
+
+        return rows;
     }
 
     private static AttachmentRecord ReadRecord(NpgsqlDataReader reader) => new(

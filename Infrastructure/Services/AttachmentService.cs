@@ -1,10 +1,7 @@
-using System.Security.Cryptography;
 using Core.Interfaces;
 using Core.Models.Attachment;
 using Core.Models.Auth;
-using Core.Settings;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
@@ -33,6 +30,26 @@ public interface IAttachmentService
         string attachmentId,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// 签发短时下载票（须先通过鉴权）。客户端再带 ?ticket= 调用 download。
+    /// </summary>
+    Task<(AttachmentDownloadDecision Decision, AttachmentDownloadTicketResponse? Body)> IssueDownloadTicketAsync(
+        long userId,
+        string attachmentId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 带票下载：消费票并校验 userId+attachmentId，再做鉴权解析。
+    /// </summary>
+    Task<(AttachmentDownloadDecision Decision, AttachmentDownloadAccess? Access)> AuthorizeDownloadWithTicketAsync(
+        long userId,
+        string attachmentId,
+        string ticket,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>本地存储绝对路径；S3 返回 null。</summary>
+    string? TryResolveLocalPhysicalPath(string objectKey);
+
     Task<AttachmentReadResult?> OpenLocalContentAsync(
         string objectKey,
         CancellationToken cancellationToken = default);
@@ -52,8 +69,8 @@ public sealed class AttachmentService(
     IAttachmentStorage storage,
     IAttachmentMetadataStore metadata,
     IAttachmentBlobDeleteService blobDeletes,
-    IAttachmentContentScanner contentScanner,
-    IOptions<AttachmentStorageOptions> storageOptions,
+    IAttachmentScanService scanJobs,
+    IAttachmentDownloadTicketService downloadTickets,
     ILogger<AttachmentService> logger) : IAttachmentService
 {
     public async Task<AttachmentPresignResponse> PresignAsync(
@@ -162,55 +179,37 @@ public sealed class AttachmentService(
 
         var downloadPath = AttachmentApiPaths.DownloadPath(attachmentId);
 
-        // 内容扫描：魔数嗅探 → SHA-256 → 恶意软件钩子；失败 → Rejected
-        var (scanOk, sniffedType, scanError) = await ScanContentAsync(
-                objectKey, contentType, originalName, sizeBytes, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (!scanOk)
-        {
-            if (metadata.IsAvailable)
-            {
-                try
-                {
-                    await metadata.MarkRejectedAsync(attachmentId, userId, scanError, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "MarkRejected 失败 AttachmentId={Id}", attachmentId);
-                }
-            }
-
-            AuthSecurityMetrics.AttachmentScan("rejected");
-            return (AuthOperationResult.Fail("ScanRejected", scanError ?? "附件内容扫描未通过"), null);
-        }
-
-        var finalContentType = sniffedType
-                               ?? (string.IsNullOrWhiteSpace(contentType)
-                                   ? "application/octet-stream"
-                                   : contentType);
-
+        // 保持 Scanning：内容扫描改由后台作业执行（瞬时失败可退避重试）
         if (metadata.IsAvailable)
         {
             try
             {
-                await metadata.ConfirmAsync(
-                    attachmentId,
-                    userId,
-                    objectKey,
-                    publicUrl: null,
-                    contentType: finalContentType,
-                    sizeBytes: sizeBytes,
-                    originalName: originalName,
-                    cancellationToken).ConfigureAwait(false);
-                AuthSecurityMetrics.AttachmentScan("confirmed");
+                await metadata.MarkUploadedScanningAsync(
+                        attachmentId, userId, sizeBytes, sha256Hex: null, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Confirm 元数据写入失败 AttachmentId={Id}", attachmentId);
-                return (AuthOperationResult.Fail("MetadataFailed", "附件元数据确认失败"), null);
+                logger.LogWarning(ex, "Confirm 后 MarkUploadedScanning 失败 AttachmentId={Id}", attachmentId);
             }
+        }
+
+        try
+        {
+            await scanJobs.EnqueueAsync(
+                    attachmentId,
+                    userId,
+                    objectKey,
+                    contentType,
+                    originalName,
+                    sizeBytes,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "附件扫描入队失败 AttachmentId={Id}", attachmentId);
+            return (AuthOperationResult.Fail("ScanEnqueueFailed", "附件扫描入队失败"), null);
         }
 
 #pragma warning disable CS0618
@@ -219,6 +218,7 @@ public sealed class AttachmentService(
             AttachmentId = attachmentId,
             DownloadPath = downloadPath,
             ObjectKey = objectKey,
+            Status = "Scanning",
             PublicUrl = string.Empty,
         });
 #pragma warning restore CS0618
@@ -239,6 +239,48 @@ public sealed class AttachmentService(
             .ConfigureAwait(false);
         return (access.Decision, access);
     }
+
+    public async Task<(AttachmentDownloadDecision Decision, AttachmentDownloadTicketResponse? Body)> IssueDownloadTicketAsync(
+        long userId,
+        string attachmentId,
+        CancellationToken cancellationToken = default)
+    {
+        var (decision, _) = await AuthorizeDownloadAsync(userId, attachmentId, cancellationToken)
+            .ConfigureAwait(false);
+        if (decision != AttachmentDownloadDecision.Allowed)
+            return (decision, null);
+
+        var (ticket, expiresAt) = await downloadTickets.IssueAsync(userId, attachmentId, cancellationToken)
+            .ConfigureAwait(false);
+
+        return (AttachmentDownloadDecision.Allowed, new AttachmentDownloadTicketResponse
+        {
+            AttachmentId = attachmentId,
+            Ticket = ticket,
+            ExpiresAt = expiresAt,
+            DownloadUrl = AttachmentApiPaths.DownloadPathWithTicket(attachmentId, ticket),
+        });
+    }
+
+    public async Task<(AttachmentDownloadDecision Decision, AttachmentDownloadAccess? Access)> AuthorizeDownloadWithTicketAsync(
+        long userId,
+        string attachmentId,
+        string ticket,
+        CancellationToken cancellationToken = default)
+    {
+        var payload = await downloadTickets.TryConsumeAsync(ticket, cancellationToken).ConfigureAwait(false);
+        if (payload is null
+            || payload.UserId != userId
+            || !string.Equals(payload.AttachmentId, attachmentId, StringComparison.Ordinal))
+        {
+            return (AttachmentDownloadDecision.InvalidTicket, null);
+        }
+
+        return await AuthorizeDownloadAsync(userId, attachmentId, cancellationToken).ConfigureAwait(false);
+    }
+
+    public string? TryResolveLocalPhysicalPath(string objectKey)
+        => storage.TryResolveLocalPhysicalPath(objectKey);
 
     public Task<AttachmentReadResult?> OpenLocalContentAsync(
         string objectKey,
@@ -284,85 +326,5 @@ public sealed class AttachmentService(
         }
 
         return AttachmentDownloadDecision.Allowed;
-    }
-
-    private async Task<(bool Ok, string? ContentType, string? Error)> ScanContentAsync(
-        string objectKey,
-        string? claimedContentType,
-        string? originalName,
-        long claimedSize,
-        CancellationToken cancellationToken)
-    {
-        var read = await storage.OpenReadAsync(objectKey, cancellationToken).ConfigureAwait(false);
-        if (read is null)
-        {
-            // S3：本地无法打开，仅做危险扩展名拒绝
-            var s3Scan = await contentScanner.ScanAsync(
-                    Stream.Null, claimedContentType, originalName, cancellationToken)
-                .ConfigureAwait(false);
-            if (!s3Scan.Allowed)
-                return (false, null, s3Scan.Reason ?? "附件内容扫描未通过");
-
-            var type = string.IsNullOrWhiteSpace(claimedContentType)
-                ? "application/octet-stream"
-                : claimedContentType;
-            if (!storage.IsAllowedContentType(type))
-                return (false, null, "不支持的附件格式");
-            return (true, type, null);
-        }
-
-        string finalType;
-        await using (read.Content)
-        {
-            var headerBuf = new byte[16];
-            var headerLen = 0;
-            while (headerLen < headerBuf.Length)
-            {
-                var n = await read.Content.ReadAsync(
-                        headerBuf.AsMemory(headerLen, headerBuf.Length - headerLen), cancellationToken)
-                    .ConfigureAwait(false);
-                if (n == 0) break;
-                headerLen += n;
-            }
-
-            finalType = AttachmentMagicSniffer.Sniff(headerBuf.AsSpan(0, headerLen))
-                        ?? "application/octet-stream";
-            if (!storage.IsAllowedContentType(finalType))
-                return (false, null, "无法识别或不支持的附件内容类型");
-
-            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            hasher.AppendData(headerBuf, 0, headerLen);
-            var buffer = new byte[64 * 1024];
-            long total = headerLen;
-            var max = storageOptions.Value.MaxBytes;
-            while (true)
-            {
-                var n = await read.Content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                if (n == 0) break;
-                total += n;
-                if (total > max)
-                    return (false, null, "附件大小超限");
-                hasher.AppendData(buffer, 0, n);
-            }
-
-            _ = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
-            if (claimedSize > 0 && Math.Abs(total - claimedSize) > Math.Max(1024, claimedSize / 10))
-                return (false, null, "附件大小与元数据不一致");
-        }
-
-        var scanOpen = await storage.OpenReadAsync(objectKey, cancellationToken).ConfigureAwait(false);
-        if (scanOpen is null)
-            return (false, null, "附件内容不存在");
-
-        await using (scanOpen.Content)
-        {
-            var scan = await contentScanner.ScanAsync(
-                    scanOpen.Content, finalType, originalName, cancellationToken)
-                .ConfigureAwait(false);
-            if (!scan.Allowed)
-                return (false, null, scan.Reason ?? "附件内容扫描未通过");
-        }
-
-        return (true, finalType, null);
     }
 }

@@ -49,6 +49,9 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
         return result.Succeeded ? Ok(new { Message = "上传成功" }) : BadRequest(result.Errors);
     }
 
+    /// <summary>
+    /// 确认对象落盘并入队内容扫描。扫描完成前 status=Scanning，禁止 bind/download。
+    /// </summary>
     [HttpPost("confirm")]
     public async Task<IActionResult> Confirm(
         [FromBody] ConfirmAttachmentRequest model,
@@ -60,7 +63,7 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
         var (result, body) = await attachments.ConfirmAsync(userId, model, cancellationToken);
         if (!result.Succeeded)
             return BadRequest(result.Errors);
-        return Ok(body);
+        return Accepted(body);
     }
 
     [HttpPost("{attachmentId}/abandon")]
@@ -85,26 +88,67 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
     }
 
     /// <summary>
-    /// 鉴权下载。Bound：须为会话成员；Confirmed 未绑定：仅上传者。
-    /// Uploaded/Scanning：409 Conflict。Local 流式返回；S3 默认 302 到短时签名 URL。
+    /// 签发短时下载票（单次消费，TTL 见 AttachmentStorage:DownloadTicketMinutes）。
+    /// 客户端再用 GET download?ticket=... 拉取内容。Realtime downloadApiHint 仍为 attachmentId。
     /// </summary>
-    [HttpGet("{attachmentId}/download")]
-    [HttpGet("{attachmentId}/content")]
-    public async Task<IActionResult> Download(
+    [HttpPost("{attachmentId}/ticket")]
+    public async Task<IActionResult> IssueDownloadTicket(
         string attachmentId,
-        [FromQuery] string? format,
         CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var (decision, access) = await attachments.AuthorizeDownloadAsync(
+        var (decision, body) = await attachments.IssueDownloadTicketAsync(
             userId, attachmentId, cancellationToken);
 
         return decision switch
         {
             AttachmentDownloadDecision.NotFound => NotFound(new { Message = "附件不存在" }),
             AttachmentDownloadDecision.Forbidden => Forbid(),
+            AttachmentDownloadDecision.NotReady => Conflict(new
+            {
+                Message = "附件仍在扫描中，暂不可下载",
+                Code = "AttachmentNotReady",
+            }),
+            AttachmentDownloadDecision.Unavailable => StatusCode(
+                StatusCodes.Status503ServiceUnavailable,
+                new { Message = "附件元数据服务不可用" }),
+            AttachmentDownloadDecision.Allowed when body is not null => Ok(body),
+            _ => NotFound(),
+        };
+    }
+
+    /// <summary>
+    /// 鉴权下载。Bound：须为会话成员；Confirmed 未绑定：仅上传者。
+    /// Uploaded/Scanning：409 Conflict。可选 ?ticket= 短时票（须先 POST /ticket）。
+    /// Local 流式返回；S3 默认 302 到短时签名 URL。
+    /// </summary>
+    [HttpGet("{attachmentId}/download")]
+    [HttpGet("{attachmentId}/content")]
+    public async Task<IActionResult> Download(
+        string attachmentId,
+        [FromQuery] string? format,
+        [FromQuery] string? ticket,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var (decision, access) = string.IsNullOrWhiteSpace(ticket)
+            ? await attachments.AuthorizeDownloadAsync(userId, attachmentId, cancellationToken)
+            : await attachments.AuthorizeDownloadWithTicketAsync(
+                userId, attachmentId, ticket, cancellationToken);
+
+        return decision switch
+        {
+            AttachmentDownloadDecision.NotFound => NotFound(new { Message = "附件不存在" }),
+            AttachmentDownloadDecision.Forbidden => Forbid(),
+            AttachmentDownloadDecision.InvalidTicket => Unauthorized(new
+            {
+                Message = "下载票无效、过期或与用户不匹配",
+                Code = "AttachmentTicketInvalid",
+            }),
             AttachmentDownloadDecision.NotReady => Conflict(new
             {
                 Message = "附件仍在扫描中，暂不可下载",
@@ -139,14 +183,24 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
             return Redirect(signed.Url);
         }
 
+        var contentType = string.IsNullOrWhiteSpace(access.ContentType)
+            ? "application/octet-stream"
+            : access.ContentType;
+        var fileName = access.OriginalName ?? access.AttachmentId;
+
+        // 本地落盘：PhysicalFile 由宿主零拷贝发送，避免再经用户态 Stream 缓冲。
+        var physicalPath = attachments.TryResolveLocalPhysicalPath(access.ObjectKey);
+        if (physicalPath is not null)
+            return PhysicalFile(physicalPath, contentType, fileDownloadName: fileName, enableRangeProcessing: true);
+
         var read = await attachments.OpenLocalContentAsync(access.ObjectKey, cancellationToken);
         if (read is null)
             return NotFound(new { Message = "附件内容不存在" });
 
-        var contentType = string.IsNullOrWhiteSpace(access.ContentType)
+        contentType = string.IsNullOrWhiteSpace(access.ContentType)
             ? read.ContentType
             : access.ContentType;
-        var fileName = access.OriginalName ?? read.FileName ?? access.AttachmentId;
+        fileName = access.OriginalName ?? read.FileName ?? access.AttachmentId;
         return File(read.Content, contentType, fileDownloadName: fileName, enableRangeProcessing: true);
     }
 }

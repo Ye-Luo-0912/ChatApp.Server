@@ -613,6 +613,7 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             services.AddSingleton(blob);
             services.AddSingleton<ISessionStore>(sessions);
             services.AddSingleton<IRealtimeChatExportReader>(new FakeChatExportReader());
+            services.AddSingleton<IAttachmentMetadataStore>(UnavailableAttachmentMetadataStore.Instance);
             services.AddScoped(_ => postgres.CreateContext());
             return services.BuildServiceProvider().CreateScope();
         }
