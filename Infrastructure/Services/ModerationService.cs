@@ -75,7 +75,11 @@ public sealed class ModerationService(
                 evidence.ReceiverUserId,
                 SentAtUtc = evidence.SentAtUtc,
                 evidence.ContentHashSha256,
-                Body = evidence.BodyText,
+                Body = evidence.IsRecalled ? string.Empty : evidence.BodyText,
+                evidence.EditVersion,
+                evidence.EditedAtMs,
+                evidence.IsRecalled,
+                evidence.RecalledAtMs,
                 Source = "message-service",
             }), 4000);
         }

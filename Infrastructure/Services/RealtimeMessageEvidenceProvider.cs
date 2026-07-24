@@ -128,7 +128,8 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
-             SELECT message_id, sender_user_id, receiver_user_id, content, received_at_ms
+             SELECT message_id, sender_user_id, receiver_user_id, content, received_at_ms,
+                    edit_version, edited_at_ms, recalled_at_ms
              FROM "{schema}"."messages"
              WHERE message_id = @id
              LIMIT 1
@@ -140,9 +141,24 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        var body = reader.GetString(3);
+        var rowMessageId = reader.GetString(0);
+        var sender = reader.GetInt64(1);
+        var receiver = reader.GetInt64(2);
+        var rawBody = reader.GetString(3);
         var receivedAtMs = reader.GetInt64(4);
-        return ToSnapshot(reader.GetString(0), reader.GetInt64(1), reader.GetInt64(2), receivedAtMs, body);
+        var editVersion = reader.IsDBNull(5) ? 1 : reader.GetInt32(5);
+        long? editedAtMs = reader.IsDBNull(6) ? null : reader.GetInt64(6);
+        long? recalledAtMs = reader.IsDBNull(7) ? null : reader.GetInt64(7);
+        var body = recalledAtMs is > 0 ? string.Empty : rawBody;
+        return ToSnapshot(
+            rowMessageId,
+            sender,
+            receiver,
+            receivedAtMs,
+            body,
+            editVersion <= 0 ? 1 : editVersion,
+            editedAtMs,
+            recalledAtMs);
     }
 
     private async Task<MessageEvidenceSnapshot?> LoadFromBusAsync(
@@ -151,16 +167,38 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
         var msg = await _bus!.TryGetMessageByIdAsync(userId, messageId, cancellationToken)
             .ConfigureAwait(false);
         if (msg is null) return null;
-        return ToSnapshot(msg.MessageId, msg.SenderUserId, msg.ReceiverUserId, msg.ReceivedAtMs, msg.Content);
+        var recalled = msg.RecalledAtMs is > 0 ? msg.RecalledAtMs : null;
+        return ToSnapshot(
+            msg.MessageId,
+            msg.SenderUserId,
+            msg.ReceiverUserId,
+            msg.ReceivedAtMs,
+            recalled is not null ? string.Empty : msg.Content,
+            msg.EditVersion <= 0 ? 1 : msg.EditVersion,
+            msg.EditedAtMs,
+            recalled);
     }
 
     private static MessageEvidenceSnapshot ToSnapshot(
-        string messageId, long sender, long receiver, long receivedAtMs, string body)
-        => new(
+        string messageId,
+        long sender,
+        long receiver,
+        long receivedAtMs,
+        string body,
+        int editVersion = 1,
+        long? editedAtMs = null,
+        long? recalledAtMs = null)
+    {
+        var stubBody = recalledAtMs is > 0 ? string.Empty : body;
+        return new(
             messageId,
             sender,
             receiver,
             DateTimeOffset.FromUnixTimeMilliseconds(receivedAtMs),
-            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body))).ToLowerInvariant(),
-            body);
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(stubBody))).ToLowerInvariant(),
+            stubBody,
+            editVersion,
+            editedAtMs,
+            recalledAtMs);
+    }
 }

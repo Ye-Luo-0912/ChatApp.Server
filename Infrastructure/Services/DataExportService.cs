@@ -1332,16 +1332,22 @@ public sealed class DataExportWorker(
                         break;
                     }
 
+                    // 撤回 stub：正文置空；编辑/撤回字段加性导出，兼容旧客户端忽略未知字段。
+                    var exportContent = msg.IsRecalled ? string.Empty : msg.Content;
                     JsonSerializer.Serialize(writer, new
                     {
                         msg.MessageId,
                         msg.ClientMessageId,
                         msg.SenderUserId,
                         msg.ReceiverUserId,
-                        msg.Content,
+                        Content = exportContent,
                         msg.ReceivedAtMs,
                         msg.DeliveredAtMs,
                         msg.ReadAtMs,
+                        msg.EditVersion,
+                        msg.EditedAtMs,
+                        msg.IsRecalled,
+                        msg.RecalledAtMs,
                     });
 
                     // 回执写入侧流，避免在内存中缓冲全部 receipts。
@@ -1356,15 +1362,18 @@ public sealed class DataExportWorker(
                         receiptCount++;
                     }
 
-                    var skipUrlScan = attachmentUrlsCapped
-                                     || (urlScanMaxChars > 0 && msg.Content.Length > urlScanMaxChars);
-                    if (skipUrlScan && !attachmentUrlsCapped && msg.Content.Length > urlScanMaxChars)
+                    // 撤回消息无正文，跳过附件 URL 扫描。
+                    var skipUrlScan = msg.IsRecalled
+                                     || attachmentUrlsCapped
+                                     || (urlScanMaxChars > 0 && exportContent.Length > urlScanMaxChars);
+                    if (skipUrlScan && !msg.IsRecalled && !attachmentUrlsCapped
+                        && exportContent.Length > urlScanMaxChars)
                         urlScanSkippedNote = true;
 
-                    if (!attachmentUrlsCapped)
+                    if (!attachmentUrlsCapped && !msg.IsRecalled)
                     {
                         foreach (var att in ChatExportAttachmentParser.Extract(
-                                     msg.MessageId, msg.ReceivedAtMs, msg.Content,
+                                     msg.MessageId, msg.ReceivedAtMs, exportContent,
                                      urlScanMaxChars, skipUrlScan))
                         {
                             if (maxAttachmentUrls > 0 && seenAttachmentUrls.Count >= maxAttachmentUrls)

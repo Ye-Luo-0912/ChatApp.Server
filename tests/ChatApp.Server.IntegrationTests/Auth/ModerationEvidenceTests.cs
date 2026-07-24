@@ -134,6 +134,51 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         Assert.False(await db.UserReports.AnyAsync(r => r.ReporterId == reporter.Id));
     }
 
+    [SkippableFact]
+    public async Task MessageReport_RecalledEvidence_StoresStubWithoutOriginalBody()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var (reporter, sender) = await SeedPairAsync(db, "rcl");
+
+        var messageId = $"msg-{Guid.NewGuid():N}";
+        var provider = new FakeMessageEvidenceProvider(new MessageEvidenceSnapshot(
+            messageId,
+            sender.Id,
+            reporter.Id,
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            "emptyhash",
+            "SHOULD_NOT_LEAK",
+            EditVersion: 2,
+            EditedAtMs: 1_700_000_000_100,
+            RecalledAtMs: 1_700_000_000_200));
+
+        var moderation = new ModerationService(
+            db,
+            new NoopSessionStore(),
+            new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
+            provider,
+            NullLogger<ModerationService>.Instance);
+
+        var result = await moderation.ReportAsync(
+            reporter.Id,
+            UserReportTargetType.Message,
+            targetUserId: null,
+            targetMessageId: messageId,
+            reason: "abuse",
+            detail: "client");
+
+        Assert.True(result.Succeeded);
+
+        var report = await db.UserReports.AsNoTracking()
+            .SingleAsync(r => r.ReporterId == reporter.Id && r.TargetMessageId == messageId);
+        Assert.DoesNotContain("SHOULD_NOT_LEAK", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.Contains("\"IsRecalled\":true", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.Contains("EditVersion", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.Contains("RecalledAtMs", report.EvidenceSnapshot, StringComparison.Ordinal);
+    }
+
     private async Task<(ApplicationUser A, ApplicationUser B)> SeedPairAsync(UserDbContext db, string prefix)
     {
         var a = await SeedUserAsync(db, prefix + "a");

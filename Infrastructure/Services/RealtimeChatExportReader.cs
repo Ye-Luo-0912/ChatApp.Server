@@ -146,12 +146,16 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
                  history.content,
                  history.received_at_ms,
                  history.delivered_at_ms,
-                 history.read_at_ms
+                 history.read_at_ms,
+                 history.edit_version,
+                 history.edited_at_ms,
+                 history.recalled_at_ms
              FROM (
                  (
                      SELECT
                          message_id, client_message_id, sender_user_id, receiver_user_id,
-                         content, received_at_ms, delivered_at_ms, read_at_ms
+                         content, received_at_ms, delivered_at_ms, read_at_ms,
+                         edit_version, edited_at_ms, recalled_at_ms
                      FROM {table}
                      WHERE receiver_user_id = @user_id
                      ORDER BY received_at_ms DESC, message_id DESC
@@ -161,7 +165,8 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
                  (
                      SELECT
                          message_id, client_message_id, sender_user_id, receiver_user_id,
-                         content, received_at_ms, delivered_at_ms, read_at_ms
+                         content, received_at_ms, delivered_at_ms, read_at_ms,
+                         edit_version, edited_at_ms, recalled_at_ms
                      FROM {table}
                      WHERE sender_user_id = @user_id
                        AND receiver_user_id <> @user_id
@@ -185,15 +190,7 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         while (count < maxMessages
                && await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            yield return new ChatExportMessage(
-                MessageId: reader.GetString(0),
-                ClientMessageId: reader.GetString(1),
-                SenderUserId: reader.GetInt64(2),
-                ReceiverUserId: reader.GetInt64(3),
-                Content: reader.GetString(4),
-                ReceivedAtMs: reader.GetInt64(5),
-                DeliveredAtMs: reader.IsDBNull(6) ? null : reader.GetInt64(6),
-                ReadAtMs: reader.IsDBNull(7) ? null : reader.GetInt64(7));
+            yield return ReadExportMessage(reader);
             count++;
         }
     }
@@ -222,12 +219,16 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
                  history.content,
                  history.received_at_ms,
                  history.delivered_at_ms,
-                 history.read_at_ms
+                 history.read_at_ms,
+                 history.edit_version,
+                 history.edited_at_ms,
+                 history.recalled_at_ms
              FROM (
                  (
                      SELECT
                          message_id, client_message_id, sender_user_id, receiver_user_id,
-                         content, received_at_ms, delivered_at_ms, read_at_ms
+                         content, received_at_ms, delivered_at_ms, read_at_ms,
+                         edit_version, edited_at_ms, recalled_at_ms
                      FROM {table}
                      WHERE receiver_user_id = @user_id
                        AND (
@@ -245,7 +246,8 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
                  (
                      SELECT
                          message_id, client_message_id, sender_user_id, receiver_user_id,
-                         content, received_at_ms, delivered_at_ms, read_at_ms
+                         content, received_at_ms, delivered_at_ms, read_at_ms,
+                         edit_version, edited_at_ms, recalled_at_ms
                      FROM {table}
                      WHERE sender_user_id = @user_id
                        AND receiver_user_id <> @user_id
@@ -276,17 +278,7 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         var items = new List<ChatExportMessage>(fetch);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            items.Add(new ChatExportMessage(
-                MessageId: reader.GetString(0),
-                ClientMessageId: reader.GetString(1),
-                SenderUserId: reader.GetInt64(2),
-                ReceiverUserId: reader.GetInt64(3),
-                Content: reader.GetString(4),
-                ReceivedAtMs: reader.GetInt64(5),
-                DeliveredAtMs: reader.IsDBNull(6) ? null : reader.GetInt64(6),
-                ReadAtMs: reader.IsDBNull(7) ? null : reader.GetInt64(7)));
-        }
+            items.Add(ReadExportMessage(reader));
 
         var hasMore = items.Count > take;
         if (hasMore)
@@ -333,21 +325,61 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
                 $"Realtime 历史查询失败: {page.ErrorCode ?? "unknown"}");
         }
 
-        var items = page.Items.Select(m => new ChatExportMessage(
-            m.MessageId,
-            m.ClientMessageId,
-            m.SenderUserId,
-            m.ReceiverUserId,
-            m.Content,
-            m.ReceivedAtMs,
-            m.DeliveredAtMs,
-            m.ReadAtMs)).ToList();
+        var items = page.Items.Select(FromHistoryMessage).ToList();
 
         return new ChatExportPage(
             items,
             page.HasMore,
             page.NextCursor?.ReceivedAtMs,
             page.NextCursor?.MessageId);
+    }
+
+    /// <summary>
+    /// ordinals: 0 message_id … 7 read_at_ms, 8 edit_version, 9 edited_at_ms, 10 recalled_at_ms.
+    /// Must read in ascending ordinal order (SequentialAccess-safe).
+    /// </summary>
+    private static ChatExportMessage ReadExportMessage(NpgsqlDataReader reader)
+    {
+        var messageId = reader.GetString(0);
+        var clientMessageId = reader.GetString(1);
+        var senderUserId = reader.GetInt64(2);
+        var receiverUserId = reader.GetInt64(3);
+        var rawContent = reader.GetString(4);
+        var receivedAtMs = reader.GetInt64(5);
+        long? deliveredAtMs = reader.IsDBNull(6) ? null : reader.GetInt64(6);
+        long? readAtMs = reader.IsDBNull(7) ? null : reader.GetInt64(7);
+        var editVersion = reader.IsDBNull(8) ? 1 : reader.GetInt32(8);
+        long? editedAtMs = reader.IsDBNull(9) ? null : reader.GetInt64(9);
+        long? recalledAtMs = reader.IsDBNull(10) ? null : reader.GetInt64(10);
+        return new ChatExportMessage(
+            MessageId: messageId,
+            ClientMessageId: clientMessageId,
+            SenderUserId: senderUserId,
+            ReceiverUserId: receiverUserId,
+            Content: recalledAtMs is > 0 ? string.Empty : rawContent,
+            ReceivedAtMs: receivedAtMs,
+            DeliveredAtMs: deliveredAtMs,
+            ReadAtMs: readAtMs,
+            EditVersion: editVersion <= 0 ? 1 : editVersion,
+            EditedAtMs: editedAtMs,
+            RecalledAtMs: recalledAtMs);
+    }
+
+    private static ChatExportMessage FromHistoryMessage(RealtimeHistoryMessage m)
+    {
+        var recalled = m.RecalledAtMs is > 0 ? m.RecalledAtMs : null;
+        return new ChatExportMessage(
+            m.MessageId,
+            m.ClientMessageId,
+            m.SenderUserId,
+            m.ReceiverUserId,
+            recalled is not null ? string.Empty : m.Content,
+            m.ReceivedAtMs,
+            m.DeliveredAtMs,
+            m.ReadAtMs,
+            m.EditVersion <= 0 ? 1 : m.EditVersion,
+            m.EditedAtMs,
+            recalled);
     }
 }
 

@@ -21,4 +21,14 @@ public sealed record MessageEvidenceSnapshot(
     long ReceiverUserId,
     DateTimeOffset SentAtUtc,
     string ContentHashSha256,
-    string BodyText);
+    string BodyText,
+    /// <summary>内容版本，从 1 起；每次成功编辑 +1。</summary>
+    int EditVersion = 1,
+    /// <summary>最近一次成功编辑时间（Unix ms）；未编辑为 null。</summary>
+    long? EditedAtMs = null,
+    /// <summary>撤回时间（Unix ms）；非空表示已撤回，BodyText 应为空 stub。</summary>
+    long? RecalledAtMs = null)
+{
+    /// <summary>是否已撤回（软撤回 stub）。</summary>
+    public bool IsRecalled => RecalledAtMs is > 0;
+}
