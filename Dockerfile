@@ -6,6 +6,7 @@ COPY ChatApp.Server/ChatApp.Server.csproj ChatApp.Server/
 COPY ChatApp.Server/Core/Core.csproj ChatApp.Server/Core/
 COPY ChatApp.Server/Infrastructure/Infrastructure.csproj ChatApp.Server/Infrastructure/
 COPY ChatApp.Server/Directory.Build.props ChatApp.Server/
+COPY ChatApp.Server/Directory.Packages.props ChatApp.Server/
 COPY ChatApp.RealtimeServices/ChatApp.Realtime.Abstractions/ChatApp.Realtime.Abstractions.csproj ChatApp.RealtimeServices/ChatApp.Realtime.Abstractions/
 COPY ChatApp.RealtimeServices/ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj ChatApp.RealtimeServices/ChatApp.Realtime.Integration/
 RUN dotnet restore ChatApp.Server/ChatApp.Server.csproj
