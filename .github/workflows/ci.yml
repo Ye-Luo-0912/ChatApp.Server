@@ -124,6 +124,10 @@ jobs:
           JwtSettings__Secret=ci-compose-secret-please-change-32chars
           JwtSettings__Issuer=ChatApp
           JwtSettings__Audience=ChatApp
+          Security__SecretEncryptionKey=ci-compose-encryption-key-32-chars!!
+          EmailSettings__Host=localhost
+          EmailSettings__SenderEmail=noreply@localhost
+          EmailSettings__Password=dummy
           CHATAPP_PROXY_PORT=18080
           EOF
           docker compose -f docker-compose.yaml up -d --build
