@@ -1,17 +1,12 @@
-﻿using System.Net;
-using Core.Interfaces;
-using ChatApp.Realtime.Integration.DependencyInjection;
+using System.Net;
+using ChatApp.Server.Extensions;
 using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
 
 using Core.Settings;
-using Infrastructure.Auth;
-using Infrastructure.Data.Configurations;
 using Infrastructure.Extensions;
 using Infrastructure.Serialization;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.HttpOverrides;
-using Infrastructure.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using NLog.Extensions.Logging;
@@ -48,68 +43,23 @@ public abstract partial class Program
         ConfigureForwardedHeaders(builder);
 
         var config = builder.Configuration;
-        var jwtSettings = config.GetSection("JwtSettings");
-        var emailSettings = config.GetSection("EmailSettings");
 
         var service = builder.Services.AddRedisCacheServices(config);
 
-        service.AddUserDbContext(config)
-            .AddCoreServiceCollection();
+        service.AddUserDbContext(config);
 
-        service.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
-        service.Configure<AttachmentStorageOptions>(config.GetSection(AttachmentStorageOptions.SectionName));
-        service.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
-        service.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
-        service.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
-        service.Configure<TrustedDeviceOptions>(config.GetSection(TrustedDeviceOptions.SectionName));
-        service.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
-        service.Configure<DataExportStorageOptions>(config.GetSection(DataExportStorageOptions.SectionName));
-        service.Configure<AccountCleanupSagaOptions>(config.GetSection(AccountCleanupSagaOptions.SectionName));
-
-        TryAddRealtimeIntegration(service, config);
-
-        service.Configure<JwtSettings>(jwtSettings)
-            .AddOptions<JwtSettings>()
-            .Validate(s => !string.IsNullOrWhiteSpace(s.Issuer), "JwtSettings:Issuer 必填")
-            .Validate(s => !string.IsNullOrWhiteSpace(s.Audience), "JwtSettings:Audience 必填")
-            .Validate(s => s.AccessTokenExpirationMinutes > 0, "JwtSettings:AccessTokenExpirationMinutes 必须 > 0")
-            .ValidateOnStart();
-
-        service.AddOptions<SecurityOptions>()
-            .Bind(config.GetSection(SecurityOptions.SectionName))
-            .Validate<IHostEnvironment>(
-                (options, environment) =>
-                    environment.IsDevelopment()
-                    || environment.IsEnvironment("Testing")
-                    || !string.IsNullOrWhiteSpace(options.SecretEncryptionKey),
-                "生产环境必须配置 Security:SecretEncryptionKey")
-            .Validate(s => s.KeyVersion > 0, "Security:KeyVersion 必须 > 0")
-            .ValidateOnStart();
-
-        service.Configure<RealtimeGatewayOptions>(config.GetSection(RealtimeGatewayOptions.SectionName))
-            .AddOptions<RealtimeGatewayOptions>()
-            .Validate(s => !string.IsNullOrWhiteSpace(s.Host), "RealtimeGateway:Host 必填")
-            .Validate(s => s.Port > 0, "RealtimeGateway:Port 必须 > 0")
-            .ValidateOnStart();
-
-        service.Configure<EmailConfig>(emailSettings)
-            .AddOptions<EmailConfig>()
-            .Validate<IHostEnvironment>(
-                (options, environment) =>
-                    environment.IsDevelopment()
-                    || environment.IsEnvironment("Testing")
-                    || (!string.IsNullOrWhiteSpace(options.Host)
-                        && !string.IsNullOrWhiteSpace(options.SenderEmail)
-                        && !string.IsNullOrWhiteSpace(options.Password)),
-                "生产环境必须完整配置 EmailSettings:Host、SenderEmail、Password")
-            .Validate(s => s.Port is > 0 and <= 65535, "EmailSettings:Port 必须在 1-65535 之间")
-            .ValidateOnStart();
-
-        service.AddOptions<ForwardedHeadersSettings>()
-            .Bind(config.GetSection(ForwardedHeadersSettings.SectionName))
-            .Validate(s => s.KnownProxies.Length > 0 || s.KnownNetworks.Length > 0,
-                "ForwardedHeaders 必须配置 KnownProxies 或 KnownNetworks")
-            .ValidateOnStart();
+        // 组合根：按模块拆分的服务注册与配置绑定。
+        // 各模块位于 Infrastructure.Extensions（业务/基础设施层）
+        // 与 ChatApp.Server.Extensions（API 层，引用宿主独占类型）。
+        service.AddIdentityModule(config);
+        service.AddFriendshipModule();
+        service.AddAttachmentModule(config);
+        service.AddNotificationModule(config);
+        service.AddModerationModule(config);
+        service.AddAccountLifecycleModule(config);
+        service.AddRealtimeIntegrationModule(config);
+        service.AddObservability(config);
+        service.AddApiPolicies(config);
 
         // 连接串校验推迟到宿主启动（ValidateOnStart），确保 Testing 下 WebApplicationFactory
         // 的 ConfigureAppConfiguration 覆盖已生效。
@@ -122,49 +72,6 @@ public abstract partial class Program
             .Validate(g => !string.IsNullOrWhiteSpace(g.DefaultConnection), "缺少 ConnectionStrings:DefaultConnection")
             .Validate(g => !string.IsNullOrWhiteSpace(g.Garnet), "缺少 ConnectionStrings:Garnet")
             .ValidateOnStart();
-
-        service.AddAuthentication("Bearer")
-            .AddScheme<AuthenticationSchemeOptions, OpaqueTokenAuthHandler>("Bearer", _ => { });
-
-        builder.Services.AddCors(options =>
-        {
-            options.AddPolicy("AllowSpecific", policy =>
-            {
-                policy.WithOrigins(builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [])
-                    .AllowAnyMethod()
-                    .AllowAnyHeader()
-                    .AllowCredentials();
-            });
-        });
-
-        builder.Services.AddRequestTimeouts(options =>
-        {
-            options.DefaultPolicy = new Microsoft.AspNetCore.Http.Timeouts.RequestTimeoutPolicy
-            {
-                Timeout = TimeSpan.FromSeconds(15),
-            };
-            options.AddPolicy("auth", TimeSpan.FromSeconds(20));
-            options.AddPolicy("email", TimeSpan.FromSeconds(10));
-            // 大附件上传需要更长超时；端点级标注，不影响普通 API。
-            options.AddPolicy("attachment-upload", TimeSpan.FromMinutes(2));
-        });
-
-        // P0-6：单例分布式限流器 + 策略提供者（不再为每个分区键创建本地 RateLimiter 对象）。
-        builder.Services.Configure<RateLimitingOptions>(config.GetSection(RateLimitingOptions.SectionName));
-        builder.Services.AddSingleton<IDistributedRateLimiter, RedisDistributedRateLimiter>();
-        builder.Services.AddSingleton<IRateLimitPolicyProvider, RateLimitPolicyProvider>();
-
-        var healthChecks = builder.Services.AddHealthChecks()
-            .AddRedis(
-                sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("Garnet")
-                      ?? throw new InvalidOperationException("缺少 ConnectionStrings:Garnet"),
-                name: "garnet",
-                tags: ["ready"])
-            .AddNpgSql(
-                sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("DefaultConnection")
-                      ?? throw new InvalidOperationException("缺少 ConnectionStrings:DefaultConnection"),
-                name: "postgres",
-                tags: ["ready"]);
 
         ConfigureOpenTelemetry(builder);
 
@@ -350,30 +257,6 @@ public abstract partial class Program
                 if (!string.IsNullOrWhiteSpace(otlpEndpoint))
                     m.AddOtlpExporter();
             });
-    }
-
-    private static void TryAddRealtimeIntegration(IServiceCollection services, IConfiguration config)
-    {
-        var section = config.GetSection(RealtimeIntegrationHostOptions.SectionName);
-        var hostOpts = section.Get<RealtimeIntegrationHostOptions>() ?? new RealtimeIntegrationHostOptions();
-        if (string.IsNullOrWhiteSpace(hostOpts.Url))
-            return;
-
-        services.AddChatAppRealtimeIntegration(new ChatApp.Realtime.Integration.Configuration.RealtimeIntegrationOptions
-        {
-            Url = hostOpts.Url,
-            ClientName = string.IsNullOrWhiteSpace(hostOpts.ClientName) ? "chatapp-server" : hostOpts.ClientName,
-            InstanceId = string.IsNullOrWhiteSpace(hostOpts.InstanceId)
-                ? Environment.MachineName
-                : hostOpts.InstanceId,
-            AccountCleanupSubject = hostOpts.AccountCleanupSubject,
-            AccountCleanupConsumerName = hostOpts.AccountCleanupConsumerName,
-            RealtimeEventsSubject = hostOpts.RealtimeEventsSubject,
-            RealtimeEventsStream = hostOpts.RealtimeEventsStream,
-            DeadLettersSubject = hostOpts.DeadLettersSubject,
-            DeadLettersStream = hostOpts.DeadLettersStream,
-            ManageStreams = false,
-        });
     }
 
     /// <summary>仅用于启动时校验连接串已配置（读取发生在宿主启动，晚于测试配置注入）。</summary>

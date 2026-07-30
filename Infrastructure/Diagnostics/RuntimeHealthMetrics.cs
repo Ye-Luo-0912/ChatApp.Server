@@ -5,20 +5,25 @@ using StackExchange.Redis;
 
 namespace Infrastructure.Diagnostics;
 
-/// <summary>进程内存、GC 与 Redis PING 延迟指标。</summary>
+/// <summary>进程内存、GC、Redis PING 延迟与后台 Worker 并发指标。</summary>
 public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
 {
     private static readonly Meter Meter = new("Infrastructure.Runtime");
     private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<RuntimeHealthMetrics> _logger;
+    private readonly WorkerConcurrencyManager _concurrencyManager;
     private readonly ObservableGauge<long> _workingSet;
     private readonly ObservableGauge<long> _gcHeap;
     private readonly Histogram<double> _redisPingMs;
     private Timer? _timer;
 
-    public RuntimeHealthMetrics(IConnectionMultiplexer redis, ILogger<RuntimeHealthMetrics> logger)
+    public RuntimeHealthMetrics(
+        IConnectionMultiplexer redis,
+        WorkerConcurrencyManager concurrencyManager,
+        ILogger<RuntimeHealthMetrics> logger)
     {
         _redis = redis;
+        _concurrencyManager = concurrencyManager;
         _logger = logger;
         _workingSet = Meter.CreateObservableGauge(
             "process.memory.working_set",
@@ -45,6 +50,16 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
             () => GC.CollectionCount(2),
             "{collections}",
             "Gen2 GC 次数");
+        _ = Meter.CreateObservableGauge(
+            "worker.concurrency.avg_wait_ms",
+            () => _concurrencyManager.AverageWaitTime.TotalMilliseconds,
+            "ms",
+            "后台 Worker 平均等待获取并发槽的时间");
+        _ = Meter.CreateObservableGauge(
+            "worker.oldest_job_age_ms",
+            () => _concurrencyManager.OldestPendingJobAge.TotalMilliseconds,
+            "ms",
+            "最老待处理任务的年龄");
         _redisPingMs = Meter.CreateHistogram<double>("redis.ping.duration", "ms", "Redis PING 延迟");
         // 保留引用，避免被优化掉
         _ = _workingSet;

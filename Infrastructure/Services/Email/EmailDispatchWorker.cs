@@ -1,7 +1,10 @@
 using Core.Models.Email;
+using Core.Settings;
+using Infrastructure.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services.Email;
 
@@ -11,10 +14,12 @@ namespace Infrastructure.Services.Email;
 public sealed class EmailDispatchWorker(
     IServiceScopeFactory scopeFactory,
     SmtpEmailSender smtp,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
+    WorkerConcurrencyManager concurrencyManager,
     EmailOutboxMetrics metrics,
     ILogger<EmailDispatchWorker> logger) : BackgroundService
 {
-    private const int MaxConcurrency = 4;
+    private const string WorkerName = "email";
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan SentRetention = TimeSpan.FromDays(14);
 
@@ -26,7 +31,7 @@ public sealed class EmailDispatchWorker(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var semaphore = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
+        var workerConcurrency = Math.Max(1, workerConcurrencyOptions.Value.EmailDispatch);
         var inFlight = new List<Task>();
         var lastCleanup = DateTime.UtcNow;
 
@@ -46,8 +51,9 @@ public sealed class EmailDispatchWorker(
 
                 foreach (var item in claimed)
                 {
-                    await semaphore.WaitAsync(stoppingToken).ConfigureAwait(false);
-                    inFlight.Add(ProcessItemAsync(item, semaphore, stoppingToken));
+                    var concurrencyScope = await concurrencyManager.AcquireAsync(
+                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
+                    inFlight.Add(ProcessItemAsync(item, concurrencyScope, stoppingToken));
                 }
 
                 inFlight.RemoveAll(static task => task.IsCompleted);
@@ -75,7 +81,7 @@ public sealed class EmailDispatchWorker(
     }
 
     private async Task ProcessItemAsync(
-        EmailOutboxItem item, SemaphoreSlim semaphore, CancellationToken cancellationToken)
+        EmailOutboxItem item, IAsyncDisposable concurrencyScope, CancellationToken cancellationToken)
     {
         try
         {
@@ -83,7 +89,7 @@ public sealed class EmailDispatchWorker(
         }
         finally
         {
-            semaphore.Release();
+            await concurrencyScope.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

@@ -3,6 +3,7 @@ using Core.Models.Notifications;
 using Core.Models.Security;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -45,6 +46,16 @@ public sealed class NotificationOutboxDispatcher(
                 x => (x.Status == NotificationOutboxStatus.Pending || x.Status == NotificationOutboxStatus.Failed)
                      && x.NextAttemptAt <= now,
                 cancellationToken);
+    }
+
+    /// <summary>返回当前积压中最老任务的创建时间（oldest-job-age 指标来源）。无积压返回 null。</summary>
+    public async Task<DateTimeOffset?> GetOldestPendingJobCreatedAtAsync(CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return await db.NotificationOutbox.AsNoTracking()
+            .Where(x => (x.Status == NotificationOutboxStatus.Pending || x.Status == NotificationOutboxStatus.Failed)
+                        && x.NextAttemptAt <= now)
+            .MinAsync(x => (DateTimeOffset?)x.CreatedAt, cancellationToken);
     }
 
     public async Task<IReadOnlyList<NotificationOutboxItem>> ClaimDueItemsAsync(
@@ -277,20 +288,23 @@ public sealed class NotificationOutboxDispatcher(
 public sealed class NotificationDispatchWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<NotificationOutboxOptions> options,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
+    WorkerConcurrencyManager concurrencyManager,
     NotificationOutboxMetrics metrics,
     ILogger<NotificationDispatchWorker> logger) : BackgroundService
 {
+    private const string WorkerName = "notification";
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var opts = options.Value;
-        var concurrency = Math.Max(1, opts.MaxConcurrency);
+        var workerConcurrency = Math.Max(1, workerConcurrencyOptions.Value.NotificationDispatch);
         // 不预领超过当前可处理并发的任务，避免排队项在内存中耗尽数据库租约。
-        var batchSize = Math.Min(Math.Max(1, opts.BatchSize), concurrency);
+        var batchSize = Math.Min(Math.Max(1, opts.BatchSize), workerConcurrency);
         var poll = TimeSpan.FromSeconds(Math.Max(1, opts.PollIntervalSeconds));
         var backlogEvery = TimeSpan.FromSeconds(Math.Max(5, opts.BacklogSampleSeconds));
         var lastBacklogSample = DateTimeOffset.MinValue;
 
-        using var semaphore = new SemaphoreSlim(concurrency, concurrency);
         var inFlight = new List<Task>();
 
         while (!stoppingToken.IsCancellationRequested)
@@ -306,6 +320,8 @@ public sealed class NotificationDispatchWorker(
                 if (DateTimeOffset.UtcNow - lastBacklogSample >= backlogEvery)
                 {
                     metrics.SetBacklog(await dispatcher.CountBacklogAsync(stoppingToken));
+                    concurrencyManager.RecordOldestPendingJob(
+                        await dispatcher.GetOldestPendingJobCreatedAtAsync(stoppingToken));
                     lastBacklogSample = DateTimeOffset.UtcNow;
                 }
 
@@ -317,8 +333,9 @@ public sealed class NotificationDispatchWorker(
 
                     foreach (var item in items)
                     {
-                        await semaphore.WaitAsync(stoppingToken);
-                        inFlight.Add(ProcessOneAsync(item, semaphore, stoppingToken));
+                        var concurrencyScope = await concurrencyManager.AcquireAsync(
+                            WorkerName, workerConcurrency, stoppingToken);
+                        inFlight.Add(ProcessOneAsync(item, concurrencyScope, stoppingToken));
                     }
 
                     inFlight.RemoveAll(static t => t.IsCompleted);
@@ -347,7 +364,7 @@ public sealed class NotificationDispatchWorker(
     }
 
     private async Task ProcessOneAsync(
-        NotificationOutboxItem item, SemaphoreSlim semaphore, CancellationToken cancellationToken)
+        NotificationOutboxItem item, IAsyncDisposable concurrencyScope, CancellationToken cancellationToken)
     {
         try
         {
@@ -359,7 +376,7 @@ public sealed class NotificationDispatchWorker(
         }
         finally
         {
-            semaphore.Release();
+            await concurrencyScope.DisposeAsync();
         }
     }
 }

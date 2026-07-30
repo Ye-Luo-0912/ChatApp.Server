@@ -11,4 +11,18 @@ public class JwtSettings
     public byte RefreshTokenLength { get; init; } = 32;
 
     public int RefreshTokenExpirationDays { get; set; } = 3;
+
+    // ── L1 访问令牌缓存（减少认证热路径的 Redis 往返） ──
+
+    /// <summary>L1 内存缓存是否启用（默认启用）。</summary>
+    public bool TokenL1CacheEnabled { get; init; } = true;
+
+    /// <summary>L1 缓存最大条目数。超过时按 LRU 淘汰。</summary>
+    public int TokenL1CacheMaxEntries { get; init; } = 10_000;
+
+    /// <summary>L1 正缓存 TTL 上限（秒）。实际 TTL = min(此值, 令牌剩余寿命)。</summary>
+    public int TokenL1CacheTtlSeconds { get; init; } = 5;
+
+    /// <summary>L1 负缓存 TTL（毫秒），防止无效令牌频繁击穿到 Redis。</summary>
+    public int TokenL1CacheNegativeTtlMs { get; init; } = 200;
 }

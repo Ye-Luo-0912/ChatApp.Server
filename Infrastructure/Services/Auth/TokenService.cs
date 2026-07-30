@@ -7,6 +7,7 @@ using Core.Interfaces.Cache;
 using Core.Models.Identity;
 using Core.Models.Token;
 using Core.Settings;
+using Infrastructure.Auth;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -44,6 +45,17 @@ public sealed class TokenService(
 
     private readonly JwtSettings _settings = options.Value;
 
+    /// <summary>
+    /// L1 内存缓存：减少认证热路径的 Redis 往返。
+    /// TTL = min(5s, 令牌剩余寿命)；负缓存 200ms；撤销时主动驱逐。
+    /// </summary>
+    private readonly AccessTokenL1Cache? _l1Cache = options.Value.TokenL1CacheEnabled
+        ? new AccessTokenL1Cache(
+            options.Value.TokenL1CacheMaxEntries,
+            options.Value.TokenL1CacheTtlSeconds,
+            options.Value.TokenL1CacheNegativeTtlMs)
+        : null;
+
     // ─────────────────────────────────────────────────────────────────────────
     // ITokenGenerator
     // ─────────────────────────────────────────────────────────────────────────
@@ -65,21 +77,56 @@ public sealed class TokenService(
 
     /// <summary>
     /// 将访问令牌元数据写入 Redis，键为 AT:{SHA-256(token)}，防止原始令牌暴露在日志中。
+    /// 同时填充 L1 缓存，使后续认证请求无需访问 Redis。
     /// </summary>
     public Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default)
-        => values.SetAsync(AccessTokenKey(token), data, expiry, cancellationToken);
+    {
+        var key = AccessTokenKey(token);
+        if (_l1Cache is not null && !data.IsExpired)
+            _l1Cache.SetPositive(key, data);
+        return values.SetAsync(key, data, expiry, cancellationToken);
+    }
 
     /// <summary>
     /// 查询访问令牌对应的元数据，不存在则返回 <see langword="null"/>。
+    /// 优先查 L1 内存缓存，未命中再查 Redis 并回填 L1。
     /// </summary>
-    public Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default)
-        => values.GetAsync<AccessTokenData>(AccessTokenKey(token), cancellationToken);
+    public async Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default)
+    {
+        var key = AccessTokenKey(token);
+
+        // L1 检查：正缓存命中 → 返回数据；负缓存命中 → 返回 null
+        if (_l1Cache is not null)
+        {
+            var (found, data) = _l1Cache.TryGet(key);
+            if (found)
+                return data;
+        }
+
+        var redisData = await values.GetAsync<AccessTokenData>(key, cancellationToken).ConfigureAwait(false);
+
+        // 回填 L1
+        if (_l1Cache is not null)
+        {
+            if (redisData is not null && !redisData.IsExpired)
+                _l1Cache.SetPositive(key, redisData);
+            else if (redisData is null)
+                _l1Cache.SetNegative(key);
+        }
+
+        return redisData;
+    }
 
     /// <summary>
     /// 从 Redis 中删除访问令牌（主动登出或安全事件触发的强制下线）。
+    /// 同时驱逐 L1 缓存中的对应条目。
     /// </summary>
     public Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default)
-        => values.RemoveAsync(AccessTokenKey(token), cancellationToken);
+    {
+        var key = AccessTokenKey(token);
+        _l1Cache?.Evict(key);
+        return values.RemoveAsync(key, cancellationToken);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // IRefreshTokenStore
@@ -527,7 +574,11 @@ public sealed class TokenService(
             sets.SetRemoveAsync(UserDeviceIndexKey(userId), deviceId, cancellationToken),
         };
 
-        if (session?.CurrentAccessTokenKey  is not null) tasks.Add(values.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
+        if (session?.CurrentAccessTokenKey  is not null)
+        {
+            _l1Cache?.Evict(session.CurrentAccessTokenKey);
+            tasks.Add(values.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
+        }
         if (session?.CurrentRefreshTokenKey is not null) tasks.Add(values.RemoveAsync(session.CurrentRefreshTokenKey, cancellationToken));
 
         await Task.WhenAll(tasks);

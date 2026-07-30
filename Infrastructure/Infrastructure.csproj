@@ -15,24 +15,24 @@
     </ItemGroup>
 
     <ItemGroup>
-      <PackageReference Include="AWSSDK.S3" Version="3.7.405.1" />
-      <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
-      <PackageReference Include="MailKit" Version="4.16.0" />
-      <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.5">
+      <PackageReference Include="AWSSDK.S3" />
+      <PackageReference Include="BCrypt.Net-Next" />
+      <PackageReference Include="MailKit" />
+      <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
         <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         <PrivateAssets>all</PrivateAssets>
       </PackageReference>
-      <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="10.0.5">
+      <PackageReference Include="Microsoft.EntityFrameworkCore.Tools">
         <PrivateAssets>all</PrivateAssets>
         <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       </PackageReference>
-      <PackageReference Include="NLog.Extensions.Logging" Version="6.1.2" />
-      <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
-      <PackageReference Include="Otp.NET" Version="1.4.0" />
-      <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
-      <PackageReference Include="StackExchange.Redis" Version="2.12.4" />
-      <PackageReference Include="TSID.Creator.NET" Version="1.0.0" />
-      <PackageReference Include="UAParser.Core" Version="4.0.4" />
+      <PackageReference Include="NLog.Extensions.Logging" />
+      <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+      <PackageReference Include="Otp.NET" />
+      <PackageReference Include="SixLabors.ImageSharp" />
+      <PackageReference Include="StackExchange.Redis" />
+      <PackageReference Include="TSID.Creator.NET" />
+      <PackageReference Include="UAParser.Core" />
     </ItemGroup>
 
     <ItemGroup>

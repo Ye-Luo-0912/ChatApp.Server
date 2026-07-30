@@ -7,8 +7,7 @@ public sealed class NotificationOutboxOptions
     /// <summary>每轮领取条数。</summary>
     public int BatchSize { get; set; } = 20;
 
-    /// <summary>有界并发处理数。</summary>
-    public int MaxConcurrency { get; set; } = 4;
+    // 并发已统一到 WorkerConcurrencyOptions（全局预算 + 每类 Worker 独立配置）。
 
     /// <summary>空闲轮询间隔（秒）。</summary>
     public int PollIntervalSeconds { get; set; } = 5;

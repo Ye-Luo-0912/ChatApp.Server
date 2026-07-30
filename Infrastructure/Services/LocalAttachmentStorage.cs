@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Buffers;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Settings;
@@ -105,29 +106,36 @@ public sealed class LocalAttachmentStorage(
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
                 using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                var buffer = new byte[64 * 1024];
-                while (true)
+                var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+                try
                 {
-                    var read = await content.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
-                        .ConfigureAwait(false);
-                    if (read == 0)
-                        break;
-
-                    written += read;
-                    if (written > MaxBytes)
+                    while (true)
                     {
-                        oversized = true;
-                        break;
+                        var read = await content.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                            .ConfigureAwait(false);
+                        if (read == 0)
+                            break;
+
+                        written += read;
+                        if (written > MaxBytes)
+                        {
+                            oversized = true;
+                            break;
+                        }
+
+                        hasher.AppendData(buffer, 0, read);
+                        await fs.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
                     }
 
-                    hasher.AppendData(buffer, 0, read);
-                    await fs.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    if (!oversized)
+                    {
+                        await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        shaHex = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+                    }
                 }
-
-                if (!oversized)
+                finally
                 {
-                    await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
-                    shaHex = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
 
