@@ -115,6 +115,10 @@ jobs:
           JwtSettings__Issuer: ChatApp
           JwtSettings__Audience: ChatApp
           JwtSettings__Secret: ci-test-secret-please-change-32chars
+          Security__SecretEncryptionKey: ci-test-secret-encryption-key-32-chars!!
+          EmailSettings__Host: localhost
+          EmailSettings__SenderEmail: noreply@localhost
+          EmailSettings__Password: dummy
           ForwardedHeaders__KnownProxies__0: 127.0.0.1
           ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
         run: |
