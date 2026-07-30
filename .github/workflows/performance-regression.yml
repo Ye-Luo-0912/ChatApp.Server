@@ -46,17 +46,6 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      garnet:
-        image: ghcr.io/microsoft/garnet:1.0.84
-        options: >-
-          --user 0:0
-          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/6379'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-        ports:
-          - 6379:6379
-
     steps:
       - name: Checkout Server
         uses: actions/checkout@v4
@@ -90,6 +79,21 @@ jobs:
         uses: grafana/k6-action@v0.3.1
         with:
           k6-version: "0.54.0"
+
+      - name: Start Garnet with Lua scripting
+        run: |
+          docker run -d --name garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 \
+            --bind 0.0.0.0 --port 6379 --lua
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              echo "Garnet ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Garnet failed to start"
+          exit 1
 
       - name: Release build
         working-directory: ChatApp.Server
