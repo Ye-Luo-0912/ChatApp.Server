@@ -11,7 +11,6 @@ jobs:
     env:
       CI: "true"
       CHATAPP_TEST_GARNET: "127.0.0.1:6379,abortConnect=false"
-      CHATAPP_TEST_GARNET_DOCKER_RESTART: "1"
       CHATAPP_TEST_POSTGRES: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres"
       ConnectionStrings__DefaultConnection: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres"
       ConnectionStrings__Garnet: "127.0.0.1:6379,abortConnect=false"
@@ -74,7 +73,7 @@ jobs:
           docker rm -f chatapp_garnet || true
           docker run -d --name chatapp_garnet -p 6379:6379 \
             redis:7.2 \
-            redis-server --bind 0.0.0.0 --port 6379 --save "" --appendonly no
+            redis-server --bind 0.0.0.0 --port 6379 --appendonly yes
           sleep 2
           docker exec chatapp_garnet redis-cli PING
 

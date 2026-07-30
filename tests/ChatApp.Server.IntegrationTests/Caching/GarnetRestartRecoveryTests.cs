@@ -66,12 +66,11 @@ public sealed class GarnetRestartRecoveryTests
     {
         var inCi = IsContinuousIntegration();
         Skip.If(
-            !inCi
-            && !string.Equals(
+            !string.Equals(
                 Environment.GetEnvironmentVariable("CHATAPP_TEST_GARNET_DOCKER_RESTART"),
                 "1",
                 StringComparison.Ordinal),
-            "Set CHATAPP_TEST_GARNET_DOCKER_RESTART=1 (CI runs this automatically).");
+            "Set CHATAPP_TEST_GARNET_DOCKER_RESTART=1 to run this test (disrupts shared container, opt-in only).");
 
         var key = $"it:garnet:restart:{Guid.NewGuid():N}";
         const string expected = "persist-after-container-restart";
