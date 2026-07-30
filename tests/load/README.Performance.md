@@ -84,6 +84,43 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 
 ## 推荐场景
 
+### 两层性能门禁
+
+| 门禁 | workflow | 触发 | 场景 | 阻塞 PR |
+|------|----------|------|------|---------|
+| PR 回归 | `.github/workflows/performance-regression.yml` | `pull_request` to master | steady 3m + 比对基线 | 是（回归超阈值或绝对目标未达） |
+| Nightly | `.github/workflows/performance-nightly.yml` | `schedule` 每日 / 手动 | steady 15m、auth capacity、device churn、双实例限流、重启恢复、2h soak | 否（仅归档 + 刷新基线） |
+
+PR 回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
+
+| 维度 | 阈值 |
+|------|------|
+| p95 | ≤ +8% |
+| p99 | ≤ +12% |
+| 错误率 | < 0.1%（绝对目标） |
+| allocations/request | ≤ +10%（待 `/debug/metrics` 上线，当前 info-only） |
+| Redis commands/request | 不得增加（待上线，info-only） |
+| DB queries/request | 不得增加（待上线，info-only） |
+
+初始绝对目标（[absolute-goals.json](absolute-goals.json)，按固定硬件校准后调整）：
+
+| 场景 | 初始目标 |
+|------|----------|
+| warmed authenticated read | p95 ≤ 50 ms，p99 ≤ 150 ms |
+| refresh | p95 ≤ 100 ms，p99 ≤ 250 ms |
+| steady 错误率 | < 0.1% |
+| 简单读取分配 | ≤ 8 KB/request（待上线） |
+| L1 上线后 Redis | ≤ 0.2 command/request（待上线） |
+| soak | 预热后内存无持续单调增长 |
+| Worker | backlog 和 oldest age 不持续增长 |
+
+基线文件存放于 [baselines/](baselines/) 目录，命名 `baseline-<PROFILE>-rate<RATE>.json`。
+Nightly 每日跑完 steady 15m 后自动 commit/push 刷新基线；PR 拉取该基线与当前分支 3m run 比对。
+首次运行（基线不存在）仅校验绝对目标与错误率，不阻塞。
+
+Nightly 重启恢复：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
+断言重启后错误率 ≤ 5%。覆盖 AGENTS.md 的恢复语义。
+
 ### steady（固定设备基线）
 
 固定 `X-Device-Id`（`k6-steady-{vu}`），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。优先配合预置 Token，避免登录限流污染业务基线：

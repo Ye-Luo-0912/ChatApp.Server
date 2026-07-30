@@ -1,0 +1,420 @@
+name: Performance Nightly
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京时间 10:00）运行
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_duration:
+        description: "soak 时长（默认 2h）"
+        default: "2h"
+      skip_soak:
+        description: "跳过 2h soak"
+        type: boolean
+        default: false
+
+# 同一时刻只跑一个 nightly
+concurrency:
+  group: perf-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      ConnectionStrings__DefaultConnection: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres;Pooling=true"
+      ConnectionStrings__Garnet: "127.0.0.1:6379,abortConnect=false"
+      JwtSettings__Issuer: ChatApp
+      JwtSettings__Audience: ChatApp
+      JwtSettings__Secret: perf-nightly-secret-please-change-32chars
+      ForwardedHeaders__KnownProxies__0: "127.0.0.1"
+      ForwardedHeaders__KnownNetworks__0: "172.28.0.0/16"
+      Security__SecretEncryptionKey: "perf-nightly-encryption-key-32-chars!!"
+      EmailSettings__Host: "localhost"
+      EmailSettings__SenderEmail: "noreply@localhost"
+      EmailSettings__Password: "dummy"
+      ASPNETCORE_ENVIRONMENT: "Performance"
+      ASPNETCORE_URLS: "http://127.0.0.1:5088"
+
+    services:
+      postgres:
+        image: postgres:16.8
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ChatAppDatabase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ChatAppDatabase"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      garnet:
+        image: ghcr.io/microsoft/garnet:1.0.84
+        options: >-
+          --user 0:0
+          --health-cmd "bash -c 'echo > /dev/tcp/127.0.0.1/6379'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout Server
+        uses: actions/checkout@v4
+        with:
+          path: ChatApp.Server
+          fetch-depth: 0
+
+      - name: Read pinned Realtime version
+        id: realtime-version
+        working-directory: ChatApp.Server
+        run: |
+          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
+          repo=$(grep "^Repo=" Realtime.version | cut -d= -f2)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout RealtimeServices at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.realtime-version.outputs.repo }}
+          path: ChatApp.RealtimeServices
+          ref: ${{ steps.realtime-version.outputs.commit }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup k6
+        uses: grafana/k6-action@v0.3.1
+        with:
+          k6-version: "0.54.0"
+
+      - name: Configure git for baseline commit
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Release build
+        working-directory: ChatApp.Server
+        run: dotnet build ChatApp.Server.sln -c Release
+
+      - name: Apply migrations
+        working-directory: ChatApp.Server
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.* || true
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          dotnet ef database update --project Infrastructure --startup-project Infrastructure --context UserDbContext
+
+      - name: Seed test users
+        working-directory: ChatApp.Server
+        env:
+          USE_DOCKER: "1"
+          SEED_COUNT: "120"
+          TEST_USER_PREFIX: "loaduser"
+          PGUSER: "postgres"
+          PGDATABASE: "ChatAppDatabase"
+        run: bash tests/load/seed-users.sh
+
+      # ─────────────────────────────────────────────────────────────
+      # 启动 API 并预热
+      # ─────────────────────────────────────────────────────────────
+      - name: Start API (Performance env)
+        working-directory: ChatApp.Server
+        run: |
+          dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile &
+          echo $! > /tmp/api.pid
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:5088/health/ready" > /dev/null 2>&1; then
+              echo "API ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed to become ready"
+          exit 1
+
+      - name: Generate preset tokens
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          node -e '
+            const http = require("http");
+            const tokens = [];
+            let done = 0;
+            const total = 100;
+            for (let i = 1; i <= total; i++) {
+              const data = JSON.stringify({ username: "loaduser" + i, password: "Passw0rd!" });
+              const req = http.request({
+                hostname: "127.0.0.1", port: 5088, path: "/api/auth/login", method: "POST",
+                headers: { "Content-Type": "application/json", "X-Device-Id": "seed-" + i, "Content-Length": Buffer.byteLength(data) }
+              }, (res) => {
+                let body = "";
+                res.on("data", (c) => body += c);
+                res.on("end", () => {
+                  try {
+                    const j = JSON.parse(body);
+                    if (res.statusCode === 200 && j.accessToken) {
+                      const idMatch = body.match(/"userId"\s*:\s*(\d+)/i);
+                      tokens.push({ accessToken: j.accessToken, refreshToken: j.refreshToken || "", userId: idMatch ? Number(idMatch[1]) : 0 });
+                    }
+                  } catch (e) {}
+                  if (++done === total) {
+                    require("fs").writeFileSync("tokens.json", JSON.stringify(tokens));
+                    console.log("Generated " + tokens.length + " tokens");
+                    process.exit(tokens.length >= 80 ? 0 : 1);
+                  }
+                });
+              });
+              req.on("error", () => { if (++done === total) { require("fs").writeFileSync("tokens.json", "[]"); process.exit(1); } });
+              req.write(data);
+              req.end();
+            }
+          '
+
+      - name: Generate creds file (for auth_capacity / device_churn)
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          node -e '
+            const creds = [];
+            for (let i = 1; i <= 100; i++) {
+              creds.push({ username: "loaduser" + i, password: "Passw0rd!", userId: i });
+            }
+            require("fs").writeFileSync("creds.json", JSON.stringify(creds));
+          '
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 1：steady（15 分钟）— 同时作为基线生成源
+      # ─────────────────────────────────────────────────────────────
+      - name: Steady 15m
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
+            -e PROFILE=steady -e RATE=20 -e DURATION=15m \
+            --out json=steady-15m.json \
+            tests/load/mixed-workload.k6.js
+
+      - name: Refresh baseline
+        working-directory: ChatApp.Server
+        run: |
+          mkdir -p tests/load/baselines
+          cp tests/load/steady-15m.json tests/load/baselines/baseline-steady-rate20.json
+          git add tests/load/baselines/baseline-steady-rate20.json
+          if git diff --cached --quiet; then
+            echo "基线无变化"
+          else
+            git commit -m "perf: refresh steady baseline (nightly $(date -u +%Y-%m-%d))"
+            git push
+            echo "基线已推送"
+          fi
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 2：auth capacity（5 分钟登录容量）
+      # ─────────────────────────────────────────────────────────────
+      - name: Auth capacity 5m
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e CREDS_FILE=./creds.json \
+            -e PROFILE=auth_capacity -e RATE=30 -e DURATION=5m \
+            --out json=auth-capacity-5m.json \
+            tests/load/mixed-workload.k6.js
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 3：device churn（10 分钟设备抖动）
+      # ─────────────────────────────────────────────────────────────
+      - name: Device churn 10m
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e CREDS_FILE=./creds.json \
+            -e PROFILE=device_churn -e RATE=10 -e DURATION=10m \
+            --out json=device-churn-10m.json \
+            tests/load/mixed-workload.k6.js
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 4：双实例限流（需第二个 API 实例）
+      # ─────────────────────────────────────────────────────────────
+      - name: Dual instance rate limit
+        working-directory: ChatApp.Server
+        run: |
+          # 第二实例使用不同端口，共享同一 Postgres + Garnet
+          ASPNETCORE_URLS="http://127.0.0.1:5089" \
+            dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile &
+          echo $! > /tmp/api2.pid
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:5089/health/ready" > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+          cd tests/load
+          k6 run \
+            -e BASE_URL_A=http://127.0.0.1:5088 \
+            -e BASE_URL_B=http://127.0.0.1:5089 \
+            -e PROFILE=dual_ratelimit \
+            --out json=dual-ratelimit.json \
+            tests/load/mixed-workload.k6.js
+
+          kill "$(cat /tmp/api2.pid)" 2>/dev/null || true
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 5：重启恢复（Postgres + Garnet）
+      # ─────────────────────────────────────────────────────────────
+      - name: Restart recovery
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          echo "=== 重启恢复测试 ==="
+          # 起始压测（30s steady）
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
+            -e PROFILE=steady -e RATE=15 -e DURATION=30s \
+            --out json=restart-before.json \
+            tests/load/mixed-workload.k6.js || echo "before-run 允许失败"
+
+          # 重启 Postgres
+          echo "重启 Postgres..."
+          docker restart "$(docker ps -q --filter ancestor=postgres:16.8)" || true
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -U postgres -d ChatAppDatabase > /dev/null 2>&1; then
+              echo "Postgres 恢复"
+              break
+            fi
+            sleep 2
+          done
+
+          # 重启 Garnet
+          echo "重启 Garnet..."
+          docker restart "$(docker ps -q --filter ancestor=ghcr.io/microsoft/garnet:1.0.84)" || true
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              echo "Garnet 恢复"
+              break
+            fi
+            sleep 2
+          done
+
+          # 等待 API 自愈（StackExchange.Redis 自动重连）
+          sleep 10
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:5088/health/ready" > /dev/null 2>&1; then
+              echo "API 重新就绪"
+              break
+            fi
+            sleep 2
+          done
+
+          # 重启后压测（30s steady），断言错误率
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
+            -e PROFILE=steady -e RATE=15 -e DURATION=30s \
+            --out json=restart-after.json \
+            tests/load/mixed-workload.k6.js
+
+          # 比对前后错误率
+          node -e '
+            const fs = require("fs");
+            function errRate(p) {
+              const lines = fs.readFileSync(p, "utf8").split(/\r?\n/).filter(Boolean);
+              let cnt = 0, sum = 0;
+              for (const l of lines) {
+                let e; try { e = JSON.parse(l); } catch { continue; }
+                if (e.type === "Metric" && e.metric === "errors") { cnt++; sum += e.data.value; }
+              }
+              return cnt > 0 ? sum / cnt : 0;
+            }
+            const before = errRate("restart-before.json");
+            const after = errRate("restart-after.json");
+            console.log("重启前错误率: " + (before * 100).toFixed(3) + "%");
+            console.log("重启后错误率: " + (after * 100).toFixed(3) + "%");
+            if (after > 0.05) {
+              console.error("重启后错误率 " + (after * 100).toFixed(3) + "% 超过 5% 阈值");
+              process.exit(1);
+            }
+            console.log("✓ 重启恢复通过");
+          '
+
+      # ─────────────────────────────────────────────────────────────
+      # 场景 6：2 小时 soak
+      # ─────────────────────────────────────────────────────────────
+      - name: 2h soak
+        if: ${{ github.event.inputs.skip_soak != 'true' }}
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          SOAK_DURATION="${{ github.event.inputs.soak_duration || '2h' }}"
+          k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
+            -e PROFILE=soak -e RATE=8 -e DURATION="${SOAK_DURATION}" \
+            --out json=soak.json \
+            tests/load/mixed-workload.k6.js
+
+      - name: Soak monotonic growth check
+        if: ${{ github.event.inputs.skip_soak != 'true' }}
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          # 抽取 soak 的 errors 趋势，断言后半段错误率不单调增长
+          node -e '
+            const fs = require("fs");
+            const lines = fs.readFileSync("soak.json", "utf8").split(/\r?\n/).filter(Boolean);
+            const errs = [];
+            for (const l of lines) {
+              let e; try { e = JSON.parse(l); } catch { continue; }
+              if (e.type === "Metric" && e.metric === "errors") errs.push({ t: e.data.time, v: e.data.value });
+            }
+            if (errs.length < 10) { console.log("soak 样本不足，跳过单调性检查"); process.exit(0); }
+            const half = Math.floor(errs.length / 2);
+            const firstHalf = errs.slice(0, half).reduce((s, x) => s + x.v, 0) / half;
+            const secondHalf = errs.slice(half).reduce((s, x) => s + x.v, 0) / (errs.length - half);
+            console.log("soak 前半段错误率: " + (firstHalf * 100).toFixed(3) + "%");
+            console.log("soak 后半段错误率: " + (secondHalf * 100).toFixed(3) + "%");
+            if (secondHalf > firstHalf * 2 && secondHalf > 0.05) {
+              console.error("soak 后半段错误率显著增长，疑似资源泄漏");
+              process.exit(1);
+            }
+            console.log("✓ soak 无单调错误增长");
+          '
+
+      - name: Stop API
+        if: always()
+        run: |
+          for f in /tmp/api.pid /tmp/api2.pid; do
+            if [ -f "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi
+          done
+
+      # ─────────────────────────────────────────────────────────────
+      # 归档所有 run
+      # ─────────────────────────────────────────────────────────────
+      - name: Upload all runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-nightly-${{ github.run_id }}
+          path: |
+            ChatApp.Server/tests/load/steady-15m.json
+            ChatApp.Server/tests/load/auth-capacity-5m.json
+            ChatApp.Server/tests/load/device-churn-10m.json
+            ChatApp.Server/tests/load/dual-ratelimit.json
+            ChatApp.Server/tests/load/restart-before.json
+            ChatApp.Server/tests/load/restart-after.json
+            ChatApp.Server/tests/load/soak.json
+          retention-days: 90
+
+      - name: Summary
+        if: always()
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          echo "## Nightly 性能门禁结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          for f in steady-15m auth-capacity-5m device-churn-10m dual-ratelimit restart-after soak; do
+            if [ -f "${f}.json" ]; then
+              echo "- ✓ ${f} 完成" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ✗ ${f} 缺失" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "基线已更新至 \`tests/load/baselines/baseline-steady-20-3m.json\`（若稳态通过）。" >> "$GITHUB_STEP_SUMMARY"

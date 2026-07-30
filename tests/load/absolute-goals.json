@@ -1,0 +1,10 @@
+{
+  "_comment": "绝对性能目标（初始值，按固定硬件校准后调整）。compare-baseline.mjs --absolute 使用。",
+  "_source": "tests/load/README.Performance.md 性能基线章节",
+  "read_p95_ms": 50,
+  "read_p99_ms": 150,
+  "refresh_p95_ms": 100,
+  "refresh_p99_ms": 250,
+  "_note_error_rate": "错误率绝对目标 0.1% 内置于 compare-baseline.mjs，无需在此声明",
+  "_note_host_metrics": "allocations/redis/db queries 待 /debug/metrics 端点上线后启用"
+}

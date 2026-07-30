@@ -16,6 +16,17 @@ tests/load/*.pid
 tests/load/*.log
 tests/load/*.log.err
 tests/load/k6-smoke-*.txt
+# 压测运行产物（CI 生成后归档为 artifact；基线在 baselines/ 下跟踪）
+tests/load/current.json
+tests/load/steady-15m.json
+tests/load/auth-capacity-5m.json
+tests/load/device-churn-10m.json
+tests/load/dual-ratelimit.json
+tests/load/restart-before.json
+tests/load/restart-after.json
+tests/load/soak.json
+tests/load/tokens.json
+tests/load/creds.json
 tmp_*.txt
 tmp_*.csproj.txt
 # Visual Studio IDE snapshots (HierarchyCache / CopilotSnapshots / .suo etc.)
