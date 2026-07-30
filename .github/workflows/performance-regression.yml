@@ -68,7 +68,9 @@ jobs:
         working-directory: ChatApp.Server
         run: |
           commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
-          repo=$(grep "^Repo=" Realtime.version | cut -d= -f2)
+          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
+          # actions/checkout 需要 owner/repo 格式；Realtime.version 可能存完整 URL
+          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
 
