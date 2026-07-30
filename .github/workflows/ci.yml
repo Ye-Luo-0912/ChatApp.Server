@@ -106,46 +106,6 @@ jobs:
           export PATH="$PATH:$HOME/.dotnet/tools"
           dotnet ef database update --project Infrastructure --startup-project Infrastructure --context UserDbContext
 
-      - name: Compose ready gate
-        working-directory: ChatApp.Server
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: ChatAppDatabase
-          JwtSettings__Secret: ci-compose-secret-please-change-32chars
-          JwtSettings__Issuer: ChatApp
-          JwtSettings__Audience: ChatApp
-        run: |
-          set -euo pipefail
-          cat > .env <<'EOF'
-          POSTGRES_PASSWORD=postgres
-          POSTGRES_USER=postgres
-          POSTGRES_DB=ChatAppDatabase
-          JwtSettings__Secret=ci-compose-secret-please-change-32chars
-          JwtSettings__Issuer=ChatApp
-          JwtSettings__Audience=ChatApp
-          Security__SecretEncryptionKey=ci-compose-encryption-key-32-chars!!
-          EmailSettings__Host=localhost
-          EmailSettings__SenderEmail=noreply@localhost
-          EmailSettings__Password=dummy
-          CHATAPP_PROXY_PORT=18080
-          EOF
-          docker compose -f docker-compose.yaml up -d --build
-          ok=0
-          for i in $(seq 1 60); do
-            status=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' chatapp_api 2>/dev/null || echo missing)
-            if [ "$status" = "healthy" ]; then
-              if curl -fsS "http://127.0.0.1:18080/health/ready"; then
-                ok=1
-                break
-              fi
-            fi
-            sleep 5
-          done
-          docker compose -f docker-compose.yaml logs --no-color || true
-          docker compose -f docker-compose.yaml down -v || true
-          test "$ok" = "1"
-
       - name: Health ready gate
         working-directory: ChatApp.Server
         env:
@@ -176,6 +136,48 @@ jobs:
         working-directory: ChatApp.Server
         run: |
           dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
+
+      - name: Compose ready gate
+        working-directory: ChatApp.Server
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: ChatAppDatabase
+          JwtSettings__Secret: ci-compose-secret-please-change-32chars
+          JwtSettings__Issuer: ChatApp
+          JwtSettings__Audience: ChatApp
+        run: |
+          set -euo pipefail
+          # 释放 standalone 容器名（chatapp_postgres / chatapp_garnet），避免与 compose 的 container_name 冲突
+          docker rm -f chatapp_postgres chatapp_garnet 2>/dev/null || true
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=postgres
+          POSTGRES_USER=postgres
+          POSTGRES_DB=ChatAppDatabase
+          JwtSettings__Secret=ci-compose-secret-please-change-32chars
+          JwtSettings__Issuer=ChatApp
+          JwtSettings__Audience=ChatApp
+          Security__SecretEncryptionKey=ci-compose-encryption-key-32-chars!!
+          EmailSettings__Host=localhost
+          EmailSettings__SenderEmail=noreply@localhost
+          EmailSettings__Password=dummy
+          CHATAPP_PROXY_PORT=18080
+          EOF
+          docker compose -f docker-compose.yaml up -d --build
+          ok=0
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' chatapp_api 2>/dev/null || echo missing)
+            if [ "$status" = "healthy" ]; then
+              if curl -fsS "http://127.0.0.1:18080/health/ready"; then
+                ok=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          docker compose -f docker-compose.yaml logs --no-color || true
+          docker compose -f docker-compose.yaml down -v || true
+          test "$ok" = "1"
 
       - name: Docker build
         working-directory: ChatApp.Server
