@@ -107,6 +107,10 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
             var options = ConfigurationOptions.Parse(connectionString, true);
             options.AbortOnConnectFail = true;
             options.ConnectTimeout = 5000;
+            // 与生产一致（InfrastructureExtensions: 1000ms），避免连接断开时命令挂起
+            options.SyncTimeout = 1000;
+            options.AsyncTimeout = 1000;
+            options.ConnectRetry = 1;
 
             _multiplexer = await ConnectionMultiplexer.ConnectAsync(options);
 

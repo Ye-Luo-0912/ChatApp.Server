@@ -139,6 +139,7 @@ jobs:
 
       - name: Test
         working-directory: ChatApp.Server
+        timeout-minutes: 5
         run: |
           dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
 
