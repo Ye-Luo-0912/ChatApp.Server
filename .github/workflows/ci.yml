@@ -69,15 +69,14 @@ jobs:
             sleep 2
           done
 
-      - name: Start Garnet with persistence
+      - name: Start Redis (standalone for tests; compose gate validates Garnet)
         run: |
           docker rm -f chatapp_garnet || true
-          docker run -d --name chatapp_garnet -p 6379:6379 --user 0:0 \
-            ghcr.io/microsoft/garnet:1.0.84 \
-            --bind 0.0.0.0 --port 6379 \
-            --checkpointdir /data/checkpoints --aof --aof-size-limit 64m --recover \
-            --lua
-          sleep 3
+          docker run -d --name chatapp_garnet -p 6379:6379 \
+            redis:7.2 \
+            redis-server --bind 0.0.0.0 --port 6379 --save "" --appendonly no
+          sleep 2
+          docker exec chatapp_garnet redis-cli PING
 
       - name: Release build
         working-directory: ChatApp.Server
