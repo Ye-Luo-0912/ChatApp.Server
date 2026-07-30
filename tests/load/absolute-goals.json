@@ -5,6 +5,8 @@
   "read_p99_ms": 150,
   "refresh_p95_ms": 100,
   "refresh_p99_ms": 250,
+  "alloc_per_req_kb": 8,
+  "redis_cmds_per_req": 0.2,
   "_note_error_rate": "错误率绝对目标 0.1% 内置于 compare-baseline.mjs，无需在此声明",
-  "_note_host_metrics": "allocations/redis/db queries 待 /debug/metrics 端点上线后启用"
+  "_note_db_queries": "DB queries/request 仅做回归检查（不得增加），不设绝对目标"
 }

@@ -220,7 +220,8 @@ jobs:
             echo "基线无变化"
           else
             git commit -m "perf: refresh steady baseline (nightly $(date -u +%Y-%m-%d))"
-            git push
+            # schedule 触发时处于 detached HEAD，显式推到 master
+            git push origin "HEAD:master"
             echo "基线已推送"
           fi
 
@@ -423,4 +424,4 @@ jobs:
             fi
           done
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "基线已更新至 \`tests/load/baselines/baseline-steady-20-3m.json\`（若稳态通过）。" >> "$GITHUB_STEP_SUMMARY"
+          echo "基线已更新至 \`tests/load/baselines/baseline-steady-rate20.json\`（若稳态通过）。" >> "$GITHUB_STEP_SUMMARY"

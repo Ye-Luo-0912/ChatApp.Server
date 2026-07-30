@@ -2,6 +2,7 @@ using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Infrastructure.Caching;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Infrastructure.Serialization;
 using Infrastructure.Messaging;
 using Infrastructure.Services.Utilities;
@@ -28,6 +29,7 @@ public static class InfrastructureExtensions
         {
             services.AddSingleton<ITsidGenerator, TsidGeneratorService>();
             services.AddSingleton<RealtimeDomainOutboxInterceptor>();
+            services.AddSingleton<DbCommandCounterInterceptor>();
             services.AddDbContextPool<UserDbContext>((serviceProvider, options) =>
             {
                 var connectionString = serviceProvider
@@ -39,7 +41,9 @@ public static class InfrastructureExtensions
                 options.UseNpgsql(connectionString, npgsql =>
                 {
                     npgsql.CommandTimeout(15);
-                }).AddInterceptors(serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>());
+                }).AddInterceptors(
+                    serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>(),
+                    serviceProvider.GetRequiredService<DbCommandCounterInterceptor>());
             });
 
             return services;

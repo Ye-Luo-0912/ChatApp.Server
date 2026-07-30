@@ -76,7 +76,7 @@ function percentile(sortedValues, p) {
     return sortedValues[Math.max(0, Math.min(sortedValues.length - 1, idx))];
 }
 
-// 从 metrics 提取 summary：p95/p99/avg/count
+// 从 metrics 提取 summary：p95/p99/avg/count/sum
 function summarize(metrics) {
     const summary = {};
     for (const [name, m] of Object.entries(metrics)) {
@@ -85,6 +85,7 @@ function summarize(metrics) {
             p95: percentile(sorted, 95),
             p99: percentile(sorted, 99),
             avg: m.count > 0 ? m.sum / m.count : 0,
+            sum: m.sum,
             count: m.count,
         };
     }
@@ -189,9 +190,9 @@ function main() {
     }
 
     // 3. 绝对目标检查（可选）
+    let absGoals = null;
     if (args.absolute) {
         console.log('\n=== 绝对目标检查 ===');
-        let absGoals;
         try {
             absGoals = JSON.parse(fs.readFileSync(args.absolute, 'utf8'));
         } catch (e) {
@@ -202,7 +203,7 @@ function main() {
             if (goalName.startsWith('_')) continue; // 元数据字段
             const mapping = ABSOLUTE_MAP[goalName];
             if (!mapping) {
-                console.log(`${goalName.padEnd(20)} 跳过（未映射）`);
+                // alloc_per_req_kb / redis_cmds_per_req 在宿主侧指标段处理
                 continue;
             }
             const actual = curSummary[mapping.metric]?.[mapping.stat];
@@ -217,16 +218,76 @@ function main() {
         }
     }
 
-    // 4. 宿主侧指标（allocations/redis/db queries）—当前仅 info，不阻塞
-    console.log('\n=== 宿主侧指标（info-only，不阻塞）===');
-    const hostMetrics = ['allocations_per_req_kb', 'redis_cmds_per_req', 'db_queries_per_req'];
-    for (const hm of hostMetrics) {
-        const b = baseSummary[hm]?.avg;
-        const c = curSummary[hm]?.avg;
-        if (b == null && c == null) {
-            console.log(`${hm.padEnd(28)} n/a（k6 未上报，需宿主端 /debug/metrics 端点）`);
-        } else {
-            console.log(`${hm.padEnd(28)} 基准 ${b ?? 'n/a'}  当前 ${c ?? 'n/a'}`);
+    // 4. 宿主侧指标（allocations/redis/db queries）—从 /debug/metrics delta + http_reqs 计算 per-request
+    console.log('\n=== 宿主侧 per-request 指标 ===');
+    const httpReqsBase = baseSummary.http_reqs?.sum ?? null;
+    const httpReqsCur = curSummary.http_reqs?.sum ?? null;
+    const allocDeltaBase = baseSummary.allocations_delta_bytes?.avg ?? null;
+    const allocDeltaCur = curSummary.allocations_delta_bytes?.avg ?? null;
+    const redisDeltaBase = baseSummary.redis_cmds_delta?.avg ?? null;
+    const redisDeltaCur = curSummary.redis_cmds_delta?.avg ?? null;
+    const dbDeltaBase = baseSummary.db_queries_delta?.avg ?? null;
+    const dbDeltaCur = curSummary.db_queries_delta?.avg ?? null;
+
+    const hostAvailable = httpReqsCur != null && httpReqsCur > 0;
+    const allocPerReqKbBase = (allocDeltaBase != null && httpReqsBase > 0) ? (allocDeltaBase / 1024) / httpReqsBase : null;
+    const allocPerReqKbCur = (allocDeltaCur != null && httpReqsCur > 0) ? (allocDeltaCur / 1024) / httpReqsCur : null;
+    const redisPerReqBase = (redisDeltaBase != null && httpReqsBase > 0) ? redisDeltaBase / httpReqsBase : null;
+    const redisPerReqCur = (redisDeltaCur != null && httpReqsCur > 0) ? redisDeltaCur / httpReqsCur : null;
+    const dbPerReqBase = (dbDeltaBase != null && httpReqsBase > 0) ? dbDeltaBase / httpReqsBase : null;
+    const dbPerReqCur = (dbDeltaCur != null && httpReqsCur > 0) ? dbDeltaCur / httpReqsCur : null;
+
+    // 宿主侧回归阈值
+    const HOST_THRESHOLDS = {
+        alloc: 0.10,   // allocations/request ≤ +10%
+        redis: 0.0,    // Redis commands/request 不得增加
+        db: 0.0,       // DB queries/request 不得增加
+    };
+
+    function fmtHost(v, unit) {
+        if (v == null) return 'n/a';
+        return `${v.toFixed(3)}${unit}`;
+    }
+
+    // allocations/request
+    {
+        const d = pctDelta(allocPerReqKbBase, allocPerReqKbCur);
+        const ok = d == null || d <= HOST_THRESHOLDS.alloc;
+        console.log(`${'allocations/req (KB)'.padEnd(28)} 基准 ${fmtHost(allocPerReqKbBase, '')}  当前 ${fmtHost(allocPerReqKbCur, '')}  ${d != null ? formatPct(d) : 'n/a'}  ${ok ? '✓' : '❌'}`);
+        if (!ok) regressions.push(`allocations/request 退化 ${formatPct(d)}（阈值 +${(HOST_THRESHOLDS.alloc * 100).toFixed(0)}%）`);
+    }
+
+    // Redis commands/request
+    {
+        const d = pctDelta(redisPerReqBase, redisPerReqCur);
+        const ok = d == null || d <= HOST_THRESHOLDS.redis;
+        console.log(`${'redis cmds/req'.padEnd(28)} 基准 ${fmtHost(redisPerReqBase, '')}  当前 ${fmtHost(redisPerReqCur, '')}  ${d != null ? formatPct(d) : 'n/a'}  ${ok ? '✓' : '❌'}`);
+        if (!ok) regressions.push(`Redis commands/request 增加 ${formatPct(d)}（阈值 +0%）`);
+    }
+
+    // DB queries/request
+    {
+        const d = pctDelta(dbPerReqBase, dbPerReqCur);
+        const ok = d == null || d <= HOST_THRESHOLDS.db;
+        console.log(`${'db queries/req'.padEnd(28)} 基准 ${fmtHost(dbPerReqBase, '')}  当前 ${fmtHost(dbPerReqCur, '')}  ${d != null ? formatPct(d) : 'n/a'}  ${ok ? '✓' : '❌'}`);
+        if (!ok) regressions.push(`DB queries/request 增加 ${formatPct(d)}（阈值 +0%）`);
+    }
+
+    if (!hostAvailable) {
+        console.log('  （宿主侧指标不可用：/debug/metrics 未上报或 http_reqs 为 0，跳过阻塞判定）');
+    }
+
+    // 宿主侧绝对目标
+    if (args.absolute && hostAvailable) {
+        if (allocPerReqKbCur != null && absGoals.alloc_per_req_kb != null) {
+            const ok = allocPerReqKbCur <= absGoals.alloc_per_req_kb;
+            console.log(`${'  [abs] allocations/req'.padEnd(28)} ${allocPerReqKbCur.toFixed(3)} KB  目标 ≤ ${absGoals.alloc_per_req_kb} KB  ${ok ? '✓' : '❌'}`);
+            if (!ok) regressions.push(`allocations/request ${allocPerReqKbCur.toFixed(3)} KB 超过绝对目标 ${absGoals.alloc_per_req_kb} KB`);
+        }
+        if (redisPerReqCur != null && absGoals.redis_cmds_per_req != null) {
+            const ok = redisPerReqCur <= absGoals.redis_cmds_per_req;
+            console.log(`${'  [abs] redis cmds/req'.padEnd(28)} ${redisPerReqCur.toFixed(3)}  目标 ≤ ${absGoals.redis_cmds_per_req}  ${ok ? '✓' : '❌'}`);
+            if (!ok) regressions.push(`Redis commands/request ${redisPerReqCur.toFixed(3)} 超过绝对目标 ${absGoals.redis_cmds_per_req}`);
         }
     }
 

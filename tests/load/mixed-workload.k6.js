@@ -1,7 +1,7 @@
 import http from 'k6/http';
 import { check, sleep, group } from 'k6';
 import { SharedArray } from 'k6/data';
-import { Rate, Trend, Counter } from 'k6/metrics';
+import { Rate, Trend, Counter, Gauge } from 'k6/metrics';
 
 /**
  * 混合负载场景（按 PROFILE 拆分）：
@@ -37,6 +37,12 @@ const notifyTrend = new Trend('notifications_ms', true);
 const sessionsTrend = new Trend('sessions_ms', true);
 const meTrend = new Trend('me_ms', true);
 const overloaded = new Counter('login_overloaded_503');
+
+// 宿主侧 delta 指标：teardown() 中从 /debug/metrics 采样并计算差值。
+// compare-baseline.mjs 据此 + http_reqs 计算 per-request 指标。
+const allocationsDelta = new Gauge('allocations_delta_bytes');
+const redisCmdsDelta = new Gauge('redis_cmds_delta');
+const dbQueriesDelta = new Gauge('db_queries_delta');
 
 const PROFILE = __ENV.PROFILE || 'steady';
 const BASE_URL = (__ENV.BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
@@ -342,4 +348,28 @@ function dualRateLimit() {
   check(null, { 'dual instance shared limit eventually 429': () => hitLimit || a.status < 500 });
   errorRate.add(a.status >= 500 || b.status >= 500);
   sleep(0.05);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 宿主侧指标采样：setup() 记录基线，teardown() 计算差值并上报。
+// /debug/metrics 端点需在 API 侧启用（见 Program.cs）。
+// ─────────────────────────────────────────────────────────────
+export function setup() {
+  try {
+    const res = http.get(`${BASE_URL}/debug/metrics`);
+    if (res.status === 200) return JSON.parse(res.body);
+  } catch (e) { /* 端点不可用时跳过宿主指标 */ }
+  return null;
+}
+
+export function teardown(data) {
+  if (!data) return;
+  try {
+    const res = http.get(`${BASE_URL}/debug/metrics`);
+    if (res.status !== 200) return;
+    const end = JSON.parse(res.body);
+    allocationsDelta.add(Math.max(0, (end.allocated_bytes || 0) - (data.allocated_bytes || 0)));
+    redisCmdsDelta.add(Math.max(0, (end.redis_total_commands || 0) - (data.redis_total_commands || 0)));
+    dbQueriesDelta.add(Math.max(0, (end.db_total_commands || 0) - (data.db_total_commands || 0)));
+  } catch (e) { /* best-effort */ }
 }

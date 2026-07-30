@@ -4,6 +4,7 @@ using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
 
 using Core.Settings;
+using Infrastructure.Diagnostics;
 using Infrastructure.Extensions;
 using Infrastructure.Serialization;
 using Microsoft.AspNetCore.HttpOverrides;
@@ -13,6 +14,7 @@ using NLog.Extensions.Logging;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
+using StackExchange.Redis;
 
 namespace ChatApp.Server;
 
@@ -160,6 +162,24 @@ public abstract partial class Program
         app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = check => check.Tags.Contains("ready"),
+        });
+
+        // 诊断端点：供 k6 压测采样 allocations/Redis commands/DB queries，计算 per-request 指标。
+        // 无需鉴权——仅暴露累计计数器，不含敏感信息。
+        app.MapGet("/debug/metrics", (IConnectionMultiplexer redis, DbCommandCounterInterceptor dbCounter) =>
+        {
+            return Results.Ok(new Dictionary<string, object>
+            {
+                ["allocated_bytes"] = GC.GetTotalAllocatedBytes(),
+                ["gc_heap_bytes"] = GC.GetTotalMemory(false),
+                ["gen0_collections"] = GC.CollectionCount(0),
+                ["gen1_collections"] = GC.CollectionCount(1),
+                ["gen2_collections"] = GC.CollectionCount(2),
+                ["working_set_bytes"] = Environment.WorkingSet,
+                ["redis_total_commands"] = redis.OperationCount,
+                ["db_total_commands"] = dbCounter.TotalCommandsExecuted,
+                ["uptime_ms"] = Environment.TickCount64,
+            });
         });
 
         app.MapControllers();

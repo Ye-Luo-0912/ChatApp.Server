@@ -38,8 +38,9 @@ PR 回归门禁调用 `tests/load/compare-baseline.mjs`，阈值见脚本头部�
 | p99  | ≤ +12% |
 | 错误率 | < 0.1%（绝对目标） |
 
-宿主侧指标（allocations/Redis commands/DB queries）当前为 info-only，
-待 `/debug/metrics` 端点上线后转为阻塞门禁。
+宿主侧指标（allocations/Redis commands/DB queries）从 `/debug/metrics` 端点采样，
+经 k6 `setup()/teardown()` 计算差值后由 `compare-baseline.mjs` 转为 per-request 阻塞门禁：
+allocations/request ≤ +10%、Redis commands/request 不得增加、DB queries/request 不得增加。
 
 ## 注意
 

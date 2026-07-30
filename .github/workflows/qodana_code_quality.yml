@@ -23,7 +23,19 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - name: Check QODANA_TOKEN
+        id: check-token
+        env:
+          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
+        run: |
+          if [ -z "$QODANA_TOKEN" ]; then
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::QODANA_TOKEN 未设置，跳过 Qodana 扫描。注册 https://qodana.cloud 获取 token 并添加为 GitHub Secret 后启用。"
+          else
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: 'Qodana Scan'
+        if: steps.check-token.outputs.has_token == 'true'
         uses: JetBrains/qodana-action@v2026.1
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
