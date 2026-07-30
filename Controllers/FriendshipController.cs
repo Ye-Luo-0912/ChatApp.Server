@@ -24,18 +24,8 @@ public class FriendshipController(
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetFriendsAsync<FriendDto>(
+        return friendshipService.GetFriendsAsync(
             GetCurrentUserId(),
-            f => new FriendDto
-            {
-                FriendId   = f.FriendId,
-                FriendName = f.Friend!.UserName,
-                Note       = f.Note,
-                CreatedAt  = f.CreatedAt,
-                GroupId    = f.GroupId,
-                GroupName  = f.Group != null ? f.Group.GroupName : null,
-                AvatarUrl  = f.Friend!.AvatarUrl
-            },
             cursor,
             limit,
             cancellationToken);
@@ -120,17 +110,8 @@ public class FriendshipController(
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetRequestsAsync<FriendRequestDto>(
+        return friendshipService.GetRequestsAsync(
             GetCurrentUserId(),
-            r => new FriendRequestDto
-            {
-                RequestId    = r.RequestId,
-                RequesterId  = r.RequesterId,
-                TargetUserId = r.TargetUserId,
-                Message      = r.Message,
-                Status       = r.Status,
-                CreatedAt    = r.CreatedAt
-            },
             FriendRequestType.Incoming,
             cursor,
             limit,
@@ -147,17 +128,8 @@ public class FriendshipController(
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetRequestsAsync<FriendRequestDto>(
+        return friendshipService.GetRequestsAsync(
             GetCurrentUserId(),
-            r => new FriendRequestDto
-            {
-                RequestId    = r.RequestId,
-                RequesterId  = r.RequesterId,
-                TargetUserId = r.TargetUserId,
-                Message      = r.Message,
-                Status       = r.Status,
-                CreatedAt    = r.CreatedAt
-            },
             FriendRequestType.Outgoing,
             cursor,
             limit,
@@ -201,15 +173,8 @@ public class FriendshipController(
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetBlockedUsersAsync<BlockedUserDto>(
+        return friendshipService.GetBlockedUsersAsync(
             GetCurrentUserId(),
-            b => new BlockedUserDto
-            {
-                UserId    = b.BlockedUserId,
-                UserName  = b.BlockedUser!.UserName,
-                AvatarUrl = b.BlockedUser.AvatarUrl,
-                BlockedAt = b.BlockedAt
-            },
             cursor,
             limit,
             cancellationToken);

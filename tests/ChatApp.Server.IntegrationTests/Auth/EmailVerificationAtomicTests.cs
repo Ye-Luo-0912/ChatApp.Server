@@ -22,7 +22,7 @@ public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
             code,
             TimeSpan.FromMinutes(5));
 
-        var service = new EmailVerificationService(new NoopEmailSender(), redis.Cache);
+        var service = new EmailVerificationService(new NoopEmailSender(), redis.Cache, redis.Cache);
 
         var successes = 0;
         var failures = 0;
@@ -49,7 +49,7 @@ public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
         const string email = "atomic-send@example.com";
         var purpose = EmailCodePurpose.Register;
         var sender = new CountingEmailSender();
-        var service = new EmailVerificationService(sender, redis.Cache);
+        var service = new EmailVerificationService(sender, redis.Cache, redis.Cache);
 
         var tasks = Enumerable.Range(0, 50)
             .Select(_ => service.SendEmailCodeAsync(email, purpose, CancellationToken.None));

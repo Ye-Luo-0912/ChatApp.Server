@@ -28,7 +28,8 @@ public interface IAttachmentDownloadTicketService
 public sealed record AttachmentDownloadTicketPayload(long UserId, string AttachmentId);
 
 public sealed class AttachmentDownloadTicketService(
-    ICacheProvider cache,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache,
     IOptions<AttachmentStorageOptions> options) : IAttachmentDownloadTicketService
 {
     public async Task<(string Ticket, DateTimeOffset ExpiresAt)> IssueAsync(
@@ -39,7 +40,7 @@ public sealed class AttachmentDownloadTicketService(
         var minutes = Math.Clamp(options.Value.DownloadTicketMinutes, 1, 5);
         var expires = DateTimeOffset.UtcNow.AddMinutes(minutes);
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
-        await cache.SetStringPayloadAsync(
+        await cache.SetAsync(
                 TicketKey(ticket),
                 new AttachmentDownloadTicketPayload(userId, attachmentId),
                 expires - DateTimeOffset.UtcNow,
@@ -55,7 +56,7 @@ public sealed class AttachmentDownloadTicketService(
         if (string.IsNullOrWhiteSpace(ticket))
             return Task.FromResult<AttachmentDownloadTicketPayload?>(null);
 
-        return cache.TryGetAndDeleteStringPayloadAsync<AttachmentDownloadTicketPayload>(
+        return atomicCache.TryGetAndDeleteAsync<AttachmentDownloadTicketPayload>(
             TicketKey(ticket.Trim()), cancellationToken);
     }
 

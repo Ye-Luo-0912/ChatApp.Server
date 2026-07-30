@@ -548,6 +548,7 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             hasher,
             mfa,
             redis.Cache,
+            redis.Cache,
             new FixedDeviceInfo(AuthTestFactories.StableDeviceId("export-test")),
             new Microsoft.AspNetCore.Http.HttpContextAccessor(),
             Options.Create(new TrustedDeviceOptions()),
@@ -565,6 +566,8 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             Audience = "ChatApp",
         });
         return new TokenService(
+            redis.Cache,
+            redis.Cache,
             redis.Cache,
             new FixedDeviceInfo(AuthTestFactories.StableDeviceId("export-test")),
             jwt,

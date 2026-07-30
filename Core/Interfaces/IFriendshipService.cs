@@ -1,4 +1,3 @@
-using System.Linq.Expressions;
 using Core.Models.Common;
 using Core.Models.Friend;
 
@@ -70,25 +69,23 @@ public interface IFriendshipService
     /// 获取好友列表（游标分页）
     /// </summary>
     /// <param name="userId">当前用户ID</param>
-    /// <param name="func"></param>
     /// <param name="cursor">游标，首次请求传 null</param>
     /// <param name="limit">每页数量，默认 50，最大 100</param>
     /// <param name="ct"></param>
-    Task<CursorPage<T>> GetFriendsAsync<T>(long userId, Expression<Func<UserFriendEntry, T>> func,
-        string? cursor = null, int limit = 50, CancellationToken ct = default) where T : class;
+    Task<CursorPage<FriendDto>> GetFriendsAsync(
+        long userId, string? cursor = null, int limit = 50, CancellationToken ct = default);
 
     /// <summary>
     /// 获取好友请求列表（游标分页）
     /// </summary>
     /// <param name="userId">当前用户ID</param>
-    /// <param name="func"></param>
     /// <param name="requestType">请求类型（收到的/发出的）</param>
     /// <param name="cursor">游标，首次请求传 null</param>
     /// <param name="limit">每页数量，默认 50，最大 100</param>
     /// <param name="ct"></param>
-    Task<CursorPage<T>> GetRequestsAsync<T>(long userId, Expression<Func<FriendRequest, T>> func,
-        FriendRequestType requestType, string? cursor = null, int limit = 50,
-        CancellationToken ct = default) where T : class;
+    Task<CursorPage<FriendRequestDto>> GetRequestsAsync(
+        long userId, FriendRequestType requestType, string? cursor = null, int limit = 50,
+        CancellationToken ct = default);
 
     /// <summary>
     /// 检查两人关系状态
@@ -135,12 +132,10 @@ public interface IFriendshipService
     /// <summary>
     /// 获取指定用户已屏蔽的用户列表（游标分页）。
     /// </summary>
-    /// <typeparam name="T">返回结果中每个元素的具体类型，由提供的选择器决定。</typeparam>
     /// <param name="userId">查询屏蔽列表的用户的ID。</param>
-    /// <param name="selector">用于从BlockRecord对象中选择或投影特定属性的选择器表达式。</param>
     /// <param name="cursor">游标，首次请求传 null</param>
     /// <param name="limit">每页数量，默认 50，最大 100</param>
     /// <param name="ct">取消令牌，允许请求在完成前被取消。</param>
-    Task<CursorPage<T>> GetBlockedUsersAsync<T>(long userId, Expression<Func<BlockRecord, T>> selector,
-        string? cursor = null, int limit = 50, CancellationToken ct = default) where T : class;
+    Task<CursorPage<BlockedUserDto>> GetBlockedUsersAsync(
+        long userId, string? cursor = null, int limit = 50, CancellationToken ct = default);
 }

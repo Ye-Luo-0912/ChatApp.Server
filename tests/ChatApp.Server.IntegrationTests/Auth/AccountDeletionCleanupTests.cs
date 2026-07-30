@@ -295,6 +295,8 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
     private TokenService CreateTokenService()
         => new(
             redis.Cache,
+            redis.Cache,
+            redis.Cache,
             new FixedDeviceInfo("del-device"),
             Options.Create(new Core.Settings.JwtSettings
             {

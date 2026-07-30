@@ -1,6 +1,7 @@
 using Core.Models.Attachment;
 using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -34,6 +35,7 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
 
     [HttpPut("upload")]
     [RequestSizeLimit(30 * 1024 * 1024)]
+    [RequestTimeout("attachment-upload")]
     public async Task<IActionResult> Upload(
         [FromQuery] string ticket,
         CancellationToken cancellationToken)

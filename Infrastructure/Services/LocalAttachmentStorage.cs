@@ -12,7 +12,8 @@ namespace Infrastructure.Services;
 /// </summary>
 public sealed class LocalAttachmentStorage(
     IOptions<AttachmentStorageOptions> options,
-    ICacheProvider cache,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache,
     ILogger<LocalAttachmentStorage> logger) : IAttachmentStorage
 {
     private readonly AttachmentStorageOptions _options = options.Value;
@@ -55,7 +56,7 @@ public sealed class LocalAttachmentStorage(
         var publicUrl = string.Empty;
         var ttl = expires - DateTimeOffset.UtcNow;
 
-        await cache.SetStringPayloadAsync(
+        await cache.SetAsync(
             TicketKey(ticket),
             new AttachmentTicketInfo(
                 userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId),
@@ -70,7 +71,7 @@ public sealed class LocalAttachmentStorage(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
     {
         var ticketKey = TicketKey(ticket);
-        var info = await cache.TryGetAndDeleteStringPayloadAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
+        var info = await atomicCache.TryGetAndDeleteAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
             return (false, null, null, null, 0, null, "上传票无效或已过期");
@@ -166,7 +167,7 @@ public sealed class LocalAttachmentStorage(
 
         // Local：上传完成后把票写回短 TTL，供 confirm 消费（绑定 attachmentId/objectKey）。
         var confirmInfo = info with { ContentLength = written };
-        await cache.SetStringPayloadAsync(
+        await cache.SetAsync(
                 ticketKey,
                 confirmInfo,
                 TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
@@ -204,7 +205,7 @@ public sealed class LocalAttachmentStorage(
         if (!string.IsNullOrWhiteSpace(ticket))
         {
             var ticketKey = TicketKey(ticket);
-            info = await cache.TryGetAndDeleteStringPayloadAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
+            info = await atomicCache.TryGetAndDeleteAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
                 .ConfigureAwait(false);
             if (info is null)
                 return (false, null, null, null, null, 0, null, "上传票无效或已过期");
@@ -348,7 +349,7 @@ public sealed class LocalAttachmentStorage(
     {
         try
         {
-            await cache.SetStringPayloadAsync(
+            await cache.SetAsync(
                     ticketKey,
                     info,
                     TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),

@@ -1,7 +1,7 @@
 namespace Core.Caching;
 
 /// <summary>
-/// <see cref="Interfaces.Cache.ICacheProvider.TryAtomicConsumeAsync{T,TResult}"/> 的执行结果。
+/// <see cref="Interfaces.Cache.IAtomicCacheStore.TryAtomicConsumeAsync{T,TResult}"/> 的执行结果。
 /// </summary>
 public readonly struct AtomicConsumeResult<TResult>
 {

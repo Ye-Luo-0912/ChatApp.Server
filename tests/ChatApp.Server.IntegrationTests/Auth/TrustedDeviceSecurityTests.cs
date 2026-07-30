@@ -327,6 +327,7 @@ public sealed class TrustedDeviceSecurityTests(PostgresTestFixture postgres, Red
             hasher,
             mfa,
             redis.Cache,
+            redis.Cache,
             new FixedDeviceInfo(deviceId),
             accessor,
             Options.Create(new TrustedDeviceOptions { MaxDevicesPerUser = maxDevices }),

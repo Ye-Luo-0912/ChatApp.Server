@@ -15,7 +15,8 @@ namespace Infrastructure.Services;
 /// </summary>
 public sealed class LocalAvatarStorage(
     IOptions<AvatarStorageOptions> options,
-    ICacheProvider cache,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache,
     AvatarReencodeQueue reencodeQueue,
     ILogger<LocalAvatarStorage> logger) : IAvatarStorage
 {
@@ -45,7 +46,7 @@ public sealed class LocalAvatarStorage(
         var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{objectKey}";
         var ttl = expires - DateTimeOffset.UtcNow;
 
-        await cache.SetStringPayloadAsync(
+        await cache.SetAsync(
             TicketKey(ticket),
             new AvatarTicketInfo(userId, objectKey, contentType, contentLength),
             ttl,
@@ -59,7 +60,7 @@ public sealed class LocalAvatarStorage(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
     {
         var ticketKey = TicketKey(ticket);
-        var info = await cache.TryGetAndDeleteStringPayloadAsync<AvatarTicketInfo>(ticketKey, cancellationToken)
+        var info = await atomicCache.TryGetAndDeleteAsync<AvatarTicketInfo>(ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
             return (false, null, "上传票无效或已过期");
@@ -165,7 +166,7 @@ public sealed class LocalAvatarStorage(
     {
         try
         {
-            await cache.SetStringPayloadAsync(
+            await cache.SetAsync(
                     ticketKey,
                     info,
                     TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),

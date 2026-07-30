@@ -18,7 +18,8 @@ namespace Infrastructure.Services;
 public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
 {
     private readonly AvatarStorageOptions _options;
-    private readonly ICacheProvider _cache;
+    private readonly ICacheValueStore _cache;
+    private readonly IAtomicCacheStore _atomicCache;
     private readonly ILogger<S3AvatarStorage> _logger;
     private readonly IAmazonS3 _s3;
     private readonly AvatarReencodeQueue _reencodeQueue;
@@ -27,12 +28,14 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
 
     public S3AvatarStorage(
         IOptions<AvatarStorageOptions> options,
-        ICacheProvider cache,
+        ICacheValueStore cache,
+        IAtomicCacheStore atomicCache,
         AvatarReencodeQueue reencodeQueue,
         ILogger<S3AvatarStorage> logger)
     {
         _options = options.Value;
         _cache = cache;
+        _atomicCache = atomicCache;
         _reencodeQueue = reencodeQueue;
         _logger = logger;
 
@@ -73,7 +76,7 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
 
-        await _cache.SetStringPayloadAsync(
+        await _cache.SetAsync(
             $"avatar:ticket:{ticket}",
             new LocalAvatarStorage.AvatarTicketInfo(userId, objectKey, contentType, contentLength),
             expires - DateTimeOffset.UtcNow,
@@ -105,7 +108,7 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
 
         var ticketKey = $"avatar:ticket:{ticket}";
         // 先原子消费票，避免并发 confirm 双重 finalize / 孤儿对象
-        var info = await _cache.TryGetAndDeleteStringPayloadAsync<LocalAvatarStorage.AvatarTicketInfo>(
+        var info = await _atomicCache.TryGetAndDeleteAsync<LocalAvatarStorage.AvatarTicketInfo>(
                 ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
@@ -122,7 +125,7 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
             // 校验失败时写回票，允许客户端重试（TTL 缩短）
             try
             {
-                await _cache.SetStringPayloadAsync(
+                await _cache.SetAsync(
                     ticketKey, info, TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
                     cancellationToken).ConfigureAwait(false);
             }

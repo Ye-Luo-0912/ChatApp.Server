@@ -17,6 +17,7 @@ namespace ChatApp.Server.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/auth")]
+[RequestSizeLimit(64 * 1024)]
 public class AuthController(
     IAuthService authService,
     IMfaService mfaService,
@@ -104,6 +105,7 @@ public class AuthController(
     /// 用户注册。
     /// </summary>
     [AllowAnonymous]
+    [EnableRateLimiting("auth-register")]
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterRequest model, CancellationToken ct)
     {
@@ -249,6 +251,7 @@ public class AuthController(
 
     /// <summary>开始 MFA 设置，返回密钥、otpauth URI 与恢复码（仅展示一次）。需密码确认。</summary>
     [Authorize]
+    [EnableRateLimiting("user-sensitive")]
     [HttpPost("mfa/setup")]
     public async Task<IActionResult> BeginMfaSetup(
         [FromBody] MfaSetupRequest model, CancellationToken cancellationToken)
@@ -272,6 +275,7 @@ public class AuthController(
 
     /// <summary>用 TOTP 确认启用 MFA。</summary>
     [Authorize]
+    [EnableRateLimiting("user-sensitive")]
     [HttpPost("mfa/confirm")]
     public async Task<IActionResult> ConfirmMfa([FromBody] MfaCodeRequest model, CancellationToken cancellationToken)
     {
@@ -286,6 +290,7 @@ public class AuthController(
 
     /// <summary>关闭 MFA（需密码 + TOTP 或恢复码）。</summary>
     [Authorize]
+    [EnableRateLimiting("user-sensitive")]
     [HttpPost("mfa/disable")]
     public async Task<IActionResult> DisableMfa([FromBody] MfaDisableRequest model, CancellationToken cancellationToken)
     {
@@ -304,6 +309,7 @@ public class AuthController(
 
     /// <summary>重新生成恢复码（旧码全部作废）。</summary>
     [Authorize]
+    [EnableRateLimiting("user-sensitive")]
     [HttpPost("mfa/recovery-codes/regenerate")]
     public async Task<IActionResult> RegenerateRecoveryCodes(
         [FromBody] MfaDisableRequest model, CancellationToken cancellationToken)

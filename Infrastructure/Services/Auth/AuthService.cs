@@ -31,7 +31,8 @@ public class AuthService(
     ITsidGenerator tsidGenerator,
     ISecurityEventStore securityEventStore,
     IMfaService mfaService,
-    ICacheProvider cache,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache,
     ISecurityNotificationService securityNotifications,
     ITrustedDeviceService trustedDevices,
     ILoginRiskAnalyzer loginRiskAnalyzer,
@@ -127,7 +128,8 @@ public class AuthService(
         var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, token);
         var attemptsKey = CacheKeyBuilder.WithPrefix(CacheConstants.MfaAttemptsPrefix, token);
 
-        var attempts = await cache.StringIncrementAsync(attemptsKey, MfaChallengeTtl, cancellationToken);
+        var attempts = await atomicCache.StringIncrementAsync(
+            attemptsKey, MfaChallengeTtl, cancellationToken);
         if (attempts > MaxMfaAttempts)
         {
             await cache.RemoveAsync(key, cancellationToken);

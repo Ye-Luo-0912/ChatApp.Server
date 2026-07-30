@@ -59,7 +59,8 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
 
     public async Task<bool> UpdateAsync(ApplicationUser user, CancellationToken cancellationToken = default)
     {
-        db.Users.Update(user);
+        // Repository queries return tracked users. Let EF persist only changed columns;
+        // Update(user) would mark the whole wide row modified and overwrite unrelated concurrent changes.
         return await db.SaveChangesAsync(cancellationToken) > 0;
     }
 
@@ -241,7 +242,6 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
             }
 
             user.SecurityStamp = Guid.NewGuid().ToString();
-            db.Users.Update(user);
 
             db.AdminAuditLogs.Add(new AdminAuditLog
             {

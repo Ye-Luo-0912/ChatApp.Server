@@ -14,12 +14,6 @@ public static class CacheKeyBuilder
         => string.Concat(prefix, key);
 
     /// <summary>
-    /// 根据完整 key 生成对应的分布式锁 key。
-    /// </summary>
-    public static string LockKey(string fullKey)
-        => string.Concat(CacheConstants.LockKeyPrefix, fullKey);
-
-    /// <summary>
     /// 构建带二级命名空间的 key，格式：{prefix}{domain}:{id}
     /// </summary>
     public static string WithDomain(string prefix, string domain, string id)

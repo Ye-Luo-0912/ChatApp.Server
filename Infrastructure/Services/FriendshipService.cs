@@ -15,7 +15,7 @@ namespace Infrastructure.Services;
 /// </summary>
 public class FriendshipService(
     UserDbContext context,
-    ICacheProvider cacheService,
+    ICacheValueStore cacheService,
     ILogger<FriendshipService> logger,
     ISecurityNotificationService? securityNotifications = null)
     : IFriendshipService
@@ -119,7 +119,7 @@ public class FriendshipService(
         // Everyone：自动通过（创建待处理申请后立即以对方身份接受）
         if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
         {
-            var create = await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, ct)
+            var create = await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
                 .ConfigureAwait(false);
             if (!create.IsSuccess
                 && create.Outcome != SendFriendRequestOutcome.RequestAlreadyPending
@@ -135,7 +135,7 @@ public class FriendshipService(
                     accept.Data);
         }
 
-        return await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, ct)
+        return await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
             .ConfigureAwait(false);
     }
 
@@ -201,7 +201,7 @@ public class FriendshipService(
     /// <returns>返回创建或更新好友请求的结果，包含操作是否成功、错误码及消息等信息</returns>
     private async Task<SendFriendRequestResult> CreateOrUpdateRequestAsync(
         long requesterId, long targetUserId,
-        string? message, CancellationToken ct)
+        string? message, bool targetNotifiesFriendRequests, CancellationToken ct)
     {
         //获取好友请求
         var existingRequest = await context.FriendRequests
@@ -238,6 +238,16 @@ public class FriendshipService(
                 existingRequest.RespondedAt = null;
             }
 
+            // 好友申请通知在同一事务内写入 NotificationOutbox，由 Worker 投递。
+            // 不再使用 fire-and-forget（避免 DbContext 释放/并发使用/丢通知）。
+            if (targetNotifiesFriendRequests && securityNotifications is not null)
+            {
+                securityNotifications.StageNotify(
+                    targetUserId, "FriendRequest", "新的好友申请",
+                    $"用户 {requesterId} 向你发送了好友申请。",
+                    preferEmail: false);
+            }
+
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -254,32 +264,7 @@ public class FriendshipService(
                 "操作失败，请稍后重试");
         }
 
-        TryNotifyFriendRequest(targetUserId, requesterId);
         return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestSent);
-    }
-
-    private void TryNotifyFriendRequest(long targetUserId, long requesterId)
-    {
-        if (securityNotifications is null) return;
-        _ = NotifyFriendRequestAsync(targetUserId, requesterId);
-    }
-
-    private async Task NotifyFriendRequestAsync(long targetUserId, long requesterId)
-    {
-        try
-        {
-            var target = await context.Users.AsNoTracking()
-                .FirstOrDefaultAsync(u => u.Id == targetUserId);
-            if (target is null || !target.NotifyFriendRequests) return;
-            await securityNotifications!.NotifyAsync(
-                targetUserId, "FriendRequest", "新的好友申请",
-                $"用户 {requesterId} 向你发送了好友申请。",
-                preferEmail: false, CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "好友申请通知失败 Target={Target}", targetUserId);
-        }
     }
 
     /// <summary>
@@ -772,8 +757,8 @@ public class FriendshipService(
     /// <summary>
     /// 获取好友列表
     /// </summary>
-    public async Task<CursorPage<T>> GetFriendsAsync<T>(long userId, Expression<Func<UserFriendEntry, T>> func,
-        string? cursor = null, int limit = DefaultPageLimit, CancellationToken ct = default) where T : class
+    public async Task<CursorPage<FriendDto>> GetFriendsAsync(
+        long userId, string? cursor = null, int limit = DefaultPageLimit, CancellationToken ct = default)
     {
         var pageSize = ClampLimit(limit);
         var cursorId = ParseCursor(cursor);
@@ -784,24 +769,32 @@ public class FriendshipService(
         if (cursorId.HasValue)
             query = query.Where(f => f.FriendId > cursorId.Value);
 
-        var entries = await query
+        var items = await query
             .OrderBy(f => f.FriendId)
+            .Select(f => new FriendDto
+            {
+                FriendId = f.FriendId,
+                FriendName = f.Friend!.UserName,
+                Note = f.Note,
+                CreatedAt = f.CreatedAt,
+                GroupId = f.GroupId,
+                GroupName = f.Group != null ? f.Group.GroupName : null,
+                AvatarUrl = f.Friend!.AvatarUrl,
+            })
             .Take(pageSize + 1)
-            .Include(f => f.Friend)
-            .Include(f => f.Group)
             .AsNoTracking()
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        return BuildPage(entries, pageSize, e => e.FriendId, func);
+        return BuildPage(items, pageSize, x => x.FriendId);
     }
 
     /// <summary>
     /// 获取好友请求列表
     /// </summary>
-    public async Task<CursorPage<T>> GetRequestsAsync<T>(long userId, Expression<Func<FriendRequest, T>> func,
-        FriendRequestType requestType, string? cursor = null, int limit = DefaultPageLimit,
-        CancellationToken ct = default) where T : class
+    public async Task<CursorPage<FriendRequestDto>> GetRequestsAsync(
+        long userId, FriendRequestType requestType, string? cursor = null, int limit = DefaultPageLimit,
+        CancellationToken ct = default)
     {
         var pageSize = ClampLimit(limit);
         var cursorId = ParseCursor(cursor);
@@ -818,16 +811,23 @@ public class FriendshipService(
         if (cursorId.HasValue)
             query = query.Where(r => r.RequestId > cursorId.Value);
 
-        var entries = await query
+        var items = await query
             .OrderBy(r => r.RequestId)
+            .Select(r => new FriendRequestDto
+            {
+                RequestId = r.RequestId,
+                RequesterId = r.RequesterId,
+                TargetUserId = r.TargetUserId,
+                Message = r.Message,
+                Status = r.Status,
+                CreatedAt = r.CreatedAt,
+            })
             .Take(pageSize + 1)
-            .Include(r => r.Requester)
-            .Include(r => r.TargetUser)
             .AsNoTracking()
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        return BuildPage(entries, pageSize, r => r.RequestId, func);
+        return BuildPage(items, pageSize, x => x.RequestId);
     }
 
     /// <summary>
@@ -1170,20 +1170,9 @@ public class FriendshipService(
         if (cursorId.HasValue)
             query = query.Where(f => f.FriendId > cursorId.Value);
 
-        var entries = await query
+        var items = await query
             .OrderBy(f => f.FriendId)
-            .Take(pageSize + 1)
-            .Include(f => f.Friend)
-            .Include(f => f.Group)
-            .AsNoTracking()
-            .ToListAsync(ct)
-            .ConfigureAwait(false);
-
-        return BuildPage(
-            entries,
-            pageSize,
-            e => e.FriendId,
-            f => new FriendDto
+            .Select(f => new FriendDto
             {
                 FriendId = f.FriendId,
                 FriendName = f.Friend!.UserName,
@@ -1192,7 +1181,13 @@ public class FriendshipService(
                 GroupId = f.GroupId,
                 GroupName = f.Group != null ? f.Group.GroupName : null,
                 AvatarUrl = f.Friend!.AvatarUrl,
-            });
+            })
+            .Take(pageSize + 1)
+            .AsNoTracking()
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        return BuildPage(items, pageSize, x => x.FriendId);
     }
 
     /// <summary>
@@ -1219,44 +1214,32 @@ public class FriendshipService(
         if (cursorId.HasValue)
             query = query.Where(f => f.FriendId > cursorId.Value);
 
-        var entries = await query
+        var items = await query
             .OrderBy(f => f.FriendId)
+            .Select(f => new FriendSearchResultDto
+            {
+                FriendId = f.FriendId,
+                FriendName = f.Friend!.UserName,
+                Note = f.Note,
+                LastInteractionAt = f.Friend!.LastLoginDate,
+            })
             .Take(pageSize + 1)
-            .Include(f => f.Friend)
             .AsNoTracking()
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        var hasMore = entries.Count > pageSize;
-        if (hasMore)
-            entries.RemoveAt(entries.Count - 1);
-
-        var items = entries.Select(f => new FriendSearchResultDto
-        {
-            FriendId = f.Friend!.Id,
-            FriendName = f.Friend.UserName,
-            Note = f.Note,
-            LastInteractionAt = f.Friend.LastLoginDate
-        }).ToList();
-
-        return new CursorPage<FriendSearchResultDto>
-        {
-            Items = items,
-            HasMore = hasMore,
-            NextCursor = hasMore && entries.Count > 0 ? entries[^1].FriendId.ToString() : null
-        };
+        return BuildPage(items, pageSize, x => x.FriendId);
     }
 
 
     /// <summary>
     /// 获取被指定用户封禁的用户列表
     /// </summary>
-    public async Task<CursorPage<T>> GetBlockedUsersAsync<T>(
+    public async Task<CursorPage<BlockedUserDto>> GetBlockedUsersAsync(
         long userId,
-        Expression<Func<BlockRecord, T>> selector,
         string? cursor = null,
         int limit = DefaultPageLimit,
-        CancellationToken ct = default) where T : class
+        CancellationToken ct = default)
     {
         var pageSize = ClampLimit(limit);
         var cursorId = ParseCursor(cursor);
@@ -1267,15 +1250,21 @@ public class FriendshipService(
         if (cursorId.HasValue)
             query = query.Where(b => b.BlockedUserId > cursorId.Value);
 
-        var entries = await query
+        var items = await query
             .OrderBy(b => b.BlockedUserId)
+            .Select(b => new BlockedUserDto
+            {
+                UserId = b.BlockedUserId,
+                UserName = b.BlockedUser!.UserName,
+                AvatarUrl = b.BlockedUser!.AvatarUrl,
+                BlockedAt = b.BlockedAt,
+            })
             .Take(pageSize + 1)
-            .Include(b => b.BlockedUser)
             .AsNoTracking()
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        return BuildPage(entries, pageSize, b => b.BlockedUserId, selector);
+        return BuildPage(items, pageSize, x => x.UserId);
     }
 
     /// <summary>
@@ -1335,24 +1324,20 @@ public class FriendshipService(
     private static long? ParseCursor(string? cursor) =>
         long.TryParse(cursor, out var id) ? id : null;
 
-    private static CursorPage<T> BuildPage<TEntity, T>(
-        List<TEntity> entries,
+    private static CursorPage<T> BuildPage<T>(
+        List<T> items,
         int limit,
-        Func<TEntity, long> idSelector,
-        Expression<Func<TEntity, T>> projector) where T : class
+        Func<T, long> idSelector) where T : class
     {
-        var hasMore = entries.Count > limit;
+        var hasMore = items.Count > limit;
         if (hasMore)
-            entries.RemoveAt(entries.Count - 1);
-
-        var compiled = projector.Compile();
-        var items = entries.Select(compiled).ToList();
+            items.RemoveAt(items.Count - 1);
 
         return new CursorPage<T>
         {
             Items = items,
             HasMore = hasMore,
-            NextCursor = hasMore && entries.Count > 0 ? idSelector(entries[^1]).ToString() : null
+            NextCursor = hasMore && items.Count > 0 ? idSelector(items[^1]).ToString() : null
         };
     }
 }

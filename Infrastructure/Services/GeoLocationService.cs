@@ -12,7 +12,7 @@ public class GeoLocationService : IGeoLocationService
 {
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GeoLocationService> _logger;
-    private readonly ICacheProvider _cache;
+    private readonly ICacheValueStore _cache;
 
     private const string HttpClientName = nameof(GeoLocationService);
     private const string CacheKeyPrefix = "geo:ip:";
@@ -20,7 +20,7 @@ public class GeoLocationService : IGeoLocationService
     private static readonly TimeSpan UnknownCacheTtl = TimeSpan.FromHours(1);
     private const int MaxRetries = 3;
 
-    public GeoLocationService(IHttpClientFactory httpClientFactory, ILogger<GeoLocationService> logger, ICacheProvider cache)
+    public GeoLocationService(IHttpClientFactory httpClientFactory, ILogger<GeoLocationService> logger, ICacheValueStore cache)
     {
         _httpClientFactory = httpClientFactory;
         _logger = logger;

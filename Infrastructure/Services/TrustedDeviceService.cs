@@ -21,7 +21,8 @@ public sealed class TrustedDeviceService(
     ISecurityEventStore securityEventStore,
     IPasswordHasher passwordHasher,
     IMfaService mfaService,
-    ICacheProvider cache,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache,
     IDeviceInfo deviceInfo,
     IHttpContextAccessor httpContextAccessor,
     IOptions<TrustedDeviceOptions> trustedDeviceOptions,
@@ -323,7 +324,7 @@ public sealed class TrustedDeviceService(
             if (TryParseStepUpPayload(stored, out var boundUserId, out var bound)
                 && boundUserId == userId
                 && BindingsMatch(bound, current.Value)
-                && await cache.TryStringCompareAndDeleteAsync(key, stored!, cancellationToken).ConfigureAwait(false))
+                && await atomicCache.TryStringCompareAndDeleteAsync(key, stored!, cancellationToken).ConfigureAwait(false))
             {
                 AuthSecurityMetrics.RecordTrusted("step_up_consumed");
                 return AuthOperationResult.Success();
@@ -337,7 +338,7 @@ public sealed class TrustedDeviceService(
         var recent = await cache.StringGetAsync(recentKey, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
         if (!string.IsNullOrEmpty(recent)
-            && await cache.TryStringCompareAndDeleteAsync(recentKey, recent, cancellationToken)
+            && await atomicCache.TryStringCompareAndDeleteAsync(recentKey, recent, cancellationToken)
                 .ConfigureAwait(false))
         {
             AuthSecurityMetrics.RecordTrusted("recent_mfa_consumed");

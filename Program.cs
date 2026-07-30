@@ -1,9 +1,9 @@
-using System.Net;
-using System.Threading.RateLimiting;
+﻿using System.Net;
+using Core.Interfaces;
 using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
-using Core.Interfaces.Cache;
+
 using Core.Settings;
 using Infrastructure.Auth;
 using Infrastructure.Data.Configurations;
@@ -11,7 +11,7 @@ using Infrastructure.Extensions;
 using Infrastructure.Serialization;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.AspNetCore.RateLimiting;
+using Infrastructure.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using NLog.Extensions.Logging;
@@ -75,7 +75,16 @@ public abstract partial class Program
             .Validate(s => s.AccessTokenExpirationMinutes > 0, "JwtSettings:AccessTokenExpirationMinutes 必须 > 0")
             .ValidateOnStart();
 
-        service.Configure<SecurityOptions>(config.GetSection(SecurityOptions.SectionName));
+        service.AddOptions<SecurityOptions>()
+            .Bind(config.GetSection(SecurityOptions.SectionName))
+            .Validate<IHostEnvironment>(
+                (options, environment) =>
+                    environment.IsDevelopment()
+                    || environment.IsEnvironment("Testing")
+                    || !string.IsNullOrWhiteSpace(options.SecretEncryptionKey),
+                "生产环境必须配置 Security:SecretEncryptionKey")
+            .Validate(s => s.KeyVersion > 0, "Security:KeyVersion 必须 > 0")
+            .ValidateOnStart();
 
         service.Configure<RealtimeGatewayOptions>(config.GetSection(RealtimeGatewayOptions.SectionName))
             .AddOptions<RealtimeGatewayOptions>()
@@ -85,7 +94,15 @@ public abstract partial class Program
 
         service.Configure<EmailConfig>(emailSettings)
             .AddOptions<EmailConfig>()
-            .Validate(s => string.IsNullOrWhiteSpace(s.Host) || s.Port > 0, "EmailSettings:Port 无效")
+            .Validate<IHostEnvironment>(
+                (options, environment) =>
+                    environment.IsDevelopment()
+                    || environment.IsEnvironment("Testing")
+                    || (!string.IsNullOrWhiteSpace(options.Host)
+                        && !string.IsNullOrWhiteSpace(options.SenderEmail)
+                        && !string.IsNullOrWhiteSpace(options.Password)),
+                "生产环境必须完整配置 EmailSettings:Host、SenderEmail、Password")
+            .Validate(s => s.Port is > 0 and <= 65535, "EmailSettings:Port 必须在 1-65535 之间")
             .ValidateOnStart();
 
         service.AddOptions<ForwardedHeadersSettings>()
@@ -128,92 +145,14 @@ public abstract partial class Program
             };
             options.AddPolicy("auth", TimeSpan.FromSeconds(20));
             options.AddPolicy("email", TimeSpan.FromSeconds(10));
+            // 大附件上传需要更长超时；端点级标注，不影响普通 API。
+            options.AddPolicy("attachment-upload", TimeSpan.FromMinutes(2));
         });
 
-        builder.Services.AddRateLimiter(options =>
-        {
-            var rate = config.GetSection(RateLimitingOptions.SectionName).Get<RateLimitingOptions>()
-                       ?? new RateLimitingOptions();
-
-            options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-            options.OnRejected = async (ctx, token) =>
-            {
-                ctx.HttpContext.Response.ContentType = "application/json";
-                await ctx.HttpContext.Response.WriteAsJsonAsync(new
-                {
-                    error = 429,
-                    message = "请求过于频繁，请稍后再试"
-                }, token);
-            };
-
-            options.AddPolicy("auth-login", httpContext =>
-            {
-                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
-                var key = GetClientKey(httpContext);
-                return RateLimitPartition.Get(
-                    $"auth-login:{key}",
-                    partition => new RedisFixedWindowRateLimiter(
-                        cache,
-                        partition,
-                        rate.AuthLoginPermitLimit,
-                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthLoginWindowSeconds))));
-            });
-
-            options.AddPolicy("auth-refresh", httpContext =>
-            {
-                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
-                var key = GetClientKey(httpContext);
-                return RateLimitPartition.Get(
-                    $"auth-refresh:{key}",
-                    partition => new RedisFixedWindowRateLimiter(
-                        cache,
-                        partition,
-                        rate.AuthRefreshPermitLimit,
-                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthRefreshWindowSeconds))));
-            });
-
-            options.AddPolicy("auth-email", httpContext =>
-            {
-                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
-                var key = GetClientKey(httpContext);
-                return RateLimitPartition.Get(
-                    $"auth-email:{key}",
-                    partition => new RedisFixedWindowRateLimiter(
-                        cache,
-                        partition,
-                        rate.AuthEmailPermitLimit,
-                        TimeSpan.FromSeconds(Math.Max(1, rate.AuthEmailWindowSeconds))));
-            });
-
-            // 按登录用户限流邮箱变更，防止轮换目标邮箱刷信
-            options.AddPolicy("user-email-change", httpContext =>
-            {
-                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
-                var userKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
-                              ?? GetClientKey(httpContext);
-                return RateLimitPartition.Get(
-                    $"email-change:{userKey}",
-                    partition => new RedisFixedWindowRateLimiter(
-                        cache,
-                        partition,
-                        rate.UserEmailChangePermitLimit,
-                        TimeSpan.FromSeconds(Math.Max(1, rate.UserEmailChangeWindowSeconds))));
-            });
-
-            options.AddPolicy("user-sensitive", httpContext =>
-            {
-                var cache = httpContext.RequestServices.GetRequiredService<ICacheProvider>();
-                var userKey = httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
-                              ?? GetClientKey(httpContext);
-                return RateLimitPartition.Get(
-                    $"sensitive:{userKey}",
-                    partition => new RedisFixedWindowRateLimiter(
-                        cache,
-                        partition,
-                        rate.UserSensitivePermitLimit,
-                        TimeSpan.FromSeconds(Math.Max(1, rate.UserSensitiveWindowSeconds))));
-            });
-        });
+        // P0-6：单例分布式限流器 + 策略提供者（不再为每个分区键创建本地 RateLimiter 对象）。
+        builder.Services.Configure<RateLimitingOptions>(config.GetSection(RateLimitingOptions.SectionName));
+        builder.Services.AddSingleton<IDistributedRateLimiter, RedisDistributedRateLimiter>();
+        builder.Services.AddSingleton<IRateLimitPolicyProvider, RateLimitPolicyProvider>();
 
         var healthChecks = builder.Services.AddHealthChecks()
             .AddRedis(
@@ -231,7 +170,9 @@ public abstract partial class Program
 
         builder.WebHost.ConfigureKestrel(options =>
         {
-            options.Limits.MaxRequestBodySize = 3 * 1024 * 1024;
+            // 宿主安全上限：允许最大附件端点（30MB）+ 编码/表单开销。
+            // 真实限制由端点元数据 [RequestSizeLimit] 决定，不再在此收紧。
+            options.Limits.MaxRequestBodySize = 32 * 1024 * 1024;
             options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(30);
             options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
         });
@@ -251,14 +192,17 @@ public abstract partial class Program
         app.UseMiddleware<CorrelationIdMiddleware>();
         app.UseMiddleware<ExceptionHandlingMiddleware>();
         // TestServer 不完全遵循 Kestrel MaxRequestBodySize，用 Content-Length 显式拒绝超限请求
-        app.UseMiddleware<RequestBodySizeLimitMiddleware>(3L * 1024 * 1024);
+        app.UseRouting();
+        app.UseMiddleware<RequestBodySizeLimitMiddleware>(32L * 1024 * 1024);
         app.UseCors("AllowSpecific");
         // 反代场景默认关闭：TLS 在 Nginx/LB 终止；需要时可设 EnableHttpsRedirection=true
         if (builder.Configuration.GetValue("EnableHttpsRedirection", false))
             app.UseHttpsRedirection();
         app.UseRequestTimeouts();
-        app.UseRateLimiter();
+        // P0-2：先认证再限流，使 user-email-change / user-sensitive 能按用户 Claim 分区。
+        // 匿名接口（login/register）仍按 IP/device/email 多维限流。
         app.UseAuthentication();
+        app.UseDistributedRateLimiting();
         app.UseAuthorization();
 
         var avatarRoot = builder.Configuration[$"{AvatarStorageOptions.SectionName}:LocalRootPath"]
@@ -430,12 +374,6 @@ public abstract partial class Program
             DeadLettersStream = hostOpts.DeadLettersStream,
             ManageStreams = false,
         });
-    }
-
-    private static string GetClientKey(HttpContext httpContext)
-    {
-        var ip = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-        return $"{ip}:{httpContext.Request.Path}";
     }
 
     /// <summary>仅用于启动时校验连接串已配置（读取发生在宿主启动，晚于测试配置注入）。</summary>

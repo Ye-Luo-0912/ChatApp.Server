@@ -91,6 +91,8 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
 
         return new TokenService(
             redis.Cache,
+            redis.Cache,
+            redis.Cache,
             new FixedDeviceInfo(deviceId),
             jwt,
             NullLogger<TokenService>.Instance);

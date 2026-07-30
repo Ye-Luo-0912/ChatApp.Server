@@ -11,22 +11,22 @@ COPY ChatApp.RealtimeServices/ChatApp.Realtime.Integration/ChatApp.Realtime.Inte
 RUN dotnet restore ChatApp.Server/ChatApp.Server.csproj
 COPY ChatApp.Server/ ChatApp.Server/
 COPY ChatApp.RealtimeServices/ ChatApp.RealtimeServices/
-RUN dotnet publish ChatApp.Server/ChatApp.Server.csproj -c Release -o /app/publish --no-restore
+RUN dotnet publish ChatApp.Server/ChatApp.Server.csproj \
+    -c Release -o /app/publish --no-restore -m:1
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 ENV ASPNETCORE_URLS=http://0.0.0.0:8080
 ENV EnableHttpsRedirection=false
 ENV AvatarStorage__LocalRootPath=/app/App_Data/avatars
+ENV AttachmentStorage__LocalRootPath=/app/App_Data/attachments
+ENV DataExport__LocalRootPath=/app/App_Data/exports
 EXPOSE 8080
 
 USER root
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
- && rm -rf /var/lib/apt/lists/* \
- && groupadd --system --gid 10001 chatapp \
+RUN groupadd --system --gid 10001 chatapp \
  && useradd --system --uid 10001 --gid chatapp --home-dir /app --shell /usr/sbin/nologin chatapp \
- && mkdir -p /app/App_Data/avatars \
+ && mkdir -p /app/App_Data/avatars /app/App_Data/attachments /app/App_Data/exports \
  && chown -R chatapp:chatapp /app
 
 COPY --from=build --chown=chatapp:chatapp /app/publish .

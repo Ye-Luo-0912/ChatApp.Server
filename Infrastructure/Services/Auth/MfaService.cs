@@ -18,7 +18,7 @@ public sealed class MfaService(
     IRecoveryCodeHasher recoveryCodeHasher,
     IMfaSecretProtector secretProtector,
     ISecurityEventStore securityEventStore,
-    ICacheProvider cache,
+    IAtomicCacheStore cache,
     ILogger<MfaService> logger) : IMfaService
 {
     private const string Issuer = "ChatApp";

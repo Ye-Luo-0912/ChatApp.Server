@@ -39,8 +39,6 @@ public static class InfrastructureExtensions
                 options.UseNpgsql(connectionString, npgsql =>
                 {
                     npgsql.CommandTimeout(15);
-                    npgsql.EnableRetryOnFailure(maxRetryCount: 2, maxRetryDelay: TimeSpan.FromSeconds(2),
-                        errorCodesToAdd: null);
                 }).AddInterceptors(serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>());
             });
 
@@ -58,7 +56,10 @@ public static class InfrastructureExtensions
             services.AddOptions<RedisCacheOptions>()
                 .Configure<IConfiguration>((opts, configuration) =>
                     configuration.GetSection(RedisCacheOptions.SectionName).Bind(opts));
-            services.AddSingleton<ICacheProvider, RedisCaching>();
+            services.AddSingleton<RedisCacheStore>();
+            services.AddSingleton<ICacheValueStore>(sp => sp.GetRequiredService<RedisCacheStore>());
+            services.AddSingleton<IAtomicCacheStore>(sp => sp.GetRequiredService<RedisCacheStore>());
+            services.AddSingleton<ICacheSetStore>(sp => sp.GetRequiredService<RedisCacheStore>());
             return services;
         }
 
@@ -80,6 +81,7 @@ public static class InfrastructureExtensions
                 configurationOptions.ResolveDns = false;
                 configurationOptions.ConnectTimeout = 1000;
                 configurationOptions.SyncTimeout = 1000;
+                configurationOptions.AsyncTimeout = 1000;
                 configurationOptions.AbortOnConnectFail = false;
                 configurationOptions.ConnectRetry = 1;
                 configurationOptions.KeepAlive = 180;

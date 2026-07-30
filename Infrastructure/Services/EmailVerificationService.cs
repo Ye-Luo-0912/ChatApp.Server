@@ -9,7 +9,10 @@ namespace Infrastructure.Services;
 /// <summary>
 /// 负责邮箱验证码的发送与校验；冷却锁与验证码消费均使用 Redis 原子操作。
 /// </summary>
-public class EmailVerificationService(IEmailSender emailSender, ICacheProvider cacheProvider)
+public class EmailVerificationService(
+    IEmailSender emailSender,
+    ICacheValueStore cache,
+    IAtomicCacheStore atomicCache)
     : IEmailVerificationService
 {
     private static readonly TimeSpan CodeLifetime = TimeSpan.FromMinutes(5);
@@ -31,14 +34,14 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
             var cooldownKey = GetCooldownKey(normalizedEmail, codePurpose);
 
             // SET NX：同一邮箱+用途的冷却窗口原子抢占，杜绝并发重复发信。
-            var acquiredCooldown = await cacheProvider
+            var acquiredCooldown = await atomicCache
                 .StringSetIfNotExistsAsync(cooldownKey, "1", ResendCooldown, cancellation)
                 .ConfigureAwait(false);
 
             if (!acquiredCooldown)
                 return new EmailResult { IsSuccess = false, ErrorMessage = "操作太频繁，请稍后再试" };
 
-            var cachedCode = await cacheProvider
+            var cachedCode = await cache
                 .StringGetAsync(dataKey, cancellationToken: cancellation)
                 .ConfigureAwait(false);
 
@@ -52,8 +55,8 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
             else
             {
                 codeToSend = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
-                await cacheProvider
-                    .StringSetAsync(dataKey, codeToSend, absoluteExpiration: CodeLifetime, cancellationToken: cancellation)
+                await cache
+                    .StringSetAsync(dataKey, codeToSend, CodeLifetime, cancellation)
                     .ConfigureAwait(false);
                 createdNewCode = true;
             }
@@ -64,9 +67,9 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
             if (!sendResult.IsSuccess)
             {
                 // 发送失败时释放冷却，允许立即重试；新生成的码也一并清掉，避免占坑。
-                await cacheProvider.RemoveAsync(cooldownKey, cancellation).ConfigureAwait(false);
+                await cache.RemoveAsync(cooldownKey, cancellation).ConfigureAwait(false);
                 if (createdNewCode)
-                    await cacheProvider.RemoveAsync(dataKey, cancellation).ConfigureAwait(false);
+                    await cache.RemoveAsync(dataKey, cancellation).ConfigureAwait(false);
             }
 
             return sendResult;
@@ -97,7 +100,7 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
         var cacheKey = GetCacheKey(normalizedEmail, codePurpose);
         var failKey = GetFailKey(normalizedEmail, codePurpose);
 
-        var failures = await cacheProvider.StringGetAsync(failKey, cancellationToken: cancellation)
+        var failures = await cache.StringGetAsync(failKey, cancellation)
             .ConfigureAwait(false);
         if (failures is not null
             && long.TryParse(failures, out var failCount)
@@ -107,24 +110,24 @@ public class EmailVerificationService(IEmailSender emailSender, ICacheProvider c
         }
 
         // 原子 compare-and-delete：并发验证同一码时严格只有一次成功。
-        var consumed = await cacheProvider
+        var consumed = await atomicCache
             .TryStringCompareAndDeleteAsync(cacheKey, normalizedCode, cancellation)
             .ConfigureAwait(false);
 
         if (consumed)
         {
-            await cacheProvider.RemoveAsync(failKey, cancellation).ConfigureAwait(false);
+            await cache.RemoveAsync(failKey, cancellation).ConfigureAwait(false);
             return new EmailResult { IsSuccess = true };
         }
 
-        var savedCode = await cacheProvider
+        var savedCode = await cache
             .StringGetAsync(cacheKey, cancellationToken: cancellation)
             .ConfigureAwait(false);
 
         if (string.IsNullOrEmpty(savedCode))
             return new EmailResult { IsSuccess = false, ErrorMessage = "验证码已过期或尚未发送" };
 
-        await cacheProvider
+        await atomicCache
             .StringIncrementAsync(failKey, FailWindow, cancellation)
             .ConfigureAwait(false);
 

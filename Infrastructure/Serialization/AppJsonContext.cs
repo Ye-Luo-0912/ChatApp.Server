@@ -6,6 +6,7 @@ using Core.Models.Friend;
 using Core.Models.Identity;
 using Core.Models.Token;
 using Core.Models.User;
+using Infrastructure.Services;
 
 namespace Infrastructure.Serialization;
 
@@ -47,6 +48,10 @@ namespace Infrastructure.Serialization;
 [JsonSerializable(typeof(AccessTokenData))]
 [JsonSerializable(typeof(RefreshToken))]
 [JsonSerializable(typeof(SessionRecord))]
+[JsonSerializable(typeof(FriendshipStatusInfo))]
+[JsonSerializable(typeof(AttachmentDownloadTicketPayload))]
+[JsonSerializable(typeof(LocalAttachmentStorage.AttachmentTicketInfo))]
+[JsonSerializable(typeof(LocalAvatarStorage.AvatarTicketInfo))]
 [JsonSerializable(typeof(UserStatus))]
 public partial class AppJsonContext : JsonSerializerContext
 {

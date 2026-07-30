@@ -31,7 +31,7 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-scan-att", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(attachmentRoot);
 
@@ -124,7 +124,7 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-scan-rej", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(attachmentRoot);
 
@@ -200,35 +200,6 @@ public sealed class AttachmentScanGateTests(PostgresTestFixture postgres, RedisT
         for (var i = 0; i < 5; i++)
             total += await scans.ProcessDueAsync();
         return total;
-    }
-
-    private static async Task EnsureSchemaAsync(string connectionString)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            """
-            CREATE SCHEMA IF NOT EXISTS realtime;
-            CREATE TABLE IF NOT EXISTS realtime.attachments (
-                attachment_id         varchar(64)   PRIMARY KEY,
-                uploader_user_id      bigint        NOT NULL,
-                object_key            varchar(512)  NOT NULL,
-                public_url            varchar(1024) NULL,
-                content_type          varchar(128)  NOT NULL,
-                size_bytes            bigint        NOT NULL,
-                original_name         varchar(256)  NULL,
-                status                smallint      NOT NULL,
-                message_id            varchar(64)   NULL,
-                conversation_id       varchar(64)   NULL,
-                client_attachment_id  varchar(128)  NULL,
-                created_at_ms         bigint        NOT NULL,
-                confirmed_at_ms       bigint        NULL,
-                bound_at_ms           bigint        NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_attachments_object_key
-                ON realtime.attachments (object_key);
-            """, conn);
-        await cmd.ExecuteNonQueryAsync();
     }
 
     private sealed record PresignDto(

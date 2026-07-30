@@ -30,7 +30,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-dl-att", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(attachmentRoot);
 
@@ -107,7 +107,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         await using var factory = CreateFactory();
         var suffix = Guid.NewGuid().ToString("N")[..8];
 
@@ -164,7 +164,7 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         await using var factory = CreateFactory();
         var suffix = Guid.NewGuid().ToString("N")[..8];
 
@@ -263,49 +263,6 @@ public sealed class AttachmentDownloadAuthTests(PostgresTestFixture postgres, Re
             if (await scans.ProcessDueAsync() > 0)
                 return;
         }
-    }
-
-    private static async Task EnsureSchemaAsync(string connectionString)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            """
-            CREATE SCHEMA IF NOT EXISTS realtime;
-            CREATE TABLE IF NOT EXISTS realtime.attachments (
-                attachment_id         varchar(64)   PRIMARY KEY,
-                uploader_user_id      bigint        NOT NULL,
-                object_key            varchar(512)  NOT NULL,
-                public_url            varchar(1024) NULL,
-                content_type          varchar(128)  NOT NULL,
-                size_bytes            bigint        NOT NULL,
-                original_name         varchar(256)  NULL,
-                status                smallint      NOT NULL,
-                message_id            varchar(64)   NULL,
-                conversation_id       varchar(64)   NULL,
-                client_attachment_id  varchar(128)  NULL,
-                created_at_ms         bigint        NOT NULL,
-                confirmed_at_ms       bigint        NULL,
-                bound_at_ms           bigint        NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_attachments_object_key
-                ON realtime.attachments (object_key);
-            CREATE TABLE IF NOT EXISTS realtime.conversation_members (
-                conversation_id varchar(64) NOT NULL,
-                user_id         bigint      NOT NULL,
-                joined_at_ms    bigint      NOT NULL,
-                PRIMARY KEY (conversation_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS realtime.messages (
-                message_id      varchar(64) PRIMARY KEY,
-                sender_user_id  bigint NOT NULL,
-                receiver_user_id bigint NOT NULL,
-                conversation_id varchar(64) NULL,
-                content         text NULL,
-                created_at_ms   bigint NOT NULL DEFAULT 0
-            );
-            """, conn);
-        await cmd.ExecuteNonQueryAsync();
     }
 
     private sealed record PresignDto(

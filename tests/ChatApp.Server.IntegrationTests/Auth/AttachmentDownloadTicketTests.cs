@@ -20,7 +20,7 @@ public sealed class AttachmentDownloadTicketTests(PostgresTestFixture postgres, 
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         var root = Path.Combine(Path.GetTempPath(), "chatapp-dl-ticket", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
 
@@ -78,8 +78,8 @@ public sealed class AttachmentDownloadTicketTests(PostgresTestFixture postgres, 
 
         await using (var scope = factory.Services.CreateAsyncScope())
         {
-            var cache = scope.ServiceProvider.GetRequiredService<ICacheProvider>();
-            await cache.KeyDeleteAsync(CacheConstants.AttachmentDownloadTicketPrefix + ticket3!.Ticket);
+            var cache = scope.ServiceProvider.GetRequiredService<ICacheValueStore>();
+            await cache.RemoveAsync(CacheConstants.AttachmentDownloadTicketPrefix + ticket3!.Ticket);
         }
 
         var expired = await owner.GetAsync(
@@ -93,7 +93,7 @@ public sealed class AttachmentDownloadTicketTests(PostgresTestFixture postgres, 
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
         var root = Path.Combine(Path.GetTempPath(), "chatapp-dl-ticket-scan", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         await using var factory = CreateFactory(root);
@@ -169,35 +169,6 @@ public sealed class AttachmentDownloadTicketTests(PostgresTestFixture postgres, 
         var scans = scope.ServiceProvider.GetRequiredService<Core.Interfaces.IAttachmentScanService>();
         Assert.True(await scans.ProcessDueAsync() >= 1);
         return ticket.AttachmentId;
-    }
-
-    private static async Task EnsureSchemaAsync(string connectionString)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            """
-            CREATE SCHEMA IF NOT EXISTS realtime;
-            CREATE TABLE IF NOT EXISTS realtime.attachments (
-                attachment_id         varchar(64)   PRIMARY KEY,
-                uploader_user_id      bigint        NOT NULL,
-                object_key            varchar(512)  NOT NULL,
-                public_url            varchar(1024) NULL,
-                content_type          varchar(128)  NOT NULL,
-                size_bytes            bigint        NOT NULL,
-                original_name         varchar(256)  NULL,
-                status                smallint      NOT NULL,
-                message_id            varchar(64)   NULL,
-                conversation_id       varchar(64)   NULL,
-                client_attachment_id  varchar(128)  NULL,
-                created_at_ms         bigint        NOT NULL,
-                confirmed_at_ms       bigint        NULL,
-                bound_at_ms           bigint        NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_attachments_object_key
-                ON realtime.attachments (object_key);
-            """, conn);
-        await cmd.ExecuteNonQueryAsync();
     }
 
     private sealed record PresignDto(

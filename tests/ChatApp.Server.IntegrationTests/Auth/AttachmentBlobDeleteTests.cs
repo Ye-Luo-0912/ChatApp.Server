@@ -75,6 +75,7 @@ public sealed class AttachmentBlobDeleteTests
                 UsePublicStatic = false,
             }),
             new ChatApp.Server.IntegrationTests.Support.NoopCacheProvider(),
+            new ChatApp.Server.IntegrationTests.Support.NoopCacheProvider(),
             NullLogger<LocalAttachmentStorage>.Instance);
         var svc = CreateService(db, storage);
 

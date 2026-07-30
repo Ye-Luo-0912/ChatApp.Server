@@ -43,6 +43,7 @@ public sealed class AttachmentSignedDownloadTests
                 UsePublicStatic = false,
             }),
             new NoopCacheProvider(),
+            new NoopCacheProvider(),
             NullLogger<LocalAttachmentStorage>.Instance);
 
         Assert.Null(await storage.CreateSignedDownloadUrlAsync(key));

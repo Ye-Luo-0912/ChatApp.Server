@@ -8,6 +8,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Npgsql;
+using NpgsqlTypes;
 
 namespace Infrastructure.Services;
 
@@ -85,46 +87,22 @@ public sealed class NotificationOutboxDispatcher(
         var pending = items.Where(i => i.InAppDeliveredAt is null).ToList();
         if (pending.Count == 0) return;
 
+        await InsertInAppNotificationsAsync(pending, cancellationToken);
+
         var ids = pending.Select(i => i.Id).ToList();
-        var existing = await db.InAppNotifications.AsNoTracking()
-            .Where(n => n.SourceOutboxId != null && ids.Contains(n.SourceOutboxId.Value))
-            .Select(n => n.SourceOutboxId!.Value)
-            .ToListAsync(cancellationToken);
-        var existingSet = existing.ToHashSet();
-
-        var toInsert = pending.Where(i => !existingSet.Contains(i.Id)).ToList();
-        if (toInsert.Count > 0)
-        {
-            foreach (var item in toInsert)
-            {
-                db.InAppNotifications.Add(new InAppNotification
-                {
-                    UserId = item.UserId,
-                    Type = item.Type,
-                    Title = item.Title,
-                    Body = item.Body,
-                    CreatedAt = DateTimeOffset.UtcNow,
-                    SourceOutboxId = item.Id,
-                });
-            }
-
-            try
-            {
-                await db.SaveChangesAsync(cancellationToken);
-            }
-            catch (DbUpdateException)
-            {
-                db.ChangeTracker.Clear();
-            }
-        }
-
         var now = DateTimeOffset.UtcNow;
-        await db.NotificationOutbox
-            .Where(x => ids.Contains(x.Id) && x.InAppDeliveredAt == null)
+        var updated = await db.NotificationOutbox
+            .Where(x => ids.Contains(x.Id)
+                && x.InAppDeliveredAt == null
+                && x.Status == NotificationOutboxStatus.Processing
+                && x.LockOwner == InstanceId)
             .ExecuteUpdateAsync(
                 s => s.SetProperty(x => x.InAppDeliveredAt, now)
                     .SetProperty(x => x.UpdatedAt, now),
                 cancellationToken);
+
+        if (updated != pending.Count)
+            throw new InvalidOperationException("通知 Outbox 租约已失效，停止处理当前批次");
 
         foreach (var item in pending)
             item.InAppDeliveredAt = now;
@@ -136,63 +114,74 @@ public sealed class NotificationOutboxDispatcher(
         {
             if (item.InAppDeliveredAt is null)
             {
-                var already = await db.InAppNotifications.AsNoTracking()
-                    .AnyAsync(n => n.SourceOutboxId == item.Id, cancellationToken);
-                if (!already)
-                {
-                    db.InAppNotifications.Add(new InAppNotification
-                    {
-                        UserId = item.UserId,
-                        Type = item.Type,
-                        Title = item.Title,
-                        Body = item.Body,
-                        CreatedAt = DateTimeOffset.UtcNow,
-                        SourceOutboxId = item.Id,
-                    });
-                    try
-                    {
-                        await db.SaveChangesAsync(cancellationToken);
-                    }
-                    catch (DbUpdateException)
-                    {
-                        db.ChangeTracker.Clear();
-                    }
-                }
+                await InsertInAppNotificationsAsync([item], cancellationToken);
 
-                await db.NotificationOutbox
-                    .Where(x => x.Id == item.Id && x.InAppDeliveredAt == null)
+                var deliveredAt = DateTimeOffset.UtcNow;
+                var updated = await db.NotificationOutbox
+                    .Where(x => x.Id == item.Id
+                        && x.InAppDeliveredAt == null
+                        && x.Status == NotificationOutboxStatus.Processing
+                        && x.LockOwner == InstanceId
+                        && x.LockedAt == item.LockedAt)
                     .ExecuteUpdateAsync(
-                        s => s.SetProperty(x => x.InAppDeliveredAt, DateTimeOffset.UtcNow)
-                            .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow),
+                        s => s.SetProperty(x => x.InAppDeliveredAt, deliveredAt)
+                            .SetProperty(x => x.UpdatedAt, deliveredAt),
                         cancellationToken);
-                item.InAppDeliveredAt = DateTimeOffset.UtcNow;
+                if (updated == 0) return;
+                item.InAppDeliveredAt = deliveredAt;
             }
 
             if (item.PreferEmail && item.EmailDeliveredAt is null)
             {
+                var renewedAt = DateTimeOffset.UtcNow;
+                var renewed = await db.NotificationOutbox
+                    .Where(x => x.Id == item.Id
+                        && x.Status == NotificationOutboxStatus.Processing
+                        && x.LockOwner == InstanceId
+                        && x.LockedAt == item.LockedAt)
+                    .ExecuteUpdateAsync(
+                        s => s.SetProperty(x => x.LockedAt, renewedAt)
+                            .SetProperty(x => x.UpdatedAt, renewedAt),
+                        cancellationToken);
+                if (renewed == 0) return;
+                item.LockedAt = renewedAt;
+
                 var user = await db.Users.AsNoTracking()
                     .FirstOrDefaultAsync(u => u.Id == item.UserId, cancellationToken);
                 if (user is { NotifySecurityEmail: true } && !string.IsNullOrWhiteSpace(user.Email))
                 {
-                    await emailSender.SendEmailAsync(
+                    var email = await emailSender.EnqueueEmailAsync(
                         user.Email,
                         $"[ChatApp] {item.Title}",
                         $"<p>{item.Body}</p><p>如非本人操作，请立即修改密码并检查登录设备。</p>",
                         isHtml: true,
+                        emailType: "SecurityNotification",
+                        idempotencyKey: $"notification:{item.Id}",
                         cancellationToken);
+                    if (!email.IsSuccess)
+                        throw new InvalidOperationException(email.ErrorMessage ?? "安全通知邮件入队失败");
                 }
 
-                await db.NotificationOutbox
-                    .Where(x => x.Id == item.Id && x.EmailDeliveredAt == null)
+                var deliveredAt = DateTimeOffset.UtcNow;
+                var updated = await db.NotificationOutbox
+                    .Where(x => x.Id == item.Id
+                        && x.EmailDeliveredAt == null
+                        && x.Status == NotificationOutboxStatus.Processing
+                        && x.LockOwner == InstanceId
+                        && x.LockedAt == item.LockedAt)
                     .ExecuteUpdateAsync(
-                        s => s.SetProperty(x => x.EmailDeliveredAt, DateTimeOffset.UtcNow)
-                            .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow),
+                        s => s.SetProperty(x => x.EmailDeliveredAt, deliveredAt)
+                            .SetProperty(x => x.UpdatedAt, deliveredAt),
                         cancellationToken);
-                item.EmailDeliveredAt = DateTimeOffset.UtcNow;
+                if (updated == 0) return;
+                item.EmailDeliveredAt = deliveredAt;
             }
 
-            await db.NotificationOutbox
-                .Where(x => x.Id == item.Id)
+            var sent = await db.NotificationOutbox
+                .Where(x => x.Id == item.Id
+                    && x.Status == NotificationOutboxStatus.Processing
+                    && x.LockOwner == InstanceId
+                    && x.LockedAt == item.LockedAt)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(x => x.Status, NotificationOutboxStatus.Sent)
                         .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
@@ -200,7 +189,13 @@ public sealed class NotificationOutboxDispatcher(
                         .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow)
                         .SetProperty(x => x.LastError, (string?)null),
                     cancellationToken);
-            metrics.RecordSent();
+            if (sent == 1)
+                metrics.RecordSent();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await ReleaseLeaseAsync(item, CancellationToken.None);
+            throw;
         }
         catch (Exception ex)
         {
@@ -209,7 +204,10 @@ public sealed class NotificationOutboxDispatcher(
             var dead = attempts >= MaxAttempts;
             var delay = TimeSpan.FromSeconds(Math.Min(3600, Math.Pow(2, attempts) * 5));
             await db.NotificationOutbox
-                .Where(x => x.Id == item.Id)
+                .Where(x => x.Id == item.Id
+                    && x.Status == NotificationOutboxStatus.Processing
+                    && x.LockOwner == InstanceId
+                    && x.LockedAt == item.LockedAt)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(x => x.Status, dead ? NotificationOutboxStatus.Dead : NotificationOutboxStatus.Failed)
                         .SetProperty(x => x.AttemptCount, attempts)
@@ -223,6 +221,57 @@ public sealed class NotificationOutboxDispatcher(
             else metrics.RecordFailed();
         }
     }
+
+    private async Task InsertInAppNotificationsAsync(
+        IReadOnlyList<NotificationOutboxItem> items,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            INSERT INTO "T_InAppNotification"
+                ("UserId", "Type", "Title", "Body", "IsRead", "CreatedAt", "SourceOutboxId")
+            SELECT x."UserId", x."Type", x."Title", x."Body", FALSE, @created_at, x."SourceOutboxId"
+            FROM unnest(@user_ids, @types, @titles, @bodies, @source_ids)
+                AS x("UserId", "Type", "Title", "Body", "SourceOutboxId")
+            ON CONFLICT ("SourceOutboxId") WHERE "SourceOutboxId" IS NOT NULL DO NOTHING
+            """;
+
+        object[] parameters =
+        [
+            new NpgsqlParameter("user_ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint)
+                { Value = items.Select(x => x.UserId).ToArray() },
+            new NpgsqlParameter("types", NpgsqlDbType.Array | NpgsqlDbType.Text)
+                { Value = items.Select(x => x.Type).ToArray() },
+            new NpgsqlParameter("titles", NpgsqlDbType.Array | NpgsqlDbType.Text)
+                { Value = items.Select(x => x.Title).ToArray() },
+            new NpgsqlParameter("bodies", NpgsqlDbType.Array | NpgsqlDbType.Text)
+                { Value = items.Select(x => x.Body).ToArray() },
+            new NpgsqlParameter("source_ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint)
+                { Value = items.Select(x => x.Id).ToArray() },
+            new NpgsqlParameter("created_at", NpgsqlDbType.TimestampTz)
+                { Value = DateTimeOffset.UtcNow },
+        ];
+
+        await db.Database.ExecuteSqlRawAsync(sql, parameters, cancellationToken);
+    }
+
+    private Task<int> ReleaseLeaseAsync(
+        NotificationOutboxItem item,
+        CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return db.NotificationOutbox
+            .Where(x => x.Id == item.Id
+                && x.Status == NotificationOutboxStatus.Processing
+                && x.LockOwner == InstanceId
+                && x.LockedAt == item.LockedAt)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(x => x.Status, NotificationOutboxStatus.Failed)
+                    .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
+                    .SetProperty(x => x.LockOwner, (string?)null)
+                    .SetProperty(x => x.NextAttemptAt, now)
+                    .SetProperty(x => x.UpdatedAt, now),
+                cancellationToken);
+    }
 }
 
 public sealed class NotificationDispatchWorker(
@@ -235,7 +284,8 @@ public sealed class NotificationDispatchWorker(
     {
         var opts = options.Value;
         var concurrency = Math.Max(1, opts.MaxConcurrency);
-        var batchSize = Math.Max(1, opts.BatchSize);
+        // 不预领超过当前可处理并发的任务，避免排队项在内存中耗尽数据库租约。
+        var batchSize = Math.Min(Math.Max(1, opts.BatchSize), concurrency);
         var poll = TimeSpan.FromSeconds(Math.Max(1, opts.PollIntervalSeconds));
         var backlogEvery = TimeSpan.FromSeconds(Math.Max(5, opts.BacklogSampleSeconds));
         var lastBacklogSample = DateTimeOffset.MinValue;

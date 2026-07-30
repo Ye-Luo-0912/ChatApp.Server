@@ -126,7 +126,10 @@ public sealed class EmailOutboxDispatcher(
             if (sendResult.IsSuccess)
             {
                 await db.EmailOutbox
-                    .Where(x => x.Id == item.Id)
+                    .Where(x => x.Id == item.Id
+                        && x.Status == EmailOutboxStatus.Processing
+                        && x.LockOwner == _ownerId
+                        && x.LockedAt == item.LockedAt)
                     .ExecuteUpdateAsync(setters => setters
                         .SetProperty(x => x.Status, EmailOutboxStatus.Sent)
                         .SetProperty(x => x.LockedAt, (DateTime?)null)
@@ -193,7 +196,7 @@ public sealed class EmailOutboxDispatcher(
             var now = DateTime.UtcNow;
 
             await db.EmailOutbox
-                .Where(x => x.Id == id && x.Status == EmailOutboxStatus.Processing)
+                .Where(x => x.Id == id && x.Status == EmailOutboxStatus.Processing && x.LockOwner == _ownerId)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.Status, EmailOutboxStatus.Pending)
                     .SetProperty(x => x.NextAttemptAt, now)
@@ -221,7 +224,10 @@ public sealed class EmailOutboxDispatcher(
         if (attemptCount >= _maxAttempts)
         {
             await db.EmailOutbox
-                .Where(x => x.Id == item.Id)
+                .Where(x => x.Id == item.Id
+                    && x.Status == EmailOutboxStatus.Processing
+                    && x.LockOwner == _ownerId
+                    && x.LockedAt == item.LockedAt)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.Status, EmailOutboxStatus.Dead)
                     .SetProperty(x => x.AttemptCount, attemptCount)
@@ -238,7 +244,10 @@ public sealed class EmailOutboxDispatcher(
         var nextAttemptAt = now.Add(CalculateBackoff(attemptCount));
 
         await db.EmailOutbox
-            .Where(x => x.Id == item.Id)
+            .Where(x => x.Id == item.Id
+                && x.Status == EmailOutboxStatus.Processing
+                && x.LockOwner == _ownerId
+                && x.LockedAt == item.LockedAt)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, EmailOutboxStatus.Failed)
                 .SetProperty(x => x.AttemptCount, attemptCount)

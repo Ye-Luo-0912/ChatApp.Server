@@ -6,48 +6,39 @@ namespace ChatApp.Server.IntegrationTests.Support;
 /// <summary>
 /// 无操作缓存，供仅需数据库的集成测试使用。
 /// </summary>
-internal sealed class NoopCacheProvider : ICacheProvider
+internal sealed class NoopCacheProvider : ICacheValueStore, IAtomicCacheStore, ICacheSetStore
 {
     public bool IsHealthy => true;
 
-    public async Task<T?> GetAsync<T>(
-        string key,
-        Func<Task<T>>? valueFactory = null,
-        TimeSpan? slidingExpiration = null,
-        TimeSpan? absoluteExpiration = null,
-        CancellationToken cancellationToken = default)
-    {
-        if (valueFactory is null)
-            return default;
-        return await valueFactory().ConfigureAwait(false);
-    }
+    public Task<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
+        => Task.FromResult<T?>(default);
 
-    public Task<string?> StringGetAsync(
-        string key,
-        Func<Task<string?>>? valueFactory = null,
-        TimeSpan? absoluteExpiration = null,
+    public Task<IReadOnlyList<T?>> GetManyAsync<T>(
+        IReadOnlyList<string> keys,
         CancellationToken cancellationToken = default)
-        => valueFactory is null ? Task.FromResult<string?>(null) : valueFactory();
+        => Task.FromResult<IReadOnlyList<T?>>(new T?[keys.Count]);
+
+    public Task<string?> StringGetAsync(string key, CancellationToken cancellationToken = default)
+        => Task.FromResult<string?>(null);
 
     public Task SetAsync<T>(
         string key,
         T value,
-        TimeSpan? slidingExpiration = null,
-        TimeSpan? absoluteExpiration = null,
+        TimeSpan expiration,
         CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
     public Task StringSetAsync(
         string key,
         string value,
-        TimeSpan? absoluteExpiration = null,
+        TimeSpan expiration,
         CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
     public Task<bool> StringSetIfNotExistsAsync(
         string key,
         string value,
-        TimeSpan? absoluteExpiration = null,
+        TimeSpan expiration,
         CancellationToken cancellationToken = default)
         => Task.FromResult(true);
 
@@ -64,34 +55,24 @@ internal sealed class NoopCacheProvider : ICacheProvider
         CancellationToken cancellationToken = default)
         => Task.FromResult(false);
 
+    public Task<bool> TryStringCompareAndSetAsync(
+        string key,
+        string expectedValue,
+        string replacementValue,
+        TimeSpan expiration,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
     public Task<long> StringIncrementAsync(
         string key,
-        TimeSpan? absoluteExpirationWhenCreate = null,
+        TimeSpan expirationWhenCreate,
         CancellationToken cancellationToken = default)
         => Task.FromResult(1L);
 
     public Task RemoveAsync(string key, CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
-    public Task RefreshAsync(string key, TimeSpan slidingExpiration, CancellationToken cancellationToken = default)
-        => Task.CompletedTask;
-
-    public Task<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default)
-        => Task.FromResult<TimeSpan?>(null);
-
-    public Task<bool> ExistsAsync(string key) => Task.FromResult(false);
-
-    public Task SetStringPayloadAsync<T>(
-        string key,
-        T value,
-        TimeSpan absoluteExpiration,
-        CancellationToken cancellationToken = default)
-        => Task.CompletedTask;
-
-    public Task<T?> GetStringPayloadAsync<T>(string key, CancellationToken cancellationToken = default)
-        => Task.FromResult<T?>(default);
-
-    public Task<T?> TryGetAndDeleteStringPayloadAsync<T>(
+    public Task<T?> TryGetAndDeleteAsync<T>(
         string key, CancellationToken cancellationToken = default)
         => Task.FromResult<T?>(default);
 
@@ -119,6 +100,4 @@ internal sealed class NoopCacheProvider : ICacheProvider
     public Task<IReadOnlyList<string>> SetMembersAsync(string key, CancellationToken cancellationToken = default)
         => Task.FromResult<IReadOnlyList<string>>([]);
 
-    public Task KeyDeleteAsync(string key, CancellationToken cancellationToken = default)
-        => Task.CompletedTask;
 }

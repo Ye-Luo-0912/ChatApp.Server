@@ -26,13 +26,31 @@ jobs:
         with:
           path: ChatApp.Server
 
-      # Realtime 为兄弟仓库；若无私有 token 可改为 submodule。本地/同源时可跳过 clone 失败并仅跑能编译的检查。
-      - name: Checkout RealtimeServices (sibling)
+      # P0-7: 从 Realtime.version 读取固定 commit，确保同一 Server commit 编译到相同版本的 Realtime 代码。
+      - name: Read pinned Realtime version
+        id: realtime-version
+        run: |
+          commit=$(grep "^Commit=" ChatApp.Server/Realtime.version | cut -d= -f2)
+          repo=$(grep "^Repo=" ChatApp.Server/Realtime.version | cut -d= -f2)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout RealtimeServices at pinned commit
         uses: actions/checkout@v4
-        continue-on-error: true
         with:
-          repository: ${{ github.repository_owner }}/ChatApp.RealtimeServices
+          repository: ${{ steps.realtime-version.outputs.repo }}
           path: ChatApp.RealtimeServices
+          ref: ${{ steps.realtime-version.outputs.commit }}
+
+      - name: Verify Realtime commit matches lock file
+        run: |
+          actual=$(git -C ChatApp.RealtimeServices rev-parse HEAD)
+          expected="${{ steps.realtime-version.outputs.commit }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "Realtime commit mismatch: expected $expected, got $actual" >&2
+            exit 1
+          fi
+          echo "OK: Realtime at pinned commit $expected"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4

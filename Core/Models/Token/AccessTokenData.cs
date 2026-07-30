@@ -32,7 +32,7 @@ public sealed class AccessTokenData
     public string? SessionId { get; set; }
 
     /// <summary>
-    /// 设备 ID 的 64 位 XOR 折叠哈希（详见 <see cref="DeviceIdHashHelper"/>）。
+    /// 原始设备 ID 的 64 位 SHA-256 截断指纹（详见 <see cref="DeviceIdHashHelper"/>）。
     /// TCP 服务端凭此与客户端握手时提供的设备 ID 做比对校验，仅 8 字节，最小化 AT 存储开销。
     /// </summary>
     [JsonPropertyName("d")]

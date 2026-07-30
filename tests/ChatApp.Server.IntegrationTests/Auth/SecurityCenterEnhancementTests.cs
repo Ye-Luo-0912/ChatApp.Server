@@ -3,7 +3,6 @@ using Core.Caching;
 using Core.Interfaces;
 using Core.Models.Identity;
 using Core.Models.Security;
-using Core.Services;
 using Core.Settings;
 using Infrastructure.Data;
 using Infrastructure.Services;
@@ -98,6 +97,8 @@ public sealed class SecurityCenterEnhancementTests(PostgresTestFixture postgres,
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var tokens = new TokenService(
             redis.Cache,
+            redis.Cache,
+            redis.Cache,
             new FixedDeviceInfo(deviceId),
             Options.Create(new JwtSettings
             {
@@ -111,7 +112,7 @@ public sealed class SecurityCenterEnhancementTests(PostgresTestFixture postgres,
             NullLogger<TokenService>.Instance);
 
         var trusted = new TrustedDeviceService(
-            db, security, AuthTestFactories.CreatePasswordHasher(), CreateMfa(db), redis.Cache,
+            db, security, AuthTestFactories.CreatePasswordHasher(), CreateMfa(db), redis.Cache, redis.Cache,
             new FixedDeviceInfo(deviceId),
             new Microsoft.AspNetCore.Http.HttpContextAccessor(),
             Options.Create(new TrustedDeviceOptions()),
@@ -120,11 +121,12 @@ public sealed class SecurityCenterEnhancementTests(PostgresTestFixture postgres,
         return new UserAccountService(
             new UserRepository(db, new TsidGeneratorService()),
             AuthTestFactories.CreatePasswordHasher(),
-            new EmailVerificationService(new NoopEmail(), redis.Cache),
+            new EmailVerificationService(new NoopEmail(), redis.Cache, redis.Cache),
             tokens,
             new FixedDeviceInfo(deviceId),
             new LocalAvatarStorage(
                 Options.Create(new AvatarStorageOptions()),
+                redis.Cache,
                 redis.Cache,
                 new AvatarReencodeQueue(
                     Options.Create(new AvatarStorageOptions()),

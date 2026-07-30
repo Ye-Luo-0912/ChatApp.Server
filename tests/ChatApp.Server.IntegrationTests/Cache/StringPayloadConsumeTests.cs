@@ -13,16 +13,16 @@ public sealed class StringPayloadConsumeTests(RedisTestFixture redis)
 
         var key = $"avatar:ticket:test-{Guid.NewGuid():N}";
         var payload = new Ticket(42, "avatars/42/x.bin", "image/jpeg", 100);
-        await redis.Cache.SetStringPayloadAsync(key, payload, TimeSpan.FromMinutes(5));
+        await redis.Cache.SetAsync(key, payload, TimeSpan.FromMinutes(5));
 
         var tasks = Enumerable.Range(0, 8)
-            .Select(_ => redis.Cache.TryGetAndDeleteStringPayloadAsync<Ticket>(key))
+            .Select(_ => redis.Cache.TryGetAndDeleteAsync<Ticket>(key))
             .ToArray();
         var results = await Task.WhenAll(tasks);
 
         Assert.Equal(1, results.Count(r => r is not null));
         Assert.Equal(42, results.First(r => r is not null)!.UserId);
-        Assert.Null(await redis.Cache.GetStringPayloadAsync<Ticket>(key));
+        Assert.Null(await redis.Cache.GetAsync<Ticket>(key));
     }
 
     private sealed record Ticket(long UserId, string ObjectKey, string ContentType, long ContentLength);

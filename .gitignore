@@ -18,3 +18,5 @@ tests/load/*.log.err
 tests/load/k6-smoke-*.txt
 tmp_*.txt
 tmp_*.csproj.txt
+# Visual Studio IDE snapshots (HierarchyCache / CopilotSnapshots / .suo etc.)
+.vs/

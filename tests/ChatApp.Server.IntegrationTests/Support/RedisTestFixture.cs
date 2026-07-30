@@ -23,7 +23,7 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
 
     public string KeyPrefix { get; private set; } = string.Empty;
 
-    public ICacheProvider Cache { get; private set; } = null!;
+    public RedisCacheStore Cache { get; private set; } = null!;
 
     public string ConnectionString { get; private set; } = "127.0.0.1:6379,abortConnect=false";
 
@@ -113,16 +113,12 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
             var cacheOptions = Options.Create(new RedisCacheOptions
             {
                 KeyPrefix = KeyPrefix,
-                DefaultSlidingExpiration = TimeSpan.FromMinutes(30),
-                ExpirationJitterPercent = 0,
-                LockTimeout = TimeSpan.FromSeconds(5),
-                DefaultLockExpiry = TimeSpan.FromSeconds(3),
             });
 
-            Cache = new RedisCaching(
+            Cache = new RedisCacheStore(
                 _multiplexer,
                 new TextJsonSerializer(),
-                NullLogger<RedisCaching>.Instance,
+                NullLogger<RedisCacheStore>.Instance,
                 cacheOptions);
 
             return true;

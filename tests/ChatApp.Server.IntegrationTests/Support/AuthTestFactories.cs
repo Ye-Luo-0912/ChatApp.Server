@@ -21,7 +21,7 @@ internal static class AuthTestFactories
         int maxConcurrent = 4, int acquireTimeoutMs = 200)
         => new(CreateCpuLimiter(maxConcurrent, acquireTimeoutMs));
 
-    /// <summary>生成合法长度的设备指纹（SHA-256 Base64url，供 DeviceIdHashHelper 使用）。</summary>
+    /// <summary>生成合法长度的稳定设备 ID。</summary>
     public static string StableDeviceId(string seed)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(seed));

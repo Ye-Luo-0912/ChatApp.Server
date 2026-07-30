@@ -72,7 +72,6 @@ public sealed class NormalizedUserUniqueTests(PostgresTestFixture postgres)
 
         var firstPage = await service.GetFriendsAsync(
             ownerId,
-            f => new FriendDto { FriendId = f.FriendId },
             limit: 2);
 
         Assert.Equal(2, firstPage.Items.Count);
@@ -82,7 +81,6 @@ public sealed class NormalizedUserUniqueTests(PostgresTestFixture postgres)
 
         var secondPage = await service.GetFriendsAsync(
             ownerId,
-            f => new FriendDto { FriendId = f.FriendId },
             cursor: firstPage.NextCursor,
             limit: 2);
 
@@ -92,7 +90,6 @@ public sealed class NormalizedUserUniqueTests(PostgresTestFixture postgres)
 
         var thirdPage = await service.GetFriendsAsync(
             ownerId,
-            f => new FriendDto { FriendId = f.FriendId },
             cursor: secondPage.NextCursor,
             limit: 2);
 

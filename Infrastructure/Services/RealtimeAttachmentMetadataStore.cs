@@ -144,9 +144,8 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
 
         var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (rows == 0)
-            _logger.LogWarning(
-                "附件 Confirm 未更新任何行 AttachmentId={Id} UserId={UserId}",
-                attachmentId, uploaderUserId);
+            throw new InvalidOperationException(
+                $"附件确认状态迁移失败。AttachmentId={attachmentId}, UserId={uploaderUserId}");
     }
 
     public async Task MarkUploadedScanningAsync(
@@ -178,18 +177,16 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         cmd.Parameters.AddWithValue("id", attachmentId);
         cmd.Parameters.AddWithValue("uid", uploaderUserId);
         cmd.Parameters.AddWithValue("size", sizeBytes);
-        cmd.Parameters.AddWithValue(
-            "hash",
-            string.IsNullOrWhiteSpace(sha256Hex) ? (object)DBNull.Value : sha256Hex.Trim());
+        cmd.Parameters.Add("hash", NpgsqlDbType.Varchar).Value =
+            string.IsNullOrWhiteSpace(sha256Hex) ? DBNull.Value : sha256Hex.Trim();
         cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
         cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
         cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
 
         var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (rows == 0)
-            _logger.LogWarning(
-                "附件 MarkUploadedScanning 未更新任何行 AttachmentId={Id} UserId={UserId}",
-                attachmentId, uploaderUserId);
+            throw new InvalidOperationException(
+                $"附件扫描状态迁移失败。AttachmentId={attachmentId}, UserId={uploaderUserId}");
     }
 
     public async Task MarkRejectedAsync(

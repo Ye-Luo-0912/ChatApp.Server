@@ -58,6 +58,7 @@ services:
     environment:
       ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
       ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      Security__SecretEncryptionKey: ${Security__SecretEncryptionKey:?Set Security__SecretEncryptionKey}
       JwtSettings__Issuer: ChatApp
       JwtSettings__Audience: ChatApp
       ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
@@ -83,6 +84,8 @@ services:
       - /tmp
     volumes:
       - avatar_data:/app/App_Data/avatars
+      - attachment_data:/app/App_Data/attachments
+      - export_data:/app/App_Data/exports
     env_file:
       - .env
     environment:
@@ -90,6 +93,10 @@ services:
       EnableHttpsRedirection: "false"
       ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
       ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      Security__SecretEncryptionKey: ${Security__SecretEncryptionKey:?Set Security__SecretEncryptionKey}
+      EmailSettings__Host: ${EmailSettings__Host:?Set EmailSettings__Host}
+      EmailSettings__SenderEmail: ${EmailSettings__SenderEmail:?Set EmailSettings__SenderEmail}
+      EmailSettings__Password: ${EmailSettings__Password:?Set EmailSettings__Password}
       ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
       ForwardedHeaders__KnownProxies__0: 127.0.0.1
     depends_on:
@@ -100,7 +107,12 @@ services:
       garnet_cache:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/ready || exit 1"]
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf "GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          grep -q "200 OK" <&3'
       interval: 15s
       timeout: 5s
       retries: 8
@@ -137,6 +149,8 @@ volumes:
   postgres_data:
   garnet_data:
   avatar_data:
+  attachment_data:
+  export_data:
 
 networks:
   chatapp_net:

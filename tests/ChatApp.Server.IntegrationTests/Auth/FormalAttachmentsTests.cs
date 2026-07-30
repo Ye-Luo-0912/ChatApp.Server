@@ -22,7 +22,7 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        await EnsureAttachmentsSchemaAsync(postgres.ConnectionString);
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
 
         var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-waf-att", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(attachmentRoot);
@@ -179,35 +179,6 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         Assert.Single(items);
         Assert.Equal("json", items[0].Source);
         Assert.Equal("https://cdn.example/legacy.png", items[0].Url);
-    }
-
-    private static async Task EnsureAttachmentsSchemaAsync(string connectionString)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            """
-            CREATE SCHEMA IF NOT EXISTS realtime;
-            CREATE TABLE IF NOT EXISTS realtime.attachments (
-                attachment_id         varchar(64)   PRIMARY KEY,
-                uploader_user_id      bigint        NOT NULL,
-                object_key            varchar(512)  NOT NULL,
-                public_url            varchar(1024) NULL,
-                content_type          varchar(128)  NOT NULL,
-                size_bytes            bigint        NOT NULL,
-                original_name         varchar(256)  NULL,
-                status                smallint      NOT NULL,
-                message_id            varchar(64)   NULL,
-                conversation_id       varchar(64)   NULL,
-                client_attachment_id  varchar(128)  NULL,
-                created_at_ms         bigint        NOT NULL,
-                confirmed_at_ms       bigint        NULL,
-                bound_at_ms           bigint        NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_attachments_object_key
-                ON realtime.attachments (object_key);
-            """, conn);
-        await cmd.ExecuteNonQueryAsync();
     }
 
     private static string? GetString(JsonElement el, params string[] names)

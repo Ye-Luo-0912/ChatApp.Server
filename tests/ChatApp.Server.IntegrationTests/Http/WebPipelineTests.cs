@@ -76,13 +76,16 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
         await using var factoryB = CreateFactory(sharedPrefix, avatarRoot);
 
         var suffix = Guid.NewGuid().ToString("N")[..8];
-        long requesterId, targetId;
+        long requesterId, targetId, otherTargetId;
         await using (var db = postgres.CreateContext())
         {
             var requester = await WafTestHelpers.SeedUserAsync(db, $"req-{suffix}", $"req-{suffix}@ex.com", "Passw0rd!");
             var target = await WafTestHelpers.SeedUserAsync(db, $"tar-{suffix}", $"tar-{suffix}@ex.com", "Passw0rd!");
+            var otherTarget = await WafTestHelpers.SeedUserAsync(
+                db, $"tar2-{suffix}", $"tar2-{suffix}@ex.com", "Passw0rd!");
             requesterId = requester.Id;
             targetId = target.Id;
+            otherTargetId = otherTarget.Id;
         }
 
         using var clientA = factoryA.CreateClientWithDevice($"dev-idem-a-{Guid.NewGuid():N}"[..28]);
@@ -129,6 +132,22 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
         var pending = await check.FriendRequests.CountAsync(r =>
             r.RequesterId == requesterId && r.TargetUserId == targetId);
         Assert.True(pending == 1, $"pending={pending}; {string.Join(" | ", bodies)}");
+
+        var differentPayload = JsonSerializer.Serialize(
+            new { targetUserId = otherTargetId, message = "different" }, WafTestHelpers.Json);
+        using var differentRequest = new HttpRequestMessage(HttpMethod.Post, "/api/Friendship/requests")
+        {
+            Content = new StringContent(differentPayload, Encoding.UTF8, "application/json"),
+        };
+        differentRequest.Headers.Add("X-Idempotency-Key", idemKey);
+        var different = await clientA.SendAsync(differentRequest);
+        Assert.Equal(HttpStatusCode.Conflict, different.StatusCode);
+        Assert.Contains(
+            "不同请求体",
+            await different.Content.ReadAsStringAsync(),
+            StringComparison.Ordinal);
+        Assert.False(await check.FriendRequests.AnyAsync(r =>
+            r.RequesterId == requesterId && r.TargetUserId == otherTargetId));
     }
 
     [SkippableFact]
@@ -182,13 +201,13 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
             Assert.Equal(HttpStatusCode.BadRequest, forged.StatusCode);
         }
 
-        // 过期：通过同前缀 ICacheProvider 删除票据
+        // 过期：通过同前缀值存储删除票据
         var presign3 = await clientA.PostAsJsonAsync("/api/users/me/avatar/presign",
             new { contentType = "image/jpeg", contentLength = jpeg.Length }, WafTestHelpers.Json);
         var ticket3 = (await presign3.Content.ReadFromJsonAsync<AvatarTicketDto>(WafTestHelpers.Json))!.Ticket;
         using (var scope = factoryA.Services.CreateScope())
         {
-            var cache = scope.ServiceProvider.GetRequiredService<Core.Interfaces.Cache.ICacheProvider>();
+            var cache = scope.ServiceProvider.GetRequiredService<Core.Interfaces.Cache.ICacheValueStore>();
             await cache.RemoveAsync($"avatar:ticket:{ticket3}");
         }
 

@@ -5,8 +5,8 @@ using Core.Interfaces.Cache;
 using Core.Models;
 using Core.Models.Email;
 using Core.Models.Identity;
-using Core.Services;
 using Core.Settings;
+using Infrastructure.Caching;
 using Infrastructure.Data;
 using Infrastructure.Services;
 using Infrastructure.Services.Auth;
@@ -77,7 +77,8 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
 
         await using var db = postgres.CreateContext();
         var suffix = Guid.NewGuid().ToString("N")[..8];
-        var emailVerification = new EmailVerificationService(new RecordingEmailSender(), redis.Cache);
+        var emailVerification = new EmailVerificationService(
+            new RecordingEmailSender(), redis.Cache, redis.Cache);
         var auth = CreateAuthService(db, emailVerification);
         var user = await SeedUserAsync(db, $"reset-{suffix}", $"reset-{suffix}@example.com", "OldPass1!");
 
@@ -181,13 +182,15 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
     {
         var hasher = AuthTestFactories.CreatePasswordHasher();
         var repo = new UserRepository(db, new TsidGeneratorService());
-        var email = new EmailVerificationService(new RecordingEmailSender(), redis.Cache);
+        var email = new EmailVerificationService(
+            new RecordingEmailSender(), redis.Cache, redis.Cache);
         var tokens = CreateTokenService(currentDeviceId);
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var account = new UserAccountService(
             repo, hasher, email, tokens, new FixedDeviceInfo(currentDeviceId),
             new LocalAvatarStorage(
                 Options.Create(new AvatarStorageOptions()),
+                redis.Cache,
                 redis.Cache,
                 new AvatarReencodeQueue(
                     Options.Create(new AvatarStorageOptions()),
@@ -228,6 +231,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             security,
             mfa,
             redis.Cache,
+            redis.Cache,
             new NoopSecurityNotificationService(),
             CreateTrusted(db, redis.Cache),
             NoopLoginRiskAnalyzer.Instance,
@@ -235,7 +239,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             NullLogger<AuthService>.Instance);
     }
 
-    private static TrustedDeviceService CreateTrusted(UserDbContext db, ICacheProvider cache)
+    private static TrustedDeviceService CreateTrusted(UserDbContext db, RedisCacheStore cache)
     {
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var hasher = AuthTestFactories.CreatePasswordHasher();
@@ -256,6 +260,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             hasher,
             mfa,
             cache,
+            cache,
             new FixedDeviceInfo(AuthTestFactories.StableDeviceId("account-sec")),
             new Microsoft.AspNetCore.Http.HttpContextAccessor(),
             Options.Create(new TrustedDeviceOptions()),
@@ -274,6 +279,8 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
         });
 
         return new TokenService(
+            redis.Cache,
+            redis.Cache,
             redis.Cache,
             new FixedDeviceInfo(deviceId),
             jwt,

@@ -1,0 +1,16 @@
+**/.git
+**/.github
+**/.vs
+**/.idea
+**/bin
+**/obj
+**/TestResults
+**/coverage
+**/Logs
+**/App_Data
+**/pgdata
+**/.env
+**/*.user
+**/*.suo
+**/*.log
+**/*.tmp

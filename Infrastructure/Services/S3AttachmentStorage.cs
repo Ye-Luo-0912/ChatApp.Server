@@ -15,17 +15,20 @@ namespace Infrastructure.Services;
 public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
 {
     private readonly AttachmentStorageOptions _options;
-    private readonly ICacheProvider _cache;
+    private readonly ICacheValueStore _cache;
+    private readonly IAtomicCacheStore _atomicCache;
     private readonly ILogger<S3AttachmentStorage> _logger;
     private readonly IAmazonS3 _s3;
 
     public S3AttachmentStorage(
         IOptions<AttachmentStorageOptions> options,
-        ICacheProvider cache,
+        ICacheValueStore cache,
+        IAtomicCacheStore atomicCache,
         ILogger<S3AttachmentStorage> logger)
     {
         _options = options.Value;
         _cache = cache;
+        _atomicCache = atomicCache;
         _logger = logger;
 
         if (string.IsNullOrWhiteSpace(_options.S3Bucket)
@@ -71,7 +74,7 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
 
-        await _cache.SetStringPayloadAsync(
+        await _cache.SetAsync(
             $"attachment:ticket:{ticket}",
             new LocalAttachmentStorage.AttachmentTicketInfo(
                 userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId),
@@ -108,7 +111,7 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
             return (false, null, null, null, null, 0, null, "确认附件须提供上传票");
 
         var ticketKey = $"attachment:ticket:{ticket}";
-        var info = await _cache.TryGetAndDeleteStringPayloadAsync<LocalAttachmentStorage.AttachmentTicketInfo>(
+        var info = await _atomicCache.TryGetAndDeleteAsync<LocalAttachmentStorage.AttachmentTicketInfo>(
                 ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
@@ -267,7 +270,7 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
     {
         try
         {
-            await _cache.SetStringPayloadAsync(
+            await _cache.SetAsync(
                 ticketKey, info, TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
                 cancellationToken).ConfigureAwait(false);
         }

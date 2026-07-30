@@ -91,25 +91,17 @@ public sealed class AttachmentService(
 
         if (metadata.IsAvailable)
         {
-            try
-            {
-                await metadata.InsertTicketedAsync(
-                    attachmentId,
-                    userId,
-                    objectKey,
-                    publicUrl: null,
-                    // octet-stream 仅作临时占位；Confirm 时魔数嗅探覆盖
-                    request.ContentType,
-                    request.ContentLength,
-                    request.OriginalName,
-                    request.ClientAttachmentId,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // 元数据失败不阻断上传票；confirm 会 upsert。
-                logger.LogWarning(ex, "InsertTicketed 失败 AttachmentId={Id}", attachmentId);
-            }
+            await metadata.InsertTicketedAsync(
+                attachmentId,
+                userId,
+                objectKey,
+                publicUrl: null,
+                // octet-stream 仅作临时占位；Confirm 时魔数嗅探覆盖
+                request.ContentType,
+                request.ContentLength,
+                request.OriginalName,
+                request.ClientAttachmentId,
+                cancellationToken).ConfigureAwait(false);
         }
 
 #pragma warning disable CS0618 // PublicUrl deprecated but kept empty for wire compat
@@ -140,17 +132,10 @@ public sealed class AttachmentService(
 
         if (metadata.IsAvailable && !string.IsNullOrWhiteSpace(attachmentId))
         {
-            try
-            {
-                await metadata.MarkUploadedScanningAsync(
-                        attachmentId, userId, sizeBytes, sha256Hex, cancellationToken)
-                    .ConfigureAwait(false);
-                AuthSecurityMetrics.AttachmentScan("uploaded_scanning");
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "MarkUploadedScanning 失败 AttachmentId={Id}", attachmentId);
-            }
+            await metadata.MarkUploadedScanningAsync(
+                    attachmentId, userId, sizeBytes, sha256Hex, cancellationToken)
+                .ConfigureAwait(false);
+            AuthSecurityMetrics.AttachmentScan("uploaded_scanning");
         }
 
         return AuthOperationResult.Success();
@@ -182,16 +167,9 @@ public sealed class AttachmentService(
         // 保持 Scanning：内容扫描改由后台作业执行（瞬时失败可退避重试）
         if (metadata.IsAvailable)
         {
-            try
-            {
-                await metadata.MarkUploadedScanningAsync(
-                        attachmentId, userId, sizeBytes, sha256Hex: null, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Confirm 后 MarkUploadedScanning 失败 AttachmentId={Id}", attachmentId);
-            }
+            await metadata.MarkUploadedScanningAsync(
+                    attachmentId, userId, sizeBytes, sha256Hex: null, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         try
