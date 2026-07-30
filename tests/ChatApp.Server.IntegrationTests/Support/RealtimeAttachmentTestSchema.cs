@@ -40,6 +40,8 @@ internal static class RealtimeAttachmentTestSchema
                 joined_at_ms    bigint      NOT NULL,
                 PRIMARY KEY (conversation_id, user_id)
             );
+            ALTER TABLE realtime.conversation_members
+                ADD COLUMN IF NOT EXISTS joined_at_ms bigint NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS realtime.messages (
                 message_id       varchar(64) PRIMARY KEY,
                 sender_user_id   bigint      NOT NULL,

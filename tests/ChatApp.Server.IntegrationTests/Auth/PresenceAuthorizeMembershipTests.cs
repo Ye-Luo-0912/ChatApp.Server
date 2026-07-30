@@ -45,8 +45,11 @@ public sealed class PresenceAuthorizeMembershipTests(PostgresTestFixture postgre
                          CREATE TABLE IF NOT EXISTS realtime.conversation_members (
                              conversation_id text NOT NULL,
                              user_id bigint NOT NULL,
+                             joined_at_ms bigint NOT NULL DEFAULT 0,
                              PRIMARY KEY (conversation_id, user_id)
                          );
+                         ALTER TABLE realtime.conversation_members
+                             ADD COLUMN IF NOT EXISTS joined_at_ms bigint NOT NULL DEFAULT 0;
                          """,
                          conn))
         {
