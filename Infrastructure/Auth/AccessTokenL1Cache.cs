@@ -1,5 +1,6 @@
 using System.Threading;
 using Core.Models.Token;
+using Infrastructure.Services;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace Infrastructure.Auth;
@@ -103,7 +104,11 @@ internal sealed class AccessTokenL1Cache : IDisposable
     }
 
     /// <summary>驱逐指定键（正/负缓存均移除）。撤销令牌时调用。</summary>
-    public void Evict(string key) => _cache.Remove(key);
+    public void Evict(string key)
+    {
+        _cache.Remove(key);
+        AuthSecurityMetrics.RecordTokenL1("eviction");
+    }
 
     public void Dispose() => _cache.Dispose();
 

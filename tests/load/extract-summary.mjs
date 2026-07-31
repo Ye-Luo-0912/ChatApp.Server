@@ -17,6 +17,11 @@
 //       "http_reqs": { "sum": 18000, "count": 18000, ... },
 //       ...
 //     }
+//     "rates": {
+//       "duration_seconds": 900,
+//       "iterations_per_second": 20,
+//       "http_requests_per_second": 100
+//     }
 //   }
 //
 // 设计目标：
@@ -123,13 +128,26 @@ function main() {
     const output = {
         version: '1.0',
         commit,
-        runner: args.runner || 'ubuntu-latest',
+        runner: args.runner || 'ubuntu-24.04',
         generated_at: new Date().toISOString(),
         runtime: args.runtime || undefined,
         first_event_ts: firstTs || undefined,
         last_event_ts: lastTs || undefined,
         metrics: summary,
     };
+
+    // 明确区分业务迭代速率和 HTTP 请求速率：一次迭代通常包含多个请求，
+    // 不能用 http_reqs 代替 iterations 来解释 steady 负载。
+    const durationSeconds = firstTs && lastTs
+        ? Math.max(0, (new Date(lastTs).getTime() - new Date(firstTs).getTime()) / 1000)
+        : 0;
+    if (durationSeconds > 0) {
+        output.rates = {
+            duration_seconds: durationSeconds,
+            iterations_per_second: summary.iterations ? summary.iterations.sum / durationSeconds : 0,
+            http_requests_per_second: summary.http_reqs ? summary.http_reqs.sum / durationSeconds : 0,
+        };
+    }
 
     // 移除 undefined 字段
     for (const k of Object.keys(output)) {

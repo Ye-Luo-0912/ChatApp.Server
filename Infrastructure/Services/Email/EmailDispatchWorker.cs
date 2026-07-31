@@ -47,16 +47,38 @@ public sealed class EmailDispatchWorker(
                     lastCleanup = DateTime.UtcNow;
                 }
 
-                var claimed = await _dispatcher.ClaimDueItemsAsync(stoppingToken).ConfigureAwait(false);
-
-                foreach (var item in claimed)
+                inFlight.RemoveAll(static task => task.IsCompleted);
+                var available = Math.Max(0, workerConcurrency - inFlight.Count);
+                var reservations = new List<IAsyncDisposable>(available);
+                while (reservations.Count < available
+                       && concurrencyManager.TryAcquire(WorkerName, workerConcurrency, out var reservation))
                 {
-                    var concurrencyScope = await concurrencyManager.AcquireAsync(
-                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
-                    inFlight.Add(ProcessItemAsync(item, concurrencyScope, stoppingToken));
+                    reservations.Add(reservation!);
                 }
 
-                inFlight.RemoveAll(static task => task.IsCompleted);
+                if (reservations.Count == 0)
+                    continue;
+
+                IReadOnlyList<EmailOutboxItem> claimed;
+                try
+                {
+                    claimed = await _dispatcher
+                        .ClaimDueItemsAsync(reservations.Count, stoppingToken)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    foreach (var reservation in reservations)
+                        await reservation.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
+
+                for (var i = 0; i < claimed.Count; i++)
+                {
+                    inFlight.Add(ProcessItemAsync(claimed[i], reservations[i], stoppingToken));
+                }
+                for (var i = claimed.Count; i < reservations.Count; i++)
+                    await reservations[i].DisposeAsync().ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

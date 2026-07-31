@@ -48,6 +48,7 @@ namespace Infrastructure.Serialization;
 [JsonSerializable(typeof(AccessTokenData))]
 [JsonSerializable(typeof(RefreshToken))]
 [JsonSerializable(typeof(SessionRecord))]
+[JsonSerializable(typeof(UserAuthSnapshot))]
 [JsonSerializable(typeof(FriendshipStatusInfo))]
 [JsonSerializable(typeof(AttachmentDownloadTicketPayload))]
 [JsonSerializable(typeof(LocalAttachmentStorage.AttachmentTicketInfo))]

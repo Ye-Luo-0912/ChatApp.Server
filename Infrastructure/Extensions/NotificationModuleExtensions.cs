@@ -20,7 +20,9 @@ public static class NotificationModuleExtensions
     /// <summary>注册通知与邮件模块。</summary>
     public static IServiceCollection AddNotificationModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<NotificationOutboxOptions>(config.GetSection(NotificationOutboxOptions.SectionName));
+        services.AddOptions<NotificationOutboxOptions>()
+            .Bind(config.GetSection(NotificationOutboxOptions.SectionName))
+            .ValidateOnStart();
 
         services.AddSingleton<NotificationOutboxMetrics>();
         services.AddScoped<INotificationQuery, NotificationQuery>();

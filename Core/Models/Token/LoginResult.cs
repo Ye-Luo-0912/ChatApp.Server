@@ -33,6 +33,9 @@ public sealed class LoginResult
     /// <summary>登录时轮换后的可信设备令牌（明文仅此一次）；客户端应覆盖本地存储。</summary>
     public string? TrustedDeviceToken { get; init; }
 
+    /// <summary>登录时签发的设备凭据明文；客户端应安全保存并在刷新时携带。</summary>
+    public string? DeviceCredential { get; init; }
+
     /// <summary>
     /// 仍存有旧版 BCrypt 恢复码摘要时为 true；客户端应引导用户重新生成恢复码（新码为 HMAC）。
     /// </summary>
@@ -111,7 +114,8 @@ public sealed class LoginResult
         bool isNewDevice = false,
         bool isUnusualLocation = false,
         string? trustedDeviceToken = null,
-        bool requiresRecoveryCodeRegeneration = false
+        bool requiresRecoveryCodeRegeneration = false,
+        string? deviceCredential = null
     ) => new()
     {
         IsSuccess = true,
@@ -122,6 +126,7 @@ public sealed class LoginResult
         IsNewDevice              = isNewDevice,
         IsUnusualLocation        = isUnusualLocation,
         TrustedDeviceToken       = trustedDeviceToken,
+        DeviceCredential         = deviceCredential,
         RequiresRecoveryCodeRegeneration = requiresRecoveryCodeRegeneration,
         SessionId                = sessionId,
         DeviceIdHash             = deviceIdHash,

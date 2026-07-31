@@ -18,7 +18,9 @@ public static class ModerationModuleExtensions
     /// <summary>注册内容审核模块。</summary>
     public static IServiceCollection AddModerationModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
+        services.AddOptions<MessageEvidenceOptions>()
+            .Bind(config.GetSection(MessageEvidenceOptions.SectionName))
+            .ValidateOnStart();
 
         services.AddSingleton<IMessageEvidenceProvider>(sp =>
         {

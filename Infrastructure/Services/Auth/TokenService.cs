@@ -34,7 +34,8 @@ public sealed class TokenService(
     ICacheSetStore sets,
     IDeviceInfo deviceInfo,
     IOptions<JwtSettings> options,
-    ILogger<TokenService> logger) : ITokenService
+    ILogger<TokenService> logger,
+    IAccessTokenL1InvalidationBus? invalidationBus = null) : ITokenService
 {
     // Redis 键前缀
     private const string AccessTokenPrefix  = "AT:";
@@ -44,6 +45,8 @@ public sealed class TokenService(
     private const string UserDeviceIndexPrefix = "UDI:";
 
     private readonly JwtSettings _settings = options.Value;
+
+    private IDeviceCredentialContext? DeviceCredentialContext => deviceInfo as IDeviceCredentialContext;
 
     /// <summary>
     /// L1 内存缓存：减少认证热路径的 Redis 往返。
@@ -55,6 +58,16 @@ public sealed class TokenService(
             options.Value.TokenL1CacheTtlSeconds,
             options.Value.TokenL1CacheNegativeTtlMs)
         : null;
+    private readonly IAccessTokenL1InvalidationBus? _invalidationBus = invalidationBus;
+    private int _l1InvalidationRegistered;
+
+    private void EnsureL1InvalidationRegistered()
+    {
+        if (_l1Cache is null || _invalidationBus is null
+            || Interlocked.Exchange(ref _l1InvalidationRegistered, 1) != 0)
+            return;
+        _invalidationBus.Register(_l1Cache.Evict);
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // ITokenGenerator
@@ -81,6 +94,7 @@ public sealed class TokenService(
     /// </summary>
     public async Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default)
     {
+        EnsureL1InvalidationRegistered();
         var key = AccessTokenKey(token);
         await values.SetAsync(key, data, expiry, cancellationToken).ConfigureAwait(false);
         if (_l1Cache is not null && !data.IsExpired)
@@ -93,6 +107,7 @@ public sealed class TokenService(
     /// </summary>
     public async Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default)
     {
+        EnsureL1InvalidationRegistered();
         var key = AccessTokenKey(token);
 
         // L1 检查：正缓存命中 → 返回数据；负缓存命中 → 返回 null
@@ -100,7 +115,11 @@ public sealed class TokenService(
         {
             var (found, data) = _l1Cache.TryGet(key);
             if (found)
+            {
+                AuthSecurityMetrics.RecordTokenL1("hit");
                 return data;
+            }
+            AuthSecurityMetrics.RecordTokenL1("miss");
         }
 
         var redisData = await values.GetAsync<AccessTokenData>(key, cancellationToken).ConfigureAwait(false);
@@ -123,8 +142,10 @@ public sealed class TokenService(
     /// </summary>
     public Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default)
     {
+        EnsureL1InvalidationRegistered();
         var key = AccessTokenKey(token);
         _l1Cache?.Evict(key);
+        _invalidationBus?.Publish(key);
         return values.RemoveAsync(key, cancellationToken);
     }
 
@@ -168,7 +189,7 @@ public sealed class TokenService(
             values.SetAsync(ssKey, session, expiry, cancellationToken),
             IndexDeviceAsync(userId, device.DeviceId, expiry, cancellationToken));
 
-        logger.LogDebug("刷新令牌及会话已写入缓存，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
+        TokenServiceLog.RefreshTokenStored(logger, userId, device.DeviceId);
     }
 
     /// <summary>
@@ -183,7 +204,9 @@ public sealed class TokenService(
             return false;
 
         // 确认令牌来自同一设备，防止跨设备复用
-        return deviceId is not null && data.DeviceId == deviceId;
+        return deviceId is not null
+               && data.DeviceId == deviceId
+               && IsPresentedCredentialValid(data);
     }
 
     /// <summary>
@@ -218,7 +241,7 @@ public sealed class TokenService(
             RefreshTokenKey(userId, refreshToken),
             oldRt =>
             {
-                if (!oldRt.IsValid || oldRt.DeviceId != deviceId)
+                if (!oldRt.IsValid || oldRt.DeviceId != deviceId || !IsPresentedCredentialValid(oldRt))
                     return null;
 
                 return new AtomicConsumePlan<bool>
@@ -271,6 +294,8 @@ public sealed class TokenService(
                     LoginAt      = login,
                     RefreshCount = count,
                     SessionId    = session,
+                    DeviceCredentialHash = oldRt.DeviceCredentialHash,
+                    SecurityVersion = oldRt.SecurityVersion,
                 };
 
                 var newSession = new SessionRecord
@@ -286,7 +311,9 @@ public sealed class TokenService(
                     LastActiveAt           = now,
                     ExpiresAt              = now.Add(expiry),
                     RefreshCount           = count,
+                    DeviceCredentialHash   = oldRt.DeviceCredentialHash,
                     CurrentRefreshTokenKey = rtKey,
+                    SecurityVersion        = oldRt.SecurityVersion,
                 };
 
                 return new AtomicConsumePlan<bool>
@@ -306,11 +333,13 @@ public sealed class TokenService(
         {
             // P0-2：CAS 已提交 → Redis 事务内已删除旧 AT key，同步驱逐本机 L1。
             if (oldAtKeyCaptured is not null)
+            {
                 _l1Cache?.Evict(oldAtKeyCaptured);
+                _invalidationBus?.Publish(oldAtKeyCaptured);
+            }
 
             await IndexDeviceAsync(userId, device.DeviceId, expiry, cancellationToken);
-            logger.LogDebug("刷新令牌已轮换，UserId={UserId}, DeviceId={DeviceId}",
-                userId, device.DeviceId);
+            TokenServiceLog.RefreshTokenRotated(logger, userId, device.DeviceId);
         }
 
         return rotated.Succeeded;
@@ -329,6 +358,10 @@ public sealed class TokenService(
         var sessionId     = Generate(16);
         var rawAt         = Generate(16);
         var rawRt         = Generate(_settings.RefreshTokenLength);
+        var rawDeviceCredential = DeviceCredentialContext?.IssueDeviceCredential();
+        var deviceCredentialHash = rawDeviceCredential is null
+            ? null
+            : DeviceCredentialHelper.ComputeHash(rawDeviceCredential);
         var userId        = user.Id.ToString();
         var device        = deviceInfo.GenerateDeviceInfo();
         var now           = DateTime.UtcNow;
@@ -346,6 +379,7 @@ public sealed class TokenService(
             ExpiresAtMs  = DateTimeOffset.UtcNow.Add(accessExpiry).ToUnixTimeMilliseconds(),
             SessionId    = sessionId,
             DeviceIdHash = DeviceIdHashHelper.Compute(device.DeviceId),
+            SecurityVersion = user.SecurityVersion,
         };
 
         var rtData = new RefreshToken
@@ -355,6 +389,8 @@ public sealed class TokenService(
             LoginAt               = now,
             SessionId             = sessionId,
             CurrentAccessTokenKey = atKey,
+            DeviceCredentialHash = deviceCredentialHash,
+            SecurityVersion      = user.SecurityVersion,
         };
 
         var session = new SessionRecord
@@ -371,6 +407,8 @@ public sealed class TokenService(
             ExpiresAt               = now.Add(refreshExpiry),
             CurrentAccessTokenKey   = atKey,
             CurrentRefreshTokenKey  = rtKey,
+            DeviceCredentialHash    = deviceCredentialHash,
+            SecurityVersion         = user.SecurityVersion,
         };
 
         await atomic.SetManyAsync(
@@ -387,9 +425,9 @@ public sealed class TokenService(
             cancellationToken);
 
         await IndexDeviceAsync(userId, device.DeviceId, refreshExpiry, cancellationToken);
+        await TrimSessionsAsync(userId, device.DeviceId, cancellationToken);
 
-        logger.LogDebug("登录令牌已建立，UserId={UserId}, SessionId={SessionId}, DeviceId={DeviceId}",
-            userId, sessionId, device.DeviceId);
+        TokenServiceLog.LoginTokensIssued(logger, userId, sessionId, device.DeviceId);
 
         return new TokenIssueResult
         {
@@ -399,6 +437,7 @@ public sealed class TokenService(
             RefreshTokenExpiresAtUtc = now.Add(refreshExpiry),
             SessionId                = sessionId,
             DeviceIdHash             = DeviceIdHashHelper.Compute(device.DeviceId),
+            DeviceCredential         = rawDeviceCredential,
         };
     }
 
@@ -418,6 +457,7 @@ public sealed class TokenService(
             ExpiresAtMs = DateTimeOffset.UtcNow.Add(expiry).ToUnixTimeMilliseconds(),
             SessionId   = sessionId,
             DeviceIdHash    = DeviceIdHashHelper.Compute(deviceInfo.GetDeviceId()),
+            SecurityVersion = user.SecurityVersion,
         };
 
         await StoreAccessTokenAsync(token, data, expiry, cancellationToken);
@@ -427,7 +467,7 @@ public sealed class TokenService(
     /// <summary>
     /// 原子地完成令牌轮换：CAS 消费旧 RT，并在同一事务中写入新 AT / RT / Session。
     /// </summary>
-    public async Task<(string accessToken, string refreshToken)?> IssueRefreshTokensAsync(
+    public async Task<(string accessToken, string refreshToken, string? deviceCredential)?> IssueRefreshTokensAsync(
         string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default)
     {
         var device = deviceInfo.GenerateDeviceInfo();
@@ -438,6 +478,10 @@ public sealed class TokenService(
         // 在 CAS 回调外预生成令牌字符串，避免重试/并发路径产生不一致的返回值。
         var rawAt = Generate(16);
         var rawRt = Generate(_settings.RefreshTokenLength);
+        var rawDeviceCredential = DeviceCredentialContext?.IssueDeviceCredential();
+        var newDeviceCredentialHash = rawDeviceCredential is null
+            ? null
+            : DeviceCredentialHelper.ComputeHash(rawDeviceCredential);
         var atKey = AccessTokenKey(rawAt);
         var rtKey = RefreshTokenKey(userId, rawRt);
         var ssKey = SessionKey(userId, device.DeviceId);
@@ -447,11 +491,13 @@ public sealed class TokenService(
         // 但 CAS 成功意味着本次看到的 oldRt 就是已被消费的快照，其 oldAtKey 即待失效的 AT。
         string? oldAtKeyCaptured = null;
 
-        var rotated = await atomic.TryAtomicConsumeAsync<RefreshToken, (string accessToken, string refreshToken)>(
+        var rotated = await atomic.TryAtomicConsumeAsync<RefreshToken, (string accessToken, string refreshToken, string? deviceCredential)>(
             RefreshTokenKey(userId, oldRefreshToken),
             oldRt =>
             {
-                if (!oldRt.IsValid || oldRt.DeviceId != device.DeviceId)
+                if (!oldRt.IsValid || oldRt.DeviceId != device.DeviceId
+                    || (oldRt.SecurityVersion != 0 && oldRt.SecurityVersion != user.SecurityVersion)
+                    || !IsPresentedCredentialValid(oldRt))
                     return null;
 
                 var sessionId = oldRt.SessionId ?? Generate(16);
@@ -473,6 +519,7 @@ public sealed class TokenService(
                     ExpiresAtMs  = DateTimeOffset.UtcNow.Add(accessExpiry).ToUnixTimeMilliseconds(),
                     SessionId    = sessionId,
                     DeviceIdHash = DeviceIdHashHelper.Compute(device.DeviceId),
+                    SecurityVersion = user.SecurityVersion,
                 };
 
                 var newRtData = new RefreshToken
@@ -483,6 +530,8 @@ public sealed class TokenService(
                     RefreshCount          = count,
                     SessionId             = sessionId,
                     CurrentAccessTokenKey = atKey,
+                    DeviceCredentialHash  = newDeviceCredentialHash ?? oldRt.DeviceCredentialHash,
+                    SecurityVersion       = user.SecurityVersion,
                 };
 
                 var session = new SessionRecord
@@ -500,11 +549,13 @@ public sealed class TokenService(
                     RefreshCount           = count,
                     CurrentAccessTokenKey  = atKey,
                     CurrentRefreshTokenKey = rtKey,
+                    DeviceCredentialHash   = newDeviceCredentialHash ?? oldRt.DeviceCredentialHash,
+                    SecurityVersion        = user.SecurityVersion,
                 };
 
-                return new AtomicConsumePlan<(string accessToken, string refreshToken)>
+                return new AtomicConsumePlan<(string accessToken, string refreshToken, string? deviceCredential)>
                 {
-                    Result = (rawAt, rawRt),
+                    Result = (rawAt, rawRt, rawDeviceCredential),
                     AdditionalKeysToDelete = deletes,
                     Writes =
                     [
@@ -523,7 +574,7 @@ public sealed class TokenService(
 
         if (!rotated.Succeeded)
         {
-            logger.LogDebug("令牌轮换失败（无效或已被并发消费），UserId={UserId}", userId);
+            TokenServiceLog.TokenRotationFailed(logger, userId);
             return null;
         }
 
@@ -531,11 +582,14 @@ public sealed class TokenService(
         // 必须同步驱逐本机 L1 正缓存，否则旧 AT 最长可在 L1 存活至 TTL（默认 5s）。
         // 与 RevokeSessionAsync 保持一致的驱逐时机。
         if (oldAtKeyCaptured is not null)
+        {
             _l1Cache?.Evict(oldAtKeyCaptured);
+            _invalidationBus?.Publish(oldAtKeyCaptured);
+        }
 
         await IndexDeviceAsync(userId, device.DeviceId, refreshExpiry, cancellationToken);
 
-        logger.LogDebug("令牌已轮换，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
+        TokenServiceLog.TokenRotated(logger, userId, device.DeviceId);
         return rotated.Value;
     }
 
@@ -598,6 +652,7 @@ public sealed class TokenService(
         if (session?.CurrentAccessTokenKey is not null)
         {
             _l1Cache?.Evict(session.CurrentAccessTokenKey);
+            _invalidationBus?.Publish(session.CurrentAccessTokenKey);
             keysToDelete.Add(session.CurrentAccessTokenKey);
         }
         if (session?.CurrentRefreshTokenKey is not null)
@@ -607,7 +662,7 @@ public sealed class TokenService(
             values.RemoveManyAsync(keysToDelete, cancellationToken),
             sets.SetRemoveAsync(UserDeviceIndexKey(userId), deviceId, cancellationToken));
 
-        logger.LogDebug("会话已撤销，UserId={UserId}, DeviceId={DeviceId}", userId, deviceId);
+        TokenServiceLog.SessionRevoked(logger, userId, deviceId);
     }
 
     /// <inheritdoc />
@@ -649,6 +704,7 @@ public sealed class TokenService(
             if (session?.CurrentAccessTokenKey is not null)
             {
                 _l1Cache?.Evict(session.CurrentAccessTokenKey);
+                _invalidationBus?.Publish(session.CurrentAccessTokenKey);
                 keysToDelete.Add(session.CurrentAccessTokenKey);
             }
             if (session?.CurrentRefreshTokenKey is not null)
@@ -673,6 +729,41 @@ public sealed class TokenService(
 
     private Task IndexDeviceAsync(string userId, string deviceId, TimeSpan ttl, CancellationToken cancellationToken)
         => sets.SetAddAsync(UserDeviceIndexKey(userId), deviceId, ttl, cancellationToken);
+
+    private bool IsPresentedCredentialValid(RefreshToken token)
+    {
+        // 旧版令牌没有设备凭据摘要，允许一次平滑升级；下一次轮换会写入摘要。
+        if (token.DeviceCredentialHash is null || DeviceCredentialContext is null)
+            return true;
+
+        return string.Equals(
+            DeviceCredentialContext.GetPresentedDeviceCredentialHash(),
+            token.DeviceCredentialHash,
+            StringComparison.Ordinal);
+    }
+
+    private async Task TrimSessionsAsync(
+        string userId,
+        string currentDeviceId,
+        CancellationToken cancellationToken)
+    {
+        var sessions = await ListSessionsAsync(userId, cancellationToken).ConfigureAwait(false);
+        var excess = sessions.Count - _settings.MaxActiveSessionsPerUser;
+        if (excess <= 0)
+            return;
+
+        var candidates = sessions
+            .Where(s => !string.Equals(s.DeviceId, currentDeviceId, StringComparison.Ordinal))
+            .OrderBy(s => s.LastActiveAt)
+            .Take(Math.Min(excess, _settings.SessionChurnCleanupBatchSize))
+            .ToArray();
+
+        foreach (var session in candidates)
+        {
+            await RevokeSessionAsync(userId, session.DeviceId, cancellationToken).ConfigureAwait(false);
+            AuthSecurityMetrics.RecordSessionChurnEviction();
+        }
+    }
 
     /// <summary>
     /// 对令牌做 SHA-256 哈希，用于构造 Redis 键，避免原始值出现在键名中。
@@ -703,4 +794,3 @@ public sealed class TokenService(
         => values.GetAsync<RefreshToken>(RefreshTokenKey(userId, refreshToken), cancellationToken);
 
 }
-

@@ -67,6 +67,7 @@ public sealed class LoginRiskAnalyzer(
         var recentLocations = await db.SecurityEvents.AsNoTracking()
             .Where(e => e.UserId == item.UserId
                         && e.EventType == SecurityEventType.LoginSuccess
+                        && (item.SessionId == null || e.SessionId != item.SessionId)
                         && e.Location != null
                         && e.Location != ""
                         && e.Location != "未知")
@@ -80,8 +81,7 @@ public sealed class LoginRiskAnalyzer(
         await db.SecurityEvents
             .Where(e => e.UserId == item.UserId
                         && e.EventType == SecurityEventType.LoginSuccess
-                        && e.Detail != null
-                        && e.Detail.Contains(item.SessionId ?? "___none___"))
+                        && e.SessionId == item.SessionId)
             .ExecuteUpdateAsync(
                 s => s.SetProperty(e => e.Location, location),
                 cancellationToken)
@@ -124,11 +124,10 @@ public sealed class LoginRiskAnalyzer(
 
         var alreadyRecorded = !string.IsNullOrWhiteSpace(item.SessionId)
             && await db.SecurityEvents.AsNoTracking()
-                .AnyAsync(
+            .AnyAsync(
                     e => e.UserId == item.UserId
                          && e.EventType == SecurityEventType.LoginUnusualLocation
-                         && e.Detail != null
-                         && e.Detail.Contains(item.SessionId!),
+                         && e.SessionId == item.SessionId,
                     cancellationToken)
                 .ConfigureAwait(false);
         if (alreadyRecorded)
@@ -139,9 +138,10 @@ public sealed class LoginRiskAnalyzer(
             UserId = item.UserId,
             EventType = SecurityEventType.LoginUnusualLocation,
             DeviceId = item.DeviceId,
+            SessionId = item.SessionId,
             ClientIp = item.ClientIp,
             Location = location,
-            Detail = $"async-geo session={item.SessionId}; loc={location}; ipChanged={item.IpChanged}",
+            Detail = $"async-geo loc={location}; ipChanged={item.IpChanged}",
             CreatedAt = DateTimeOffset.UtcNow,
         });
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -149,7 +149,7 @@ public sealed class LoginRiskAnalyzer(
             item.UserId,
             "LoginUnusualLocation",
             "异常地点登录",
-            $"检测到与常用地区不一致的登录位置：{location}（IP：{item.ClientIp}）。",
+            $"检测到与常用地区不一致的登录位置：{location}（IP 网段：{IpPrivacy.Display(item.ClientIp)}）。",
             preferEmail: true,
             cancellationToken,
             sessionKey).ConfigureAwait(false);

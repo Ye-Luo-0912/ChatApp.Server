@@ -57,7 +57,13 @@ export const options = {
 
 export function setup() {
   if (__ENV.TOKENS_FILE) {
-    return { sessions: JSON.parse(open(__ENV.TOKENS_FILE)) };
+    const sessions = JSON.parse(open(__ENV.TOKENS_FILE));
+    return {
+      sessions: sessions.map((s) => ({
+        ...s,
+        deviceCredential: s.deviceCredential || s.DeviceCredential || '',
+      })),
+    };
   }
 
   const sessions = [];
@@ -70,7 +76,7 @@ export function setup() {
       {
         headers: {
           'Content-Type': 'application/json',
-          'X-Device-Id': `k6-online-${i + 1}`,
+          'X-Installation-Id': `k6-online-${i + 1}`,
         },
       },
     );
@@ -79,6 +85,7 @@ export function setup() {
     sessions.push({
       accessToken: body.accessToken || body.AccessToken,
       refreshToken: body.refreshToken || body.RefreshToken,
+      deviceCredential: body.deviceCredential || body.DeviceCredential || '',
       userId: body.userId || body.UserId || u.userId,
       device: `k6-online-${i + 1}`,
     });
@@ -93,7 +100,7 @@ export default function (data) {
   const session = data.sessions[(__VU - 1) % data.sessions.length];
   const headers = {
     Authorization: `Bearer ${session.accessToken}`,
-    'X-Device-Id': session.device,
+    'X-Installation-Id': session.device,
     'X-Correlation-Id': `online-${__VU}-${__ITER}`,
   };
 
@@ -131,13 +138,18 @@ export default function (data) {
       const res = http.post(
         `${BASE_URL}/api/auth/refresh-token`,
         JSON.stringify({ userId: session.userId, refreshToken: session.refreshToken }),
-        { headers: { 'Content-Type': 'application/json', 'X-Device-Id': session.device } },
+        { headers: {
+          'Content-Type': 'application/json',
+          'X-Installation-Id': session.device,
+          ...(session.deviceCredential ? { 'X-Device-Credential': session.deviceCredential } : {}),
+        } },
       );
       refreshDuration.add(Date.now() - start);
       if (res.status === 200) {
         const body = res.json();
         session.accessToken = body.accessToken || body.AccessToken || session.accessToken;
         session.refreshToken = body.refreshToken || body.RefreshToken || session.refreshToken;
+        session.deviceCredential = body.deviceCredential || body.DeviceCredential || session.deviceCredential;
       }
     });
   }

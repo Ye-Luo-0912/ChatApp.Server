@@ -18,9 +18,15 @@ public static class AttachmentModuleExtensions
     /// <summary>注册附件与头像存储模块。</summary>
     public static IServiceCollection AddAttachmentModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<AttachmentStorageOptions>(config.GetSection(AttachmentStorageOptions.SectionName));
-        services.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
-        services.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
+        services.AddOptions<AttachmentStorageOptions>()
+            .Bind(config.GetSection(AttachmentStorageOptions.SectionName))
+            .ValidateOnStart();
+        services.AddOptions<AvatarStorageOptions>()
+            .Bind(config.GetSection(AvatarStorageOptions.SectionName))
+            .ValidateOnStart();
+        services.AddOptions<ProfileOptions>()
+            .Bind(config.GetSection(ProfileOptions.SectionName))
+            .ValidateOnStart();
 
         services.AddSingleton<AvatarReencodeMetrics>();
         services.AddSingleton<AvatarReencodeQueue>();
@@ -38,7 +44,17 @@ public static class AttachmentModuleExtensions
         services.AddScoped<IAttachmentScanService, AttachmentScanService>();
         services.AddSingleton<AttachmentScanEnqueuer>();
         services.AddSingleton<IAttachmentDownloadTicketService, AttachmentDownloadTicketService>();
-        services.AddSingleton<IAttachmentContentScanner, DenyListAttachmentContentScanner>();
+        services.AddSingleton<IAttachmentContentScanner>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<AttachmentStorageOptions>>().Value;
+            var policy = ActivatorUtilities.CreateInstance<DenyListAttachmentContentScanner>(sp);
+            if (!string.Equals(options.ScannerProvider, "ClamAV", StringComparison.OrdinalIgnoreCase))
+                return policy;
+
+            return new CompositeAttachmentContentScanner(
+                policy,
+                ActivatorUtilities.CreateInstance<ClamAvAttachmentContentScanner>(sp));
+        });
         services.AddSingleton<IAttachmentStorage>(sp =>
         {
             var opts = sp.GetRequiredService<IOptions<AttachmentStorageOptions>>().Value;

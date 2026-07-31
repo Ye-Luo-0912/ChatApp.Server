@@ -12,7 +12,8 @@ concurrency:
 
 jobs:
   regression:
-    runs-on: ubuntu-latest
+    # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       DOTNET_NOLOGO: "1"

@@ -54,19 +54,16 @@ public sealed class AvatarStorageOptionsValidator : IValidateOptions<AvatarStora
                 failures.Add("AvatarStorage:S3Bucket 在 Provider=S3 时不能为空。");
             }
 
-            if (string.IsNullOrWhiteSpace(options.S3Endpoint))
+            if (!string.Equals(options.S3SseMode, "SSE-S3", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(options.S3SseMode, "SSE-KMS", StringComparison.OrdinalIgnoreCase))
             {
-                failures.Add("AvatarStorage:S3Endpoint 在 Provider=S3 时不能为空。");
+                failures.Add("AvatarStorage:S3SseMode 必须为 SSE-S3 或 SSE-KMS。");
             }
 
-            if (string.IsNullOrWhiteSpace(options.S3AccessKey))
+            if (string.Equals(options.S3SseMode, "SSE-KMS", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(options.S3KmsKeyId))
             {
-                failures.Add("AvatarStorage:S3AccessKey 在 Provider=S3 时不能为空。");
-            }
-
-            if (string.IsNullOrWhiteSpace(options.S3SecretKey))
-            {
-                failures.Add("AvatarStorage:S3SecretKey 在 Provider=S3 时不能为空。");
+                failures.Add("AvatarStorage:S3KmsKeyId 在 S3SseMode=SSE-KMS 时不能为空。");
             }
         }
 

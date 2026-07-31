@@ -1,7 +1,5 @@
 using System.Globalization;
 using System.Security.Claims;
-using System.Text;
-using System.Text.Json;
 using Core.Interfaces;
 using Core.Settings;
 using Microsoft.AspNetCore.RateLimiting;
@@ -34,14 +32,15 @@ public sealed class RateLimitPolicyProvider : IRateLimitPolicyProvider
         var failOpen = rate.FailOpenWhenRedisUnavailable;
         var policies = new Dictionary<string, RateLimitPolicy>(StringComparer.Ordinal);
 
-        // 登录类：IP + 设备指纹 + 账户归一化值 三维独立限流（任一超限即拒）。
+        // IP/device stay in the pre-MVC middleware. Account dimensions are acquired
+        // by AccountRateLimitActionFilter after model binding, so request JSON is
+        // parsed exactly once by MVC.
         policies["auth-login"] = new RateLimitPolicy(
             "auth-login", rate.AuthLoginPermitLimit,
             TimeSpan.FromSeconds(Math.Max(1, rate.AuthLoginWindowSeconds)), failOpen,
             [
                 new("ip", ExtractIpAsync),
                 new("dev", ExtractDeviceAsync),
-                new("acct", ExtractAccountAsync),
             ]);
 
         policies["auth-register"] = new RateLimitPolicy(
@@ -50,7 +49,6 @@ public sealed class RateLimitPolicyProvider : IRateLimitPolicyProvider
             [
                 new("ip", ExtractIpAsync),
                 new("dev", ExtractDeviceAsync),
-                new("acct", ExtractAccountAsync),
             ]);
 
         policies["auth-refresh"] = new RateLimitPolicy(
@@ -96,50 +94,6 @@ public sealed class RateLimitPolicyProvider : IRateLimitPolicyProvider
             return new("uid:" + userId);
         return new("ip:" + (ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown"));
     }
-    /// <summary>
-    /// 从登录请求体提取并归一化账户名（小写、去空白）。
-    /// 仅在 auth-login 策略内调用；缓冲请求体并复位，使 MVC 模型绑定可再次读取。
-    /// </summary>
-    private static async ValueTask<string?> ExtractAccountAsync(HttpContext ctx)
-    {
-        var req = ctx.Request;
-        if (!req.Headers.TryGetValue("Content-Type", out var ct) ||
-            !ct.ToString().Contains("application/json", StringComparison.OrdinalIgnoreCase))
-            return null;
-
-        req.EnableBuffering();
-        string body;
-        try
-        {
-            req.Body.Position = 0;
-            using var reader = new StreamReader(req.Body, Encoding.UTF8, leaveOpen: true);
-            body = await reader.ReadToEndAsync(ctx.RequestAborted).ConfigureAwait(false);
-        }
-        finally
-        {
-            req.Body.Position = 0;
-        }
-
-        if (string.IsNullOrEmpty(body))
-            return null;
-
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                return null;
-            if (!doc.RootElement.TryGetProperty("username", out var u))
-                return null;
-            if (u.ValueKind != JsonValueKind.String)
-                return null;
-            var v = u.GetString()?.Trim();
-            return string.IsNullOrEmpty(v) ? null : v.ToLowerInvariant();
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
 }
 /// <summary>
 /// 单例分布式限流中间件：读取端点上的 [EnableRateLimiting] 元数据，
@@ -150,6 +104,7 @@ public sealed class DistributedRateLimitingMiddleware(
     RequestDelegate next,
     IDistributedRateLimiter limiter,
     IRateLimitPolicyProvider policyProvider,
+    RateLimitDimensionKeyHasher keyHasher,
     ILogger<DistributedRateLimitingMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
@@ -203,7 +158,7 @@ public sealed class DistributedRateLimitingMiddleware(
             if (string.IsNullOrEmpty(component))
                 continue;
 
-            partitionKeys.Add($"{dim.KeySuffix}:{component}");
+            partitionKeys.Add($"{dim.KeySuffix}:{keyHasher.Hash(component)}");
         }
 
         var result = await limiter.TryAcquireAsync(

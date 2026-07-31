@@ -41,6 +41,8 @@ public class AuthService(
 {
     private const int MaxFailedAccessAttempts = 5;
     private const int MaxMfaAttempts = 5;
+    private const string AuthSnapshotKeyPrefix = "auth:snapshot:";
+    private static readonly TimeSpan AuthSnapshotTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LockoutDuration = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MfaChallengeTtl = TimeSpan.FromMinutes(5);
 
@@ -212,7 +214,7 @@ public class AuthService(
             }
         }
 
-        var roles = await GetRolesAsync(user.Id, cancellationToken);
+        var roles = await GetRolesAsync(user, cancellationToken);
         var tokens = await _tokenService.IssueLoginTokensAsync(user, roles, cancellationToken);
 
         var previousLoginDate = user.LastLoginDate;
@@ -237,6 +239,7 @@ public class AuthService(
                 EventType = SecurityEventType.LoginSuccess,
                 DeviceId = currentDevice,
                 ClientIp = currentIp,
+                SessionId = tokens.SessionId,
                 Detail = $"session={tokens.SessionId}",
                 CreatedAt = DateTimeOffset.UtcNow,
             },
@@ -249,11 +252,12 @@ public class AuthService(
                 EventType = SecurityEventType.LoginNewDevice,
                 DeviceId = currentDevice,
                 ClientIp = currentIp,
+                SessionId = tokens.SessionId,
                 CreatedAt = DateTimeOffset.UtcNow,
             });
             securityNotifications.StageNotify(
                 user.Id, "LoginNewDevice", "新设备登录",
-                $"检测到新设备登录，IP：{currentIp ?? "未知"}。", preferEmail: true);
+                $"检测到新设备登录，IP 网段：{IpPrivacy.Display(currentIp)}。", preferEmail: true);
         }
 
         var requiresRecoveryCodeRegeneration =
@@ -312,7 +316,8 @@ public class AuthService(
             isNewDevice,
             ipChanged,
             trustedDeviceToken,
-            requiresRecoveryCodeRegeneration);
+            requiresRecoveryCodeRegeneration,
+            tokens.DeviceCredential);
     }
 
     public async Task LogoutAsync(long userId, string refreshToken, CancellationToken cancellationToken = default)
@@ -395,7 +400,7 @@ public class AuthService(
                 || (user.LockoutEnabled && user.LockoutEnd.HasValue && user.LockoutEnd.Value > DateTimeOffset.UtcNow))
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
-            var roles = await GetRolesAsync(user.Id, cancellationToken);
+            var roles = await GetRolesAsync(user, cancellationToken);
 
             var rotated = await _tokenService.IssueRefreshTokensAsync(
                 userIdString, refreshToken, user, roles, cancellationToken);
@@ -403,7 +408,10 @@ public class AuthService(
             if (rotated is null)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
-            return TokenPairResult.Success(rotated.Value.accessToken, rotated.Value.refreshToken);
+            return TokenPairResult.Success(
+                rotated.Value.accessToken,
+                rotated.Value.refreshToken,
+                rotated.Value.deviceCredential);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -443,6 +451,7 @@ public class AuthService(
 
         user.PasswordHash = await _passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
         user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AdvanceSecurityVersion();
         user.AccessFailedCount = 0;
         user.LockoutEnd = null;
         user.MustChangePassword = false;
@@ -459,12 +468,50 @@ public class AuthService(
         return AuthOperationResult.Success();
     }
 
-    private async Task<IList<string>> GetRolesAsync(long userId, CancellationToken cancellationToken)
+    private async Task<IList<string>> GetRolesAsync(ApplicationUser user, CancellationToken cancellationToken)
     {
-        return await _db.UserRoles
-            .Where(ur => ur.UserId == userId)
+        var cacheKey = AuthSnapshotKeyPrefix + user.Id;
+        try
+        {
+            var cached = await cache.GetAsync<UserAuthSnapshot>(cacheKey, cancellationToken)
+                .ConfigureAwait(false);
+            if (cached is not null
+                && cached.UserId == user.Id
+                && cached.SecurityVersion == user.SecurityVersion)
+            {
+                return cached.Roles;
+            }
+        }
+        catch (CacheUnavailableException)
+        {
+            // 角色缓存是派生数据；Redis 故障时回退 PostgreSQL，不能阻断登录。
+        }
+
+        var roles = await _db.UserRoles
+            .Where(ur => ur.UserId == user.Id)
             .Select(ur => ur.Role.Name!)
             .ToListAsync(cancellationToken);
+
+        try
+        {
+            await cache.SetAsync(
+                    cacheKey,
+                    new UserAuthSnapshot
+                    {
+                        UserId = user.Id,
+                        SecurityVersion = user.SecurityVersion,
+                        Roles = [.. roles],
+                    },
+                    AuthSnapshotTtl,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (CacheUnavailableException)
+        {
+            // 角色缓存写失败同样只影响命中率。
+        }
+
+        return roles;
     }
 
     private async Task<(LoginCheckStatus Status, ApplicationUser? User)> VerifyUserCredentialsAsync(string account,

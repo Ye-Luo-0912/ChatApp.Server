@@ -355,6 +355,79 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_AttachmentScanJob", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Models.Export.AttachmentScanAudit", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<bool>("Allowed")
+                        .HasColumnType("boolean");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("AttachmentId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("ContentType")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("EngineName")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("EngineVersion")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("Reason")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<long>("ScanJobId")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Verdict")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<bool>("IsTransient")
+                        .HasColumnType("boolean");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AttachmentId", "CreatedAt")
+                        .HasDatabaseName("IX_AttachmentScanAudit_Attachment_Created");
+
+                    b.HasIndex("ScanJobId", "CreatedAt")
+                        .HasDatabaseName("IX_AttachmentScanAudit_Job_Created");
+
+                    b.ToTable("T_AttachmentScanAudit", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Export.AccountCleanupInboxEntry", b =>
                 {
                     b.Property<string>("EventId")
@@ -783,6 +856,11 @@ namespace Infrastructure.Migrations
                     b.Property<string>("SecurityStamp")
                         .HasColumnType("text");
 
+                    b.Property<long>("SecurityVersion")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasDefaultValue(1L);
+
                     b.Property<string>("Signature")
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
@@ -1121,6 +1199,10 @@ namespace Infrastructure.Migrations
                     b.Property<string>("Location")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
+
+                    b.Property<string>("SessionId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
 
                     b.Property<long?>("UserId")
                         .HasColumnType("bigint");

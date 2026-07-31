@@ -19,8 +19,12 @@ public static class AccountLifecycleModuleExtensions
     /// <summary>注册账号生命周期模块。</summary>
     public static IServiceCollection AddAccountLifecycleModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<AccountCleanupSagaOptions>(config.GetSection(AccountCleanupSagaOptions.SectionName));
-        services.Configure<DataExportStorageOptions>(config.GetSection(DataExportStorageOptions.SectionName));
+        services.AddOptions<AccountCleanupSagaOptions>()
+            .Bind(config.GetSection(AccountCleanupSagaOptions.SectionName))
+            .ValidateOnStart();
+        services.AddOptions<DataExportStorageOptions>()
+            .Bind(config.GetSection(DataExportStorageOptions.SectionName))
+            .ValidateOnStart();
 
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
         services.AddScoped<AccountCleanupSagaService>();
@@ -34,7 +38,13 @@ public static class AccountLifecycleModuleExtensions
             sp.GetRequiredService<ILogger<AccountCleanupSagaWorker>>()));
         services.AddHostedService<AccountDeletionWorker>();
         services.AddHostedService<SecurityEventArchiveWorker>();
-        services.AddSingleton<IDataExportBlobStore, LocalDataExportBlobStore>();
+        services.AddSingleton<IDataExportBlobStore>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<DataExportStorageOptions>>().Value;
+            return string.Equals(options.Provider, "S3", StringComparison.OrdinalIgnoreCase)
+                ? ActivatorUtilities.CreateInstance<S3DataExportBlobStore>(sp)
+                : ActivatorUtilities.CreateInstance<LocalDataExportBlobStore>(sp);
+        });
         services.AddSingleton<IRealtimeChatExportReader>(sp =>
         {
             var evidence = sp.GetRequiredService<IOptions<MessageEvidenceOptions>>().Value;

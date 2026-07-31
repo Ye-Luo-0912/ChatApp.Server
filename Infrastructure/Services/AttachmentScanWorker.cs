@@ -46,21 +46,46 @@ public sealed class AttachmentScanWorker(
                     continue;
                 }
 
-                await using var scope = scopeFactory.CreateAsyncScope();
-                var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
-                var claimed = await svc.ClaimDueJobsAsync(available, stoppingToken).ConfigureAwait(false);
-                if (claimed.Count == 0)
+                var reservations = new List<IAsyncDisposable>(available);
+                while (reservations.Count < available
+                       && concurrencyManager.TryAcquire(WorkerName, workerConcurrency, out var reservation))
+                {
+                    reservations.Add(reservation!);
+                }
+
+                if (reservations.Count == 0)
                 {
                     await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
                     continue;
                 }
 
-                foreach (var job in claimed)
+                await using var scope = scopeFactory.CreateAsyncScope();
+                var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+                IReadOnlyList<AttachmentScanJob> claimed;
+                try
                 {
-                    var concurrencyScope = await concurrencyManager.AcquireAsync(
-                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
-                    inFlight.Add(ProcessOneAsync(job, concurrencyScope, stoppingToken));
+                    claimed = await svc.ClaimDueJobsAsync(reservations.Count, stoppingToken).ConfigureAwait(false);
                 }
+                catch
+                {
+                    foreach (var reservation in reservations)
+                        await reservation.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
+                if (claimed.Count == 0)
+                {
+                    foreach (var reservation in reservations)
+                        await reservation.DisposeAsync().ConfigureAwait(false);
+                    await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                for (var i = 0; i < claimed.Count; i++)
+                {
+                    inFlight.Add(ProcessOneAsync(claimed[i], reservations[i], stoppingToken));
+                }
+                for (var i = claimed.Count; i < reservations.Count; i++)
+                    await reservations[i].DisposeAsync().ConfigureAwait(false);
 
                 inFlight.RemoveAll(static t => t.IsCompleted);
             }
@@ -112,9 +137,11 @@ public sealed class AttachmentScanWorker(
                 {
                     await using var scope = scopeFactory.CreateAsyncScope();
                     var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
-                    await svc.RenewLeaseAsync(
+                    var renewed = await svc.RenewLeaseAsync(
                             claimed.Id, claimed.LeaseOwner!, claimed.LeaseToken!, heartbeatCts.Token)
                         .ConfigureAwait(false);
+                    if (renewed == 0)
+                        concurrencyManager.RecordLeaseLost(WorkerName);
                 }
                 catch (Exception ex)
                 {
@@ -131,6 +158,8 @@ public sealed class AttachmentScanWorker(
             await using var scope = scopeFactory.CreateAsyncScope();
             var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
             var terminal = await svc.ProcessClaimedJobAsync(claimed, cancellationToken).ConfigureAwait(false);
+            if (!terminal)
+                concurrencyManager.RecordLeaseLost(WorkerName);
             if (terminal)
                 logger.LogInformation("附件扫描完成 JobId={Id} AttachmentId={Aid}", claimed.Id, claimed.AttachmentId);
         }

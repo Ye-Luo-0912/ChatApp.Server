@@ -59,7 +59,9 @@ function loadMetrics(filePath) {
         try {
             const obj = JSON.parse(trimmed);
             if (obj.version && obj.metrics) {
-                return obj.metrics;
+                const metrics = obj.metrics;
+                if (obj.rates) metrics.__rates = obj.rates;
+                return metrics;
             }
         } catch { /* 不是单行 JSON，按原始事件流处理 */ }
     }
@@ -67,6 +69,8 @@ function loadMetrics(filePath) {
     // k6 原始事件流：每行一个 JSON 事件
     const lines = raw.split(/\r?\n/).filter(Boolean);
     const metrics = {};
+    let firstTs = null;
+    let lastTs = null;
     for (const line of lines) {
         let evt;
         try { evt = JSON.parse(line); } catch { continue; }
@@ -76,6 +80,11 @@ function loadMetrics(filePath) {
         m.count++;
         m.sum += v;
         m.values.push(v);
+        const t = evt.data.time;
+        if (t) {
+            if (firstTs === null || t < firstTs) firstTs = t;
+            if (lastTs === null || t > lastTs) lastTs = t;
+        }
     }
     for (const m of Object.values(metrics)) {
         const sorted = [...m.values].sort((a, b) => a - b);
@@ -84,6 +93,16 @@ function loadMetrics(filePath) {
         m.p99 = percentile(sorted, 99);
         m.avg = m.count > 0 ? m.sum / m.count : 0;
         delete m.values;
+    }
+    const durationSeconds = firstTs && lastTs
+        ? Math.max(0, (new Date(lastTs).getTime() - new Date(firstTs).getTime()) / 1000)
+        : 0;
+    if (durationSeconds > 0) {
+        metrics.__rates = {
+            duration_seconds: durationSeconds,
+            iterations_per_second: metrics.iterations ? metrics.iterations.sum / durationSeconds : 0,
+            http_requests_per_second: metrics.http_reqs ? metrics.http_reqs.sum / durationSeconds : 0,
+        };
     }
     return metrics;
 }
@@ -191,6 +210,13 @@ function main() {
     if (curErr != null && curErr > ERR_ABSOLUTE_TARGET) {
         regressions.push(`错误率 ${(curErr * 100).toFixed(3)}% 超过绝对目标 0.1%`);
     }
+
+    // 业务迭代和 HTTP 请求不是同一个单位：一个 steady 迭代会发出多个请求。
+    console.log('\n=== 负载速率（单位明确） ===');
+    const baseRates = baseMetrics.__rates;
+    const curRates = curMetrics.__rates;
+    console.log(`iterations/s          基准 ${baseRates?.iterations_per_second?.toFixed?.(2) ?? 'n/a'}  当前 ${curRates?.iterations_per_second?.toFixed?.(2) ?? 'n/a'}`);
+    console.log(`HTTP requests/s       基准 ${baseRates?.http_requests_per_second?.toFixed?.(2) ?? 'n/a'}  当前 ${curRates?.http_requests_per_second?.toFixed?.(2) ?? 'n/a'}`);
 
     // 3. 绝对目标检查（可选）
     let absGoals = null;

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using Core.Settings;
 using Microsoft.Extensions.Options;
 
@@ -19,12 +20,21 @@ namespace Infrastructure.Diagnostics;
 /// </summary>
 public sealed class WorkerConcurrencyManager : IDisposable
 {
+    private static readonly Meter WorkerMeter = new("Infrastructure.Workers");
+    private static readonly Histogram<double> WaitHistogram =
+        WorkerMeter.CreateHistogram<double>("worker.wait", "ms", "按 Worker 分类的并发槽等待时间");
+    private static readonly Counter<long> Throughput =
+        WorkerMeter.CreateCounter<long>("worker.throughput", "jobs", "获取并发槽并完成释放的作业数");
+    private static readonly Counter<long> LeaseLost =
+        WorkerMeter.CreateCounter<long>("worker.lease_lost", "jobs", "租约丢失作业数");
+
     private readonly SemaphoreSlim _globalSemaphore;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _perWorker = new();
 
     private long _totalWaitTicks;
     private long _waitCount;
     private long _oldestPendingJobTicks;
+    private readonly ConcurrentDictionary<string, long> _oldestPendingByWorker = new(StringComparer.Ordinal);
 
     /// <summary>平均等待获取并发槽的时间。</summary>
     public TimeSpan AverageWaitTime
@@ -90,18 +100,76 @@ public sealed class WorkerConcurrencyManager : IDisposable
 
         Interlocked.Add(ref _totalWaitTicks, sw.ElapsedTicks);
         Interlocked.Increment(ref _waitCount);
+        WaitHistogram.Record(sw.Elapsed.TotalMilliseconds,
+            new KeyValuePair<string, object?>("worker", workerName));
 
-        return new ConcurrencyScope(_globalSemaphore, workerSemaphore);
+        return new ConcurrencyScope(_globalSemaphore, workerSemaphore, workerName);
+    }
+
+    /// <summary>
+    /// 非阻塞预留一个 Worker + 全局槽位，用于在 claim 前确定真实可用并发。
+    /// 返回 false 时调用方应稍后轮询，而不是先领取作业再等待槽位。
+    /// </summary>
+    public bool TryAcquire(
+        string workerName, int workerMaxConcurrency, out IAsyncDisposable? scope)
+    {
+        var workerSemaphore = _perWorker.GetOrAdd(
+            workerName,
+            _ => new SemaphoreSlim(
+                Math.Max(1, workerMaxConcurrency),
+                Math.Max(1, workerMaxConcurrency)));
+
+        if (!workerSemaphore.Wait(0))
+        {
+            scope = null;
+            return false;
+        }
+
+        if (!_globalSemaphore.Wait(0))
+        {
+            workerSemaphore.Release();
+            scope = null;
+            return false;
+        }
+
+        WaitHistogram.Record(0,
+            new KeyValuePair<string, object?>("worker", workerName));
+        scope = new ConcurrencyScope(_globalSemaphore, workerSemaphore, workerName);
+        return true;
     }
 
     /// <summary>记录最老待处理任务的时间戳（供 oldest-job-age 指标）。</summary>
     public void RecordOldestPendingJob(DateTimeOffset? oldestJobAt)
+        => RecordOldestPendingJob("notification", oldestJobAt);
+
+    public void RecordOldestPendingJob(string workerName, DateTimeOffset? oldestJobAt)
     {
         if (oldestJobAt is { } at)
+        {
             Interlocked.Exchange(ref _oldestPendingJobTicks, at.UtcTicks);
+            _oldestPendingByWorker[workerName] = at.UtcTicks;
+        }
         else
+        {
             Interlocked.Exchange(ref _oldestPendingJobTicks, 0);
+            _oldestPendingByWorker.TryRemove(workerName, out _);
+        }
     }
+
+    public IEnumerable<Measurement<double>> GetOldestPendingJobMeasurements()
+    {
+        var now = DateTimeOffset.UtcNow.Ticks;
+        foreach (var pair in _oldestPendingByWorker)
+        {
+            var ageMs = Math.Max(0, TimeSpan.FromTicks(now - pair.Value).TotalMilliseconds);
+            yield return new Measurement<double>(
+                ageMs,
+                new KeyValuePair<string, object?>("worker", pair.Key));
+        }
+    }
+
+    public void RecordLeaseLost(string workerName)
+        => LeaseLost.Add(1, new KeyValuePair<string, object?>("worker", workerName));
 
     public void Dispose()
     {
@@ -110,12 +178,16 @@ public sealed class WorkerConcurrencyManager : IDisposable
             sem.Dispose();
     }
 
-    private sealed class ConcurrencyScope(SemaphoreSlim global, SemaphoreSlim worker) : IAsyncDisposable
+    private sealed class ConcurrencyScope(
+        SemaphoreSlim global,
+        SemaphoreSlim worker,
+        string workerName) : IAsyncDisposable
     {
         public ValueTask DisposeAsync()
         {
             worker.Release();
             global.Release();
+            Throughput.Add(1, new KeyValuePair<string, object?>("worker", workerName));
             return ValueTask.CompletedTask;
         }
     }

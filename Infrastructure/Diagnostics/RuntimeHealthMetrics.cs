@@ -60,6 +60,11 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
             () => _concurrencyManager.OldestPendingJobAge.TotalMilliseconds,
             "ms",
             "最老待处理任务的年龄");
+        _ = Meter.CreateObservableGauge(
+            "worker.oldest_job_age_ms.by_worker",
+            () => _concurrencyManager.GetOldestPendingJobMeasurements(),
+            "ms",
+            "按 Worker 分类的最老待处理任务年龄");
         _redisPingMs = Meter.CreateHistogram<double>("redis.ping.duration", "ms", "Redis PING 延迟");
         // 保留引用，避免被优化掉
         _ = _workingSet;

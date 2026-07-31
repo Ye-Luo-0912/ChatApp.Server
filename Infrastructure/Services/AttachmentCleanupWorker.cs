@@ -1,5 +1,3 @@
-using Amazon;
-using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Core.Interfaces;
@@ -77,17 +75,10 @@ public sealed class AttachmentCleanupWorker(
     {
         var (activeKeys, metadataAvailable) = await LoadActiveKeysAsync(ct).ConfigureAwait(false);
 
-        var config = new AmazonS3Config
-        {
-            RegionEndpoint = RegionEndpoint.GetBySystemName(opts.S3Region ?? "us-east-1"),
-            ForcePathStyle = true,
-        };
-        if (!string.IsNullOrWhiteSpace(opts.S3Endpoint))
-            config.ServiceURL = opts.S3Endpoint;
-
-        using var s3 = new AmazonS3Client(
-            new BasicAWSCredentials(opts.S3AccessKey, opts.S3SecretKey),
-            config);
+        using var s3 = S3ClientFactory.Create(
+            opts.S3Region,
+            opts.S3Endpoint,
+            opts.S3ForcePathStyle);
 
         var cutoff = DateTime.UtcNow - maxAge;
         string? token = null;
@@ -108,8 +99,9 @@ public sealed class AttachmentCleanupWorker(
 
                 if (!metadataAvailable)
                 {
-                    // 无元数据时仅清理临时 .bin，避免误删正式对象。
-                    if (!obj.Key.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                    // 无元数据时不能 safely infer final-vs-pending from a file
+                    // extension. Leave the object for bucket lifecycle/operations.
+                    if (!obj.Key.Contains("/pending/", StringComparison.OrdinalIgnoreCase))
                         continue;
                 }
                 else if (activeKeys.Contains(obj.Key))

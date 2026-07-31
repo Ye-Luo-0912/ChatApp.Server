@@ -90,6 +90,7 @@ public sealed class SecurityEventDto
     public long Id { get; init; }
     public SecurityEventType EventType { get; init; }
     public string? DeviceId { get; init; }
+    public string? SessionId { get; init; }
     public string? ClientIp { get; init; }
     public string? Location { get; init; }
     public string? Detail { get; init; }

@@ -59,7 +59,7 @@ public interface IDataExportBlobStore
 /// 本地文件导出存储。默认 CAE3 分块 AES-GCM 信封加密落盘（Security:SecretEncryptionKey）。
 /// 仍可读遗留 CAE2（零长 EOF）、CAE1 整包密文与明文。生产切 S3 时见 <see cref="DataExportStorageOptions.S3SseMode"/>（SSE-S3/KMS）。
 /// </summary>
-public sealed class LocalDataExportBlobStore : IDataExportBlobStore
+public sealed class LocalDataExportBlobStore : IDataExportBlobStore, IObjectStoreHealthProbe
 {
     private static readonly byte[] MagicCae1 = "CAE1"u8.ToArray();
     private static readonly byte[] MagicCae2 = "CAE2"u8.ToArray();
@@ -200,6 +200,14 @@ public sealed class LocalDataExportBlobStore : IDataExportBlobStore
             ArrayPool<byte>.Shared.Return(plainBuf, clearArray: false);
             ArrayPool<byte>.Shared.Return(cipherBuf, clearArray: false);
         }
+    }
+
+    public Task ProbeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(_root))
+            throw new DirectoryNotFoundException(_root);
+        return Task.CompletedTask;
     }
 
     public Task<Stream?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default)
@@ -902,15 +910,35 @@ public sealed class DataExportWorker(
                 // P0-5.2：只领取当前真正拥有执行槽的任务数量；每个作业独立作用域+独立 DbContext 并发处理。
                 inFlight.RemoveAll(static t => t.IsCompleted);
                 var available = Math.Max(0, workerConcurrency - inFlight.Count);
-                for (var i = 0; i < available; i++)
+                var reservations = new List<IAsyncDisposable>(available);
+                while (reservations.Count < available
+                       && concurrencyManager.TryAcquire(WorkerName, workerConcurrency, out var reservation))
                 {
-                    var claimed = await ClaimOneAsync(stoppingToken).ConfigureAwait(false);
-                    if (claimed is null) break;
+                    reservations.Add(reservation!);
+                }
 
-                    var concurrencyScope = await concurrencyManager.AcquireAsync(
-                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
+                for (var i = 0; i < reservations.Count; i++)
+                {
+                    (DataExportJob Job, string LeaseToken)? claimed;
+                    try
+                    {
+                        claimed = await ClaimOneAsync(stoppingToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        await reservations[i].DisposeAsync().ConfigureAwait(false);
+                        for (var j = i + 1; j < reservations.Count; j++)
+                            await reservations[j].DisposeAsync().ConfigureAwait(false);
+                        throw;
+                    }
+                    if (claimed is null)
+                    {
+                        await reservations[i].DisposeAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
                     inFlight.Add(ProcessOneAsync(
-                        claimed.Value.Job, claimed.Value.LeaseToken, concurrencyScope, stoppingToken));
+                        claimed.Value.Job, claimed.Value.LeaseToken, reservations[i], stoppingToken));
                 }
 
                 inFlight.RemoveAll(static t => t.IsCompleted);
@@ -1118,6 +1146,8 @@ public sealed class DataExportWorker(
         {
             logger.LogError(ex, "导出作业失败 JobId={JobId}", job.Id);
             var publicCode = DataExportJobErrors.MapPublicCode(ex);
+            if (publicCode == DataExportJobErrors.LeaseLost)
+                concurrencyManager.RecordLeaseLost(WorkerName);
             try
             {
                 await using var scope = scopeFactory.CreateAsyncScope();
@@ -1194,7 +1224,7 @@ public sealed class DataExportWorker(
 
             var events = await db.SecurityEvents.AsNoTracking()
                 .Where(e => e.UserId == userId).OrderByDescending(e => e.Id).Take(2000)
-                .Select(e => new { e.Id, e.EventType, e.DeviceId, e.ClientIp, e.Location, e.Detail, e.CreatedAt })
+                .Select(e => new { e.Id, e.EventType, e.DeviceId, e.SessionId, e.ClientIp, e.Location, e.Detail, e.CreatedAt })
                 .ToListAsync(cancellationToken);
             var notifications = await db.InAppNotifications.AsNoTracking()
                 .Where(n => n.UserId == userId).OrderByDescending(n => n.Id).Take(2000)

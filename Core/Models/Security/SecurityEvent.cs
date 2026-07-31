@@ -36,6 +36,7 @@ public sealed class SecurityEvent
     public long? UserId { get; set; }
     public SecurityEventType EventType { get; set; }
     public string? DeviceId { get; set; }
+    public string? SessionId { get; set; }
     public string? ClientIp { get; set; }
     public string? Location { get; set; }
     public string? Detail { get; set; }

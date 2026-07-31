@@ -41,6 +41,6 @@ public interface ITokenService : ITokenGenerator, IAccessTokenStore, IRefreshTok
     /// </para>
     /// </summary>
     /// <returns>成功时返回新签发的 (accessToken, refreshToken)；失败返回 <see langword="null"/>。</returns>
-    Task<(string accessToken, string refreshToken)?> IssueRefreshTokensAsync(
+    Task<(string accessToken, string refreshToken, string? deviceCredential)?> IssueRefreshTokensAsync(
         string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default);
 }

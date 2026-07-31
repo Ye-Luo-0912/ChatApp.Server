@@ -33,6 +33,7 @@ namespace Infrastructure.Data
         public DbSet<DataExportJob> DataExportJobs { get; set; }
         public DbSet<AttachmentBlobDeleteJob> AttachmentBlobDeleteJobs { get; set; }
         public DbSet<AttachmentScanJob> AttachmentScanJobs { get; set; }
+        public DbSet<AttachmentScanAudit> AttachmentScanAudits { get; set; }
         public DbSet<AccountCleanupSaga> AccountCleanupSagas { get; set; }
         public DbSet<AccountCleanupInboxEntry> AccountCleanupInbox { get; set; }
         public DbSet<AccountCleanupDeadLetter> AccountCleanupDeadLetters { get; set; }
@@ -74,6 +75,7 @@ namespace Infrastructure.Data
                 e.HasKey(x => x.Id);
                 e.Property(x => x.Id).UseIdentityByDefaultColumn();
                 e.Property(x => x.DeviceId).HasMaxLength(128);
+                e.Property(x => x.SessionId).HasMaxLength(128);
                 e.Property(x => x.ClientIp).HasMaxLength(64);
                 e.Property(x => x.Location).HasMaxLength(256);
                 e.Property(x => x.Detail).HasMaxLength(1024);
@@ -208,6 +210,24 @@ namespace Infrastructure.Data
                     .HasDatabaseName("IX_AttachmentScanJob_ActiveAttachment");
                 e.HasIndex(x => new { x.Status, x.LeaseExpiresAt })
                     .HasDatabaseName("IX_AttachmentScanJob_LeaseDue");
+            });
+
+            builder.Entity<AttachmentScanAudit>(e =>
+            {
+                e.ToTable("T_AttachmentScanAudit");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.AttachmentId).HasMaxLength(64).IsRequired();
+                e.Property(x => x.ObjectKey).HasMaxLength(512).IsRequired();
+                e.Property(x => x.ContentType).HasMaxLength(128);
+                e.Property(x => x.EngineName).HasMaxLength(128).IsRequired();
+                e.Property(x => x.EngineVersion).HasMaxLength(128).IsRequired();
+                e.Property(x => x.Verdict).HasMaxLength(32).IsRequired();
+                e.Property(x => x.Reason).HasMaxLength(500);
+                e.HasIndex(x => new { x.AttachmentId, x.CreatedAt })
+                    .HasDatabaseName("IX_AttachmentScanAudit_Attachment_Created");
+                e.HasIndex(x => new { x.ScanJobId, x.CreatedAt })
+                    .HasDatabaseName("IX_AttachmentScanAudit_Job_Created");
             });
 
             builder.Entity<AccountCleanupSaga>(e =>

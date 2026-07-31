@@ -1,8 +1,8 @@
 namespace Core.Interfaces;
 
 /// <summary>
-/// 附件内容扫描钩子（魔数嗅探后的可选恶意软件/危险类型检查）。
-/// 默认实现仅做扩展名/魔数拒绝列表；可替换为真实 AV。
+/// 附件内容扫描钩子（魔数嗅探后的危险类型、归档与恶意软件检查）。
+/// DenyList 是开发/预过滤策略；生产通过组合器接入真实 AV。
 /// </summary>
 public interface IAttachmentContentScanner
 {
@@ -22,11 +22,23 @@ public interface IAttachmentContentScanner
 public sealed record AttachmentContentScanResult(
     bool Allowed,
     string? Reason = null,
-    bool IsTransient = false)
+    bool IsTransient = false,
+    string? EngineName = null,
+    string? EngineVersion = null)
 {
-    public static AttachmentContentScanResult Allow() => new(true);
-    public static AttachmentContentScanResult Deny(string reason) => new(false, reason);
-    public static AttachmentContentScanResult TransientFail(string reason) =>
-        new(false, reason, IsTransient: true);
+    public static AttachmentContentScanResult Allow(
+        string? engineName = null,
+        string? engineVersion = null) =>
+        new(true, EngineName: engineName, EngineVersion: engineVersion);
+    public static AttachmentContentScanResult Deny(
+        string reason,
+        string? engineName = null,
+        string? engineVersion = null) =>
+        new(false, reason, EngineName: engineName, EngineVersion: engineVersion);
+    public static AttachmentContentScanResult TransientFail(
+        string reason,
+        string? engineName = null,
+        string? engineVersion = null) =>
+        new(false, reason, IsTransient: true, EngineName: engineName, EngineVersion: engineVersion);
 }
-
+

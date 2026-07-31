@@ -77,6 +77,35 @@ public sealed class AttachmentStorageOptionsValidator : IValidateOptions<Attachm
             failures.Add("AttachmentStorage:ScanBatchSize 必须大于 0。");
         }
 
+        if (options.ScanAuditRetentionDays <= 0)
+        {
+            failures.Add("AttachmentStorage:ScanAuditRetentionDays 必须大于 0。");
+        }
+
+        if (!string.Equals(options.ScannerProvider, "DenyList", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(options.ScannerProvider, "ClamAV", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add("AttachmentStorage:ScannerProvider 必须为 DenyList 或 ClamAV。");
+        }
+
+        if (options.ClamAvPort is < 1 or > 65535)
+            failures.Add("AttachmentStorage:ClamAvPort 必须在 1-65535 之间。");
+
+        if (options.ClamAvTimeoutMilliseconds <= 0)
+            failures.Add("AttachmentStorage:ClamAvTimeoutMilliseconds 必须大于 0。");
+
+        if (options.ArchiveMaxEntries <= 0)
+            failures.Add("AttachmentStorage:ArchiveMaxEntries 必须大于 0。");
+
+        if (options.ArchiveMaxUncompressedBytes <= 0)
+            failures.Add("AttachmentStorage:ArchiveMaxUncompressedBytes 必须大于 0。");
+
+        if (options.ArchiveMaxPathDepth <= 0)
+            failures.Add("AttachmentStorage:ArchiveMaxPathDepth 必须大于 0。");
+
+        if (options.ArchiveMaxNestingDepth <= 0)
+            failures.Add("AttachmentStorage:ArchiveMaxNestingDepth 必须大于 0。");
+
         if (options.StuckScanningMinutes <= 0)
         {
             failures.Add("AttachmentStorage:StuckScanningMinutes 必须大于 0。");
@@ -99,19 +128,16 @@ public sealed class AttachmentStorageOptionsValidator : IValidateOptions<Attachm
                 failures.Add("AttachmentStorage:S3Bucket 在 Provider=S3 时不能为空。");
             }
 
-            if (string.IsNullOrWhiteSpace(options.S3Endpoint))
+            if (!string.Equals(options.S3SseMode, "SSE-S3", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(options.S3SseMode, "SSE-KMS", StringComparison.OrdinalIgnoreCase))
             {
-                failures.Add("AttachmentStorage:S3Endpoint 在 Provider=S3 时不能为空。");
+                failures.Add("AttachmentStorage:S3SseMode 必须为 SSE-S3 或 SSE-KMS。");
             }
 
-            if (string.IsNullOrWhiteSpace(options.S3AccessKey))
+            if (string.Equals(options.S3SseMode, "SSE-KMS", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(options.S3KmsKeyId))
             {
-                failures.Add("AttachmentStorage:S3AccessKey 在 Provider=S3 时不能为空。");
-            }
-
-            if (string.IsNullOrWhiteSpace(options.S3SecretKey))
-            {
-                failures.Add("AttachmentStorage:S3SecretKey 在 Provider=S3 时不能为空。");
+                failures.Add("AttachmentStorage:S3KmsKeyId 在 S3SseMode=SSE-KMS 时不能为空。");
             }
         }
 

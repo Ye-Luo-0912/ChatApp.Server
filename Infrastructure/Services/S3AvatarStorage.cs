@@ -1,6 +1,4 @@
 using System.Security.Cryptography;
-using Amazon;
-using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Core.Interfaces;
@@ -39,22 +37,13 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
         _reencodeQueue = reencodeQueue;
         _logger = logger;
 
-        if (string.IsNullOrWhiteSpace(_options.S3Bucket)
-            || string.IsNullOrWhiteSpace(_options.S3AccessKey)
-            || string.IsNullOrWhiteSpace(_options.S3SecretKey))
+        if (string.IsNullOrWhiteSpace(_options.S3Bucket))
             throw new InvalidOperationException("AvatarStorage S3 配置不完整");
 
-        var config = new AmazonS3Config
-        {
-            RegionEndpoint = RegionEndpoint.GetBySystemName(_options.S3Region ?? "us-east-1"),
-            ForcePathStyle = true,
-        };
-        if (!string.IsNullOrWhiteSpace(_options.S3Endpoint))
-            config.ServiceURL = _options.S3Endpoint;
-
-        _s3 = new AmazonS3Client(
-            new BasicAWSCredentials(_options.S3AccessKey, _options.S3SecretKey),
-            config);
+        _s3 = S3ClientFactory.Create(
+            _options.S3Region,
+            _options.S3Endpoint,
+            _options.S3ForcePathStyle);
     }
 
     public long MaxBytes => _options.MaxBytes;
@@ -90,6 +79,7 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
             Expires = expires.UtcDateTime,
             ContentType = contentType,
         };
+        S3ClientFactory.ApplyServerSideEncryption(request, _options.S3SseMode, _options.S3KmsKeyId);
         var uploadUrl = await _s3.GetPreSignedURLAsync(request).ConfigureAwait(false);
         var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{objectKey}";
         return (objectKey, ticket, uploadUrl, publicUrl, expires);
@@ -209,13 +199,15 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
                     .ConfigureAwait(false);
                 encoded.Position = 0;
 
-                await _s3.PutObjectAsync(new PutObjectRequest
+                var put = new PutObjectRequest
                 {
                     BucketName = _options.S3Bucket,
                     Key = key,
                     InputStream = encoded,
                     ContentType = "image/jpeg",
-                }, ct).ConfigureAwait(false);
+                };
+                S3ClientFactory.ApplyServerSideEncryption(put, _options.S3SseMode, _options.S3KmsKeyId);
+                await _s3.PutObjectAsync(put, ct).ConfigureAwait(false);
 
                 return (key, GetPublicUrl(key), null as string);
             }, cancellationToken).ConfigureAwait(false);

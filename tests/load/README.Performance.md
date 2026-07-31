@@ -76,7 +76,7 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 | 双实例限流 | 两实例 + 共享 Redis，默认限流 | `mixed-workload.k6.js` `PROFILE=dual_ratelimit` |
 | 登录容量 | Performance | `login-capacity.k6.js` 或 `PROFILE=auth_capacity` |
 | 稳态业务 | Performance | `PROFILE=steady`（固定设备，≥90% 已认证） |
-| 设备抖动 | Performance | `PROFILE=device_churn`（每轮新 `X-Device-Id`） |
+| 设备抖动 | Performance | `PROFILE=device_churn`（每轮新 `X-Installation-Id`） |
 | 浸泡 | Performance | `PROFILE=soak`（默认 **2h**，同 steady 流量形态） |
 | 在线用户 | Performance + 预置 Token | `online-users.k6.js`，`-e TOKENS_FILE=./tokens.json` |
 
@@ -123,7 +123,7 @@ Nightly 重启恢复：在 steady 压测中段 `docker restart` Postgres + Garne
 
 ### steady（固定设备基线）
 
-固定 `X-Device-Id`（`k6-steady-{vu}`），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。优先配合预置 Token，避免登录限流污染业务基线：
+固定 `X-Installation-Id`（`k6-steady-{vu}`），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
 
 ```bash
 k6 run -e BASE_URL=http://localhost:8080 -e TOKENS_FILE=./tokens.json -e PROFILE=steady \
@@ -148,7 +148,7 @@ k6 run -e CREDS_FILE=./creds.json tests/load/login-capacity.k6.js
 
 ### device_churn（新设备 / 会话 / 通知增长）
 
-每轮 `X-Device-Id=k6-churn-{vu}-{iter}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
+每轮 `X-Installation-Id=k6-churn-{vu}-{iter}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
 
 ```bash
 k6 run -e CREDS_FILE=./creds.json -e PROFILE=device_churn -e RATE=10 -e DURATION=10m \
@@ -194,6 +194,8 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 ```
 
 ### 基线记录表（每次跑完填一行；未跑勿填造数据）
+
+`extract-summary.mjs` 同时输出 `iterations_per_second` 和 `http_requests_per_second`。前者是业务迭代速率，后者是 HTTP 请求速率；steady 的一次迭代包含多个请求，不能混用。
 
 | 日期 | 硬件 | PROFILE | RATE | 时长 | login p95/p99 | refresh p95 | errors | 503 overload | 备注 |
 |------|------|--------|------|------|---------------|-------------|--------|--------------|------|

@@ -38,6 +38,10 @@ public sealed class AccessTokenData
     [JsonPropertyName("d")]
     public ulong? DeviceIdHash { get; set; }
 
+    /// <summary>签发时的用户认证快照版本；版本变化时由会话撤销栅栏使其失效。</summary>
+    [JsonPropertyName("v")]
+    public long SecurityVersion { get; set; }
+
     /// <summary>是否已过期（运行时计算，不参与序列化）。</summary>
     [JsonIgnore]
     public bool IsExpired => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() >= ExpiresAtMs;

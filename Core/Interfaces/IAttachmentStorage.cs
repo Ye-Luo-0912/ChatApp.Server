@@ -26,7 +26,7 @@ public interface IAttachmentStorage
         string contentType,
         CancellationToken cancellationToken = default);
 
-    /// <summary>确认对象存在；S3 会消费 ticket 并将临时 .bin 提升为正式对象。</summary>
+    /// <summary>确认对象存在；对象键从预签阶段起就是最终键。</summary>
     Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
         ConfirmObjectAsync(
             long userId,

@@ -198,7 +198,88 @@ jobs:
       - name: Dependency vulnerability check
         working-directory: ChatApp.Server
         run: |
+          set -o pipefail
           set +e
           out=$(dotnet list ChatApp.Server.sln package --vulnerable --include-transitive 2>&1)
+          status=$?
+          set -e
           echo "$out"
-          echo "$out" | grep -qiE "Critical|High" && exit 1 || exit 0
+          if [ "$status" -ne 0 ]; then
+            echo "dotnet list package failed with exit code $status" >&2
+            exit "$status"
+          fi
+          if echo "$out" | grep -qiE "Critical|High"; then
+            echo "High/Critical dependency vulnerability found" >&2
+            exit 1
+          fi
+
+  garnet-compatibility:
+    name: Garnet compatibility contracts
+    runs-on: ubuntu-latest
+    needs: build-test
+    env:
+      CHATAPP_TEST_GARNET: "127.0.0.1:6379,abortConnect=false"
+      CHATAPP_TEST_POSTGRES: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres"
+      CHATAPP_TEST_GARNET_DOCKER_RESTART: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+    steps:
+      - name: Checkout Server
+        uses: actions/checkout@v4
+        with:
+          path: ChatApp.Server
+
+      - name: Read pinned Realtime version
+        id: realtime-version
+        working-directory: ChatApp.Server
+        run: |
+          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
+          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
+          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned RealtimeServices
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.realtime-version.outputs.repo }}
+          path: ChatApp.RealtimeServices
+          ref: ${{ steps.realtime-version.outputs.commit }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Start Garnet with production Lua transaction mode
+        run: |
+          docker run -d --name chatapp_garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 \
+            --bind 0.0.0.0 --port 6379 --lua --lua-transaction-mode \
+            --checkpointdir /data/checkpoints --aof --aof-size-limit 64m --recover
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs chatapp_garnet || true
+          exit 1
+
+      - name: Start Postgres for cross-store contracts
+        run: |
+          docker run -d --name chatapp_postgres \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ChatAppDatabase \
+            -p 5432:5432 postgres:16.8
+          for i in $(seq 1 30); do
+            if docker exec chatapp_postgres pg_isready -U postgres -d ChatAppDatabase; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs chatapp_postgres || true
+          exit 1
+
+      - name: Run full integration suite against Garnet
+        working-directory: ChatApp.Server
+        run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release

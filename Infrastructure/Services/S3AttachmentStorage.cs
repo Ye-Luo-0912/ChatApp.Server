@@ -1,6 +1,4 @@
 using System.Security.Cryptography;
-using Amazon;
-using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Core.Interfaces;
@@ -11,12 +9,13 @@ using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
-/// <summary>S3/MinIO 预签名附件上传；确认时校验对象并提升临时 .bin。</summary>
-public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
+/// <summary>S3/MinIO 预签名附件上传；确认时校验对象并复用稳定最终键。</summary>
+public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadHeadersProvider, IAttachmentScanStateMarker, IObjectStoreHealthProbe, IDisposable
 {
     private readonly AttachmentStorageOptions _options;
     private readonly ICacheValueStore _cache;
     private readonly IAtomicCacheStore _atomicCache;
+    private readonly AttachmentBlobDeleteEnqueuer _blobDeletes;
     private readonly ILogger<S3AttachmentStorage> _logger;
     private readonly IAmazonS3 _s3;
 
@@ -24,32 +23,41 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         IOptions<AttachmentStorageOptions> options,
         ICacheValueStore cache,
         IAtomicCacheStore atomicCache,
+        AttachmentBlobDeleteEnqueuer blobDeletes,
         ILogger<S3AttachmentStorage> logger)
     {
         _options = options.Value;
         _cache = cache;
         _atomicCache = atomicCache;
+        _blobDeletes = blobDeletes;
         _logger = logger;
 
-        if (string.IsNullOrWhiteSpace(_options.S3Bucket)
-            || string.IsNullOrWhiteSpace(_options.S3AccessKey)
-            || string.IsNullOrWhiteSpace(_options.S3SecretKey))
+        if (string.IsNullOrWhiteSpace(_options.S3Bucket))
             throw new InvalidOperationException("AttachmentStorage S3 配置不完整");
 
-        var config = new AmazonS3Config
-        {
-            RegionEndpoint = RegionEndpoint.GetBySystemName(_options.S3Region ?? "us-east-1"),
-            ForcePathStyle = true,
-        };
-        if (!string.IsNullOrWhiteSpace(_options.S3Endpoint))
-            config.ServiceURL = _options.S3Endpoint;
-
-        _s3 = new AmazonS3Client(
-            new BasicAWSCredentials(_options.S3AccessKey, _options.S3SecretKey),
-            config);
+        _s3 = S3ClientFactory.Create(
+            _options.S3Region,
+            _options.S3Endpoint,
+            _options.S3ForcePathStyle);
     }
 
     public long MaxBytes => _options.MaxBytes;
+
+    public async Task ProbeAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _s3.GetObjectMetadataAsync(
+                    _options.S3Bucket,
+                    "__chatapp_healthcheck_nonexistent__",
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            // A 404 proves that the bucket and credentials are reachable.
+        }
+    }
 
     public bool IsAllowedContentType(string contentType) =>
         _options.AllowedContentTypes.Any(t =>
@@ -70,7 +78,9 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
             throw new ArgumentException($"附件大小须在 1~{MaxBytes} 字节之间");
 
         var attachmentId = Guid.NewGuid().ToString("N");
-        var objectKey = $"attachments/{userId}/{attachmentId}.bin";
+        // The final key is allocated once. MIME is carried by S3 Content-Type and
+        // the realtime metadata row; never copy a large object merely to add an extension.
+        var objectKey = $"attachments/{userId}/{attachmentId}";
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
 
@@ -90,9 +100,34 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
             Expires = expires.UtcDateTime,
             ContentType = contentType,
         };
+        S3ClientFactory.ApplyServerSideEncryption(request, _options.S3SseMode, _options.S3KmsKeyId);
+        request.Headers["x-amz-tagging"] = "chatapp-scan-state=unconfirmed";
         var uploadUrl = await _s3.GetPreSignedURLAsync(request).ConfigureAwait(false);
         // 不再返回永久 PublicUrl；聊天侧走鉴权下载。
         return (attachmentId, objectKey, ticket, uploadUrl, string.Empty, expires);
+    }
+
+    public IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(string contentType)
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Content-Type"] = contentType,
+            ["x-amz-tagging"] = "chatapp-scan-state=unconfirmed",
+        };
+
+        switch (S3ClientFactory.NormalizeMode(_options.S3SseMode))
+        {
+            case "SSE-S3":
+                headers["x-amz-server-side-encryption"] = "AES256";
+                break;
+            case "SSE-KMS":
+                headers["x-amz-server-side-encryption"] = "aws:kms";
+                if (!string.IsNullOrWhiteSpace(_options.S3KmsKeyId))
+                    headers["x-amz-server-side-encryption-aws-kms-key-id"] = _options.S3KmsKeyId;
+                break;
+        }
+
+        return headers;
     }
 
     public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)> StoreAsync(
@@ -130,31 +165,60 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
                 .ConfigureAwait(false);
             if (meta.ContentLength <= 0 || meta.ContentLength > MaxBytes)
             {
-                await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
-                return (false, null, null, null, null, 0, null, "附件大小超限");
-            }
-
-            var finalKey = objectKey;
-            if (objectKey.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
-            {
-                var ext = GuessExtension(info.ContentType, info.OriginalName);
-                finalKey = $"attachments/{userId}/{info.AttachmentId}{ext}";
-                await _s3.CopyObjectAsync(
-                    _options.S3Bucket, objectKey,
-                    _options.S3Bucket, finalKey,
-                    cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    await _s3.DeleteObjectAsync(_options.S3Bucket, objectKey, cancellationToken)
+                    // A client can replace the body behind a PUT URL. Do not restore
+                    // the ticket: the object is now a durable deletion concern, not a
+                    // retryable upload.
+                    await _blobDeletes.EnqueueAsync(
+                            [(objectKey, info.AttachmentId)], userId, cancellationToken)
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "清理临时附件对象失败");
+                    _logger.LogError(
+                        ex,
+                        "超限附件对象删除任务入队失败 AttachmentId={AttachmentId} Key={Key}",
+                        info.AttachmentId,
+                        objectKey);
                 }
+
+                return (false, null, null, null, null, 0, null, "附件大小超限");
             }
 
-            return (true, string.Empty, finalKey, info.AttachmentId, info.ContentType, meta.ContentLength, info.OriginalName, null);
+            var contentType = string.IsNullOrWhiteSpace(meta.Headers.ContentType)
+                ? info.ContentType
+                : meta.Headers.ContentType;
+            try
+            {
+                await MarkScanStateAsync(objectKey, "quarantine", cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "附件对象无法进入 quarantine 状态，写入删除任务 AttachmentId={AttachmentId} Key={Key}",
+                    info.AttachmentId,
+                    objectKey);
+                try
+                {
+                    await _blobDeletes.EnqueueAsync(
+                            [(objectKey, info.AttachmentId)], userId, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception enqueueEx)
+                {
+                    _logger.LogError(
+                        enqueueEx,
+                        "quarantine 失败后的附件删除任务入队失败 AttachmentId={AttachmentId} Key={Key}",
+                        info.AttachmentId,
+                        objectKey);
+                }
+
+                return (false, null, null, null, null, 0, null, "附件无法进入隔离扫描状态");
+            }
+            return (true, string.Empty, objectKey, info.AttachmentId, contentType, meta.ContentLength, info.OriginalName, null);
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
@@ -255,6 +319,25 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         }
     }
 
+    public Task MarkScanStateAsync(
+        string objectKey,
+        string state,
+        CancellationToken cancellationToken = default)
+        => _s3.PutObjectTaggingAsync(
+                new PutObjectTaggingRequest
+                {
+                    BucketName = _options.S3Bucket,
+                    Key = NormalizeKey(objectKey),
+                    Tagging = new Tagging
+                    {
+                        TagSet =
+                        [
+                            new Tag { Key = "chatapp-scan-state", Value = state },
+                        ],
+                    },
+                },
+                cancellationToken);
+
     private string NormalizeKey(string objectKeyOrUrl)
     {
         var key = objectKeyOrUrl;
@@ -287,29 +370,6 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         {
             _logger.LogWarning(ex, "附件确认失败后写回上传票失败");
         }
-    }
-
-    private static string GuessExtension(string contentType, string? originalName)
-    {
-        if (!string.IsNullOrWhiteSpace(originalName))
-        {
-            var ext = Path.GetExtension(originalName);
-            if (!string.IsNullOrWhiteSpace(ext) && ext.Length <= 16)
-                return ext.ToLowerInvariant();
-        }
-
-        return contentType.ToLowerInvariant() switch
-        {
-            "image/jpeg" => ".jpg",
-            "image/png" => ".png",
-            "image/webp" => ".webp",
-            "image/gif" => ".gif",
-            "application/pdf" => ".pdf",
-            "audio/mpeg" => ".mp3",
-            "audio/ogg" => ".ogg",
-            "video/mp4" => ".mp4",
-            _ => ".bin",
-        };
     }
 
     public void Dispose() => _s3.Dispose();

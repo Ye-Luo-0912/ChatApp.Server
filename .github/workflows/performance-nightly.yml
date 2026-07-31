@@ -21,7 +21,8 @@ concurrency:
 
 jobs:
   nightly:
-    runs-on: ubuntu-latest
+    # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
       contents: write
@@ -220,7 +221,7 @@ jobs:
           node tests/load/extract-summary.mjs \
             --input tests/load/steady-15m.json \
             --output tests/load/baselines/baseline-steady-rate20.json \
-            --runner ubuntu-latest \
+            --runner ubuntu-24.04 \
             --runtime "steady 15m RATE=20"
           git add tests/load/baselines/baseline-steady-rate20.json
           if git diff --cached --quiet; then

@@ -17,5 +17,8 @@
         /// 完整设备信息可通过 SessionId 关联的 SessionRecord 获取。
         /// </summary>
         public ulong? DeviceIdHash { get; init; }
+
+        /// <summary>登录时签发的设备凭据明文；仅返回一次，服务端不持久化明文。</summary>
+        public string? DeviceCredential { get; init; }
     }
 }

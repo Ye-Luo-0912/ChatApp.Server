@@ -44,6 +44,6 @@ allocations/request ≤ +10%、Redis commands/request 不得增加、DB queries/
 
 ## 注意
 
-- 基线仅在固定 runner（`ubuntu-latest`）上有效；自托管 runner 需重新校准。
+- 基线仅在固定 runner（`ubuntu-24.04`）上有效；自托管 runner 需重新校准。
 - 硬件变更后必须重新生成基线，并在 commit message 中注明硬件配置。
 - 不要手工编辑基线 JSON——它是 k6 的原始事件流。

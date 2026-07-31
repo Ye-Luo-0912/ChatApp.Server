@@ -1,5 +1,3 @@
-using Amazon;
-using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Core.Settings;
@@ -48,17 +46,10 @@ public sealed class AvatarCleanupWorker(
 
     private async Task CleanupS3Async(AvatarStorageOptions opts, TimeSpan maxAge, CancellationToken ct)
     {
-        var config = new AmazonS3Config
-        {
-            RegionEndpoint = RegionEndpoint.GetBySystemName(opts.S3Region ?? "us-east-1"),
-            ForcePathStyle = true,
-        };
-        if (!string.IsNullOrWhiteSpace(opts.S3Endpoint))
-            config.ServiceURL = opts.S3Endpoint;
-
-        using var s3 = new AmazonS3Client(
-            new BasicAWSCredentials(opts.S3AccessKey, opts.S3SecretKey),
-            config);
+        using var s3 = S3ClientFactory.Create(
+            opts.S3Region,
+            opts.S3Endpoint,
+            opts.S3ForcePathStyle);
 
         var cutoff = DateTime.UtcNow - maxAge;
         string? token = null;

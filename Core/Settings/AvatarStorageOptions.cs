@@ -34,9 +34,15 @@ public sealed class AvatarStorageOptions
     /// <summary>等待重编码闸门超时（毫秒）；0 表示一直等到有空位。</summary>
     public int ReencodeAcquireTimeoutMilliseconds { get; set; } = 5_000;
 
-    // S3 兼容（可选）
+    /// <summary>SSE-S3 或 SSE-KMS；Provider=S3 时必须启用。</summary>
+    public string S3SseMode { get; set; } = "SSE-S3";
+
+    /// <summary>Provider=S3 且 S3SseMode=SSE-KMS 时的 KMS key id/ARN。</summary>
+    public string? S3KmsKeyId { get; set; }
     public string? S3Bucket { get; set; }
     public string? S3Endpoint { get; set; }
+    public bool S3ForcePathStyle { get; set; }
+    // 旧字段保留用于兼容已有配置，但不再被实现读取。
     public string? S3AccessKey { get; set; }
     public string? S3SecretKey { get; set; }
     public string? S3Region { get; set; } = "us-east-1";

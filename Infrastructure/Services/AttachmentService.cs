@@ -114,6 +114,9 @@ public sealed class AttachmentService(
             DownloadPath = downloadPath,
             PublicUrl = string.Empty,
             ExpiresAt = expiresAt,
+            UploadHeaders = storage is IAttachmentUploadHeadersProvider headers
+                ? headers.GetRequiredUploadHeaders(request.ContentType)
+                : null,
         };
 #pragma warning restore CS0618
     }
@@ -187,6 +190,23 @@ public sealed class AttachmentService(
         catch (Exception ex)
         {
             logger.LogError(ex, "附件扫描入队失败 AttachmentId={Id}", attachmentId);
+            try
+            {
+                // The metadata row is already visible as Scanning. If the scan
+                // job could not be durably recorded, delete the object through
+                // the same tombstone path instead of leaving an unreachable blob.
+                await blobDeletes.EnqueueAsync(
+                        [(objectKey, attachmentId)], userId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception deleteEx)
+            {
+                logger.LogError(
+                    deleteEx,
+                    "扫描入队失败后附件删除任务入队失败 AttachmentId={Id} Key={Key}",
+                    attachmentId,
+                    objectKey);
+            }
             return (AuthOperationResult.Fail("ScanEnqueueFailed", "附件扫描入队失败"), null);
         }
 

@@ -35,6 +35,6 @@ public interface IAttachmentScanService
     /// <summary>
     /// 续租：仅当本实例仍持有该 LeaseToken 时延长 LeaseExpiresAt。处理大文件期间由 Worker 心跳调用。
     /// </summary>
-    Task RenewLeaseAsync(
+    Task<int> RenewLeaseAsync(
         long jobId, string leaseOwner, string leaseToken, CancellationToken cancellationToken = default);
 }

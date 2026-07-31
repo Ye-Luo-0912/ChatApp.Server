@@ -595,7 +595,10 @@ public sealed class RedisCacheStore : ICacheValueStore, IAtomicCacheStore, ICach
         using var activity = ActivitySource.StartActivity("Redis", ActivityKind.Client);
         activity?.SetTag("db.system", "redis");
         activity?.SetTag("db.operation.name", operation);
-        var started = Stopwatch.GetTimestamp();
+        // Redis duration 是可选诊断指标；没有 listener 时不读取高精度时钟，
+        // 也不在每次缓存操作的 finally 中构造/记录 measurement。
+        var recordDuration = OperationDuration.Enabled;
+        var started = recordDuration ? Stopwatch.GetTimestamp() : 0L;
         try
         {
             // 命令发出后等待 Redis 自身的 AsyncTimeout。对原子写入使用 WaitAsync
@@ -616,9 +619,12 @@ public sealed class RedisCacheStore : ICacheValueStore, IAtomicCacheStore, ICach
         }
         finally
         {
-            OperationDuration.Record(
-                Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-                new KeyValuePair<string, object?>("cache.operation", operation));
+            if (recordDuration)
+            {
+                OperationDuration.Record(
+                    Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                    new KeyValuePair<string, object?>("cache.operation", operation));
+            }
         }
     }
 

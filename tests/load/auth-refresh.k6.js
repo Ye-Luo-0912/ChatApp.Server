@@ -97,11 +97,13 @@ export const options = {
         },
 };
 
-function deviceHeaders(vu) {
-  return {
+function deviceHeaders(vu, deviceCredential = '') {
+  const headers = {
     'Content-Type': 'application/json',
-    'X-Device-Id': `k6-vu-${vu}-device-00123456`,
+    'X-Installation-Id': `k6-vu-${vu}-installation-00123456`,
   };
+  if (deviceCredential) headers['X-Device-Credential'] = deviceCredential;
+  return headers;
 }
 
 function pickUser(vu) {
@@ -122,6 +124,7 @@ export function setup() {
       shared: {
         accessToken: body.accessToken || body.AccessToken,
         refreshToken: body.refreshToken || body.RefreshToken,
+        deviceCredential: body.deviceCredential || body.DeviceCredential || '',
         userId: body.userId || body.UserId || u.userId,
       },
     };
@@ -152,7 +155,7 @@ export default function (data) {
         userId: data.shared.userId,
         refreshToken: data.shared.refreshToken,
       }),
-      { headers: deviceHeaders(1) }, // 同设备抢同一 RT
+      { headers: deviceHeaders(1, data.shared.deviceCredential) }, // 同设备抢同一 RT
     );
     refreshDuration.add(Date.now() - start);
     // 仅一次成功，其余失败是预期
@@ -166,6 +169,7 @@ export default function (data) {
 
   let accessToken;
   let refreshToken;
+  let deviceCredential = '';
   let userId = user.userId;
 
   group('login', () => {
@@ -182,6 +186,7 @@ export default function (data) {
       const body = res.json();
       accessToken = body.accessToken || body.AccessToken;
       refreshToken = body.refreshToken || body.RefreshToken;
+      deviceCredential = body.deviceCredential || body.DeviceCredential || '';
       userId = body.userId || body.UserId || userId;
     }
   });
@@ -223,15 +228,17 @@ export default function (data) {
     const res = http.post(
       `${BASE_URL}/api/auth/refresh-token`,
       JSON.stringify({ userId, refreshToken }),
-      { headers },
+      { headers: deviceHeaders(__VU, deviceCredential) },
     );
     refreshDuration.add(Date.now() - start);
     const ok = check(res, { 'refresh ok': (r) => r.status === 200 });
     errorRate.add(!ok);
     if (ok) {
       const body = res.json();
-      // 轮换后旧 RT 失效；下一轮迭代会重新 login
+      // 轮换后旧 RT/AT 失效；下一轮迭代会重新 login，但本轮后续请求必须使用新 AT。
       refreshToken = body.refreshToken || body.RefreshToken || refreshToken;
+      accessToken = body.accessToken || body.AccessToken || accessToken;
+      deviceCredential = body.deviceCredential || body.DeviceCredential || deviceCredential;
     }
   });
 

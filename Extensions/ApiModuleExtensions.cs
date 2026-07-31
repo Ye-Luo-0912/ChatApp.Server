@@ -24,9 +24,13 @@ public static class ApiModuleExtensions
     public static IServiceCollection AddApiPolicies(this IServiceCollection services, IConfiguration config)
     {
         // P0-6：单例分布式限流器 + 策略提供者（不再为每个分区键创建本地 RateLimiter 对象）。
-        services.Configure<RateLimitingOptions>(config.GetSection(RateLimitingOptions.SectionName));
+        services.AddOptions<RateLimitingOptions>()
+            .Bind(config.GetSection(RateLimitingOptions.SectionName))
+            .ValidateOnStart();
         services.AddSingleton<IDistributedRateLimiter, RedisDistributedRateLimiter>();
         services.AddSingleton<IRateLimitPolicyProvider, RateLimitPolicyProvider>();
+        services.AddSingleton<RateLimitDimensionKeyHasher>();
+        services.AddScoped<AccountRateLimitActionFilter>();
         services.AddSingleton<IValidateOptions<RateLimitingOptions>, RateLimitingOptionsValidator>();
 
         services.AddOptions<ForwardedHeadersSettings>()
@@ -66,12 +70,24 @@ public static class ApiModuleExtensions
                 sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("Garnet")
                       ?? throw new InvalidOperationException("缺少 ConnectionStrings:Garnet"),
                 name: "garnet",
-                tags: ["ready"])
+                tags: ["ready", "identity", "dependencies", "capabilities"])
             .AddNpgSql(
                 sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("DefaultConnection")
                       ?? throw new InvalidOperationException("缺少 ConnectionStrings:DefaultConnection"),
                 name: "postgres",
-                tags: ["ready"]);
+                tags: ["ready", "identity", "dependencies", "capabilities"])
+            .AddCheck<AttachmentStorageHealthCheck>(
+                "attachments",
+                tags: ["ready", "dependencies", "capabilities"])
+            .AddCheck<MessageEvidenceHealthCheck>(
+                "message-evidence",
+                tags: ["ready", "dependencies", "capabilities"])
+            .AddCheck<RealtimeOutboxHealthCheck>(
+                "realtime-outbox",
+                tags: ["ready", "dependencies", "capabilities"])
+            .AddCheck<DataExportHealthCheck>(
+                "data-export",
+                tags: ["ready", "dependencies", "capabilities"]);
 
         return services;
     }

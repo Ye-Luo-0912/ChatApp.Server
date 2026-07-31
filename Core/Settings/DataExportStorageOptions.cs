@@ -4,6 +4,9 @@ public sealed class DataExportStorageOptions
 {
     public const string SectionName = "DataExport";
 
+    /// <summary>Local | S3。生产多实例应使用 S3。</summary>
+    public string Provider { get; set; } = "Local";
+
     public string LocalRootPath { get; set; } = Path.Combine(Path.GetTempPath(), "chatapp-exports");
     public int JobTtlHours { get; set; } = 24;
     public int LeaseSeconds { get; set; } = 120;
@@ -28,7 +31,15 @@ public sealed class DataExportStorageOptions
     /// 生产切 S3 时：关闭本地信封加密（EncryptAtRest=false），改用桶级 SSE-S3 或 SSE-KMS；
     /// blob store 实现应流式 PutObject/GetObject，勿缓冲整对象。
     /// </summary>
-    public string? S3SseMode { get; set; }
+    public string S3SseMode { get; set; } = "SSE-S3";
+    public string? S3Bucket { get; set; }
+    public string? S3Endpoint { get; set; }
+    public bool S3ForcePathStyle { get; set; }
+    public string? S3Region { get; set; } = "us-east-1";
+    public string? S3KmsKeyId { get; set; }
+    // 旧配置字段保留兼容，但 S3 实现不读取静态 access key/secret。
+    public string? S3AccessKey { get; set; }
+    public string? S3SecretKey { get; set; }
 
     /// <summary>
     /// 可选：覆盖 MessageEvidence 的 Realtime Postgres 连接串，专供导出直读 messages。

@@ -32,8 +32,60 @@ public sealed class OpsController(IAttachmentOpsAdminService ops) : ControllerBa
     public Task<AttachmentOpsScanBacklogDto> AttachmentScanBacklog(CancellationToken cancellationToken)
         => ops.GetScanBacklogAsync(cancellationToken);
 
+    /// <summary>读取指定附件的逐次扫描引擎、版本、判定和原因审计。</summary>
+    [HttpGet("attachments/{attachmentId}/scan-audits")]
+    public Task<IReadOnlyList<AttachmentScanAuditDto>> AttachmentScanAudits(
+        string attachmentId,
+        [FromQuery] int limit = 50,
+        CancellationToken cancellationToken = default)
+        => ops.GetScanAuditsAsync(attachmentId, limit, cancellationToken);
+
     /// <summary>廉价提示：Active size 汇总、下载票 TTL、相关 metric 名（不做 Redis KEYS）。</summary>
     [HttpGet("attachment-hints")]
     public Task<AttachmentOpsHintsDto> AttachmentHints(CancellationToken cancellationToken)
         => ops.GetHintsAsync(cancellationToken);
+
+    [HttpPost("attachments/{attachmentId}/rescan")]
+    public async Task<IActionResult> Rescan(
+        string attachmentId,
+        [FromBody] AttachmentOpsActionRequest? request,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetAdminId(out var adminUserId))
+            return Unauthorized();
+        var ok = await ops.RescanAsync(
+            adminUserId, attachmentId, request?.Reason, cancellationToken);
+        return ok ? Accepted(new { AttachmentId = attachmentId, Status = "Scanning" }) : NotFound();
+    }
+
+    [HttpPost("attachments/{attachmentId}/delete")]
+    public async Task<IActionResult> Delete(
+        string attachmentId,
+        [FromBody] AttachmentOpsActionRequest? request,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetAdminId(out var adminUserId))
+            return Unauthorized();
+        var ok = await ops.DeleteAsync(
+            adminUserId, attachmentId, request?.Reason, cancellationToken);
+        return ok ? Accepted(new { AttachmentId = attachmentId, Status = "DeleteQueued" }) : NotFound();
+    }
+
+    [HttpPost("attachments/{attachmentId}/release")]
+    public async Task<IActionResult> Release(
+        string attachmentId,
+        [FromBody] AttachmentOpsActionRequest? request,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetAdminId(out var adminUserId))
+            return Unauthorized();
+        var ok = await ops.ReleaseAsync(
+            adminUserId, attachmentId, request?.Reason, cancellationToken);
+        return ok ? Ok(new { AttachmentId = attachmentId, Status = "Confirmed" }) : NotFound();
+    }
+
+    private bool TryGetAdminId(out long adminUserId)
+        => long.TryParse(
+            User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value,
+            out adminUserId);
 }
