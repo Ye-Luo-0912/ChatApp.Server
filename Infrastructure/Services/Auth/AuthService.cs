@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using Core.Caching;
 using Core.Exceptions;
 using Core.Interfaces;
@@ -381,10 +381,11 @@ public class AuthService(
         {
             var userIdString = account.ToString();
 
-            var isValid = await _tokenService.ValidateRefreshTokenAsync(userIdString, refreshToken, cancellationToken);
-            if (!isValid)
-                return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
-
+            // P0-3.2：移除冗余的 ValidateRefreshTokenAsync 调用。
+            // 旧实现先 GET 验证，再 CAS 消费同一 key——第一次验证不能替代后面的 CAS，
+            // 只增加一次 Redis 往返，且两次调用之间存在竞态（验证通过后可能被另一请求消费）。
+            // IssueRefreshTokensAsync 内部的 TryAtomicConsumeAsync 已原子地验证 + 轮换，
+            // 失败返回 null。先查用户状态再轮换，避免无效令牌触发 Redis 写。
             var user = await _db.Users.FindAsync([account], cancellationToken);
             if (user is null)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
@@ -503,19 +504,38 @@ public class AuthService(
 
         if (!isPasswordValid)
         {
-            user.AccessFailedCount++;
+            // P0-3.1：原子递增 AccessFailedCount。
+            // 旧实现 user.AccessFailedCount++ + SaveChanges 是 read-modify-write，
+            // 并发失败请求会读取相同旧值并互相覆盖（5 个并发失败可能只写成 1）。
+            // ExecuteUpdateAsync 生成 UPDATE "AspNetUsers" SET "AccessFailedCount" = "AccessFailedCount" + 1，
+            // 数据库层面原子，不会丢失增量。
+            await _db.Users
+                .Where(u => u.Id == user.Id)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(u => u.AccessFailedCount, u => u.AccessFailedCount + 1),
+                    cancellationToken);
 
-            if (user.LockoutEnabled && user.AccessFailedCount >= MaxFailedAccessAttempts)
+            // 读取递增后的值用于锁定判定。投影查询绕过 identity map，直接读 DB。
+            // 即使并发递增，读到的值 >= 本次增量（单调），锁定判定安全。
+            var failedState = await _db.Users
+                .Where(u => u.Id == user.Id)
+                .Select(u => new { u.AccessFailedCount, u.LockoutEnabled })
+                .FirstAsync(cancellationToken);
+
+            if (failedState.LockoutEnabled && failedState.AccessFailedCount >= MaxFailedAccessAttempts)
             {
-                user.LockoutEnd = DateTimeOffset.UtcNow.Add(LockoutDuration);
+                var lockoutEnd = DateTimeOffset.UtcNow.Add(LockoutDuration);
+                await _db.Users
+                    .Where(u => u.Id == user.Id)
+                    .ExecuteUpdateAsync(
+                        s => s.SetProperty(u => u.LockoutEnd, lockoutEnd),
+                        cancellationToken);
                 _logger.LogWarning("登录失败：连续错误已达上限，账号已锁定。UserId={UserId}", user.Id);
-                await _db.SaveChangesAsync(cancellationToken);
                 return (LoginCheckStatus.LockedOut, null);
             }
 
-            await _db.SaveChangesAsync(cancellationToken);
             _logger.LogWarning("登录失败：密码错误。UserId={UserId}, FailedCount={Count}",
-                user.Id, user.AccessFailedCount);
+                user.Id, failedState.AccessFailedCount);
             return (LoginCheckStatus.InvalidCredentials, null);
         }
 

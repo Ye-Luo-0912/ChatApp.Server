@@ -16,6 +16,7 @@ public sealed class NotificationOutboxItemConfig : IEntityTypeConfiguration<Noti
         builder.Property(x => x.IdempotencyKey).HasMaxLength(128);
         builder.Property(x => x.LastError).HasMaxLength(1000);
         builder.Property(x => x.LockOwner).HasMaxLength(64);
+        builder.Property(x => x.LeaseToken).HasMaxLength(64);
         builder.Property(x => x.Status).HasConversion<byte>();
 
         builder.HasIndex(x => new { x.Status, x.NextAttemptAt })

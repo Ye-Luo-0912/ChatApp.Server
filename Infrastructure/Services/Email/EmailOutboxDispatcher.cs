@@ -44,6 +44,7 @@ public sealed class EmailOutboxDispatcher(
                 .SetProperty(x => x.NextAttemptAt, DateTime.UtcNow)
                 .SetProperty(x => x.LockedAt, (DateTime?)null)
                 .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
                 .SetProperty(x => x.LastError, "Processing lease expired")
                 .SetProperty(x => x.UpdatedAt, DateTime.UtcNow), cancellationToken)
             .ConfigureAwait(false);
@@ -71,6 +72,8 @@ public sealed class EmailOutboxDispatcher(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
         var now = DateTime.UtcNow;
+        // P0-4：每次领取生成唯一 LeaseToken 作为 fencing token。
+        var leaseToken = Guid.NewGuid().ToString("N");
 
         List<long> dueIds;
         await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
@@ -81,6 +84,7 @@ public sealed class EmailOutboxDispatcher(
                     SET "Status" = {(int)EmailOutboxStatus.Processing},
                         "LockedAt" = {now},
                         "LockOwner" = {_ownerId},
+                        "LeaseToken" = {leaseToken},
                         "UpdatedAt" = {now}
                     WHERE o."Id" IN (
                         SELECT i."Id" FROM "T_EmailOutbox" AS i
@@ -125,19 +129,22 @@ public sealed class EmailOutboxDispatcher(
 
             if (sendResult.IsSuccess)
             {
-                await db.EmailOutbox
+                var sent = await db.EmailOutbox
                     .Where(x => x.Id == item.Id
                         && x.Status == EmailOutboxStatus.Processing
                         && x.LockOwner == _ownerId
-                        && x.LockedAt == item.LockedAt)
+                        && x.LeaseToken == item.LeaseToken)
                     .ExecuteUpdateAsync(setters => setters
                         .SetProperty(x => x.Status, EmailOutboxStatus.Sent)
                         .SetProperty(x => x.LockedAt, (DateTime?)null)
                         .SetProperty(x => x.LockOwner, (string?)null)
+                        .SetProperty(x => x.LeaseToken, (string?)null)
                         .SetProperty(x => x.UpdatedAt, now), cancellationToken)
                     .ConfigureAwait(false);
 
-                metrics.RecordSent();
+                // P0-4：检查更新行数，租约失效时不记录 sent。
+                if (sent == 1)
+                    metrics.RecordSent();
                 return;
             }
 
@@ -146,7 +153,7 @@ public sealed class EmailOutboxDispatcher(
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await ReleaseLeaseWithoutFailureAsync(item.Id, CancellationToken.None).ConfigureAwait(false);
+            await ReleaseLeaseWithoutFailureAsync(item.Id, item.LeaseToken, CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
@@ -182,12 +189,13 @@ public sealed class EmailOutboxDispatcher(
                 .SetProperty(x => x.NextAttemptAt, now)
                 .SetProperty(x => x.LockedAt, (DateTime?)null)
                 .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
                 .SetProperty(x => x.UpdatedAt, now)
                 .SetProperty(x => x.LastError, (string?)null), cancellationToken)
             .ConfigureAwait(false);
     }
 
-    private async Task ReleaseLeaseWithoutFailureAsync(long id, CancellationToken cancellationToken)
+    private async Task ReleaseLeaseWithoutFailureAsync(long id, string? leaseToken, CancellationToken cancellationToken)
     {
         try
         {
@@ -196,12 +204,13 @@ public sealed class EmailOutboxDispatcher(
             var now = DateTime.UtcNow;
 
             await db.EmailOutbox
-                .Where(x => x.Id == id && x.Status == EmailOutboxStatus.Processing && x.LockOwner == _ownerId)
+                .Where(x => x.Id == id && x.Status == EmailOutboxStatus.Processing && x.LockOwner == _ownerId && x.LeaseToken == leaseToken)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.Status, EmailOutboxStatus.Pending)
                     .SetProperty(x => x.NextAttemptAt, now)
                     .SetProperty(x => x.LockedAt, (DateTime?)null)
                     .SetProperty(x => x.LockOwner, (string?)null)
+                    .SetProperty(x => x.LeaseToken, (string?)null)
                     .SetProperty(x => x.UpdatedAt, now), cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -223,31 +232,32 @@ public sealed class EmailOutboxDispatcher(
 
         if (attemptCount >= _maxAttempts)
         {
-            await db.EmailOutbox
+            var dead = await db.EmailOutbox
                 .Where(x => x.Id == item.Id
                     && x.Status == EmailOutboxStatus.Processing
                     && x.LockOwner == _ownerId
-                    && x.LockedAt == item.LockedAt)
+                    && x.LeaseToken == item.LeaseToken)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.Status, EmailOutboxStatus.Dead)
                     .SetProperty(x => x.AttemptCount, attemptCount)
                     .SetProperty(x => x.LastError, truncatedError)
                     .SetProperty(x => x.LockedAt, (DateTime?)null)
                     .SetProperty(x => x.LockOwner, (string?)null)
+                    .SetProperty(x => x.LeaseToken, (string?)null)
                     .SetProperty(x => x.UpdatedAt, now), cancellationToken)
                 .ConfigureAwait(false);
 
-            metrics.RecordDead();
+            if (dead == 1) metrics.RecordDead();
             return;
         }
 
         var nextAttemptAt = now.Add(CalculateBackoff(attemptCount));
 
-        await db.EmailOutbox
+        var failed = await db.EmailOutbox
             .Where(x => x.Id == item.Id
                 && x.Status == EmailOutboxStatus.Processing
                 && x.LockOwner == _ownerId
-                && x.LockedAt == item.LockedAt)
+                && x.LeaseToken == item.LeaseToken)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, EmailOutboxStatus.Failed)
                 .SetProperty(x => x.AttemptCount, attemptCount)
@@ -255,10 +265,11 @@ public sealed class EmailOutboxDispatcher(
                 .SetProperty(x => x.NextAttemptAt, nextAttemptAt)
                 .SetProperty(x => x.LockedAt, (DateTime?)null)
                 .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
 
-        metrics.RecordFailed();
+        if (failed == 1) metrics.RecordFailed();
     }
 
     private static TimeSpan CalculateBackoff(int attemptCount)

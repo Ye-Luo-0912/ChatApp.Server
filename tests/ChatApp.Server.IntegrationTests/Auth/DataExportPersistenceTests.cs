@@ -6,6 +6,7 @@ using Core.Models.Export;
 using Core.Models.Identity;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Infrastructure.Services;
 using Infrastructure.Services.Auth;
 using Infrastructure.Services.Utilities;
@@ -52,7 +53,12 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         Assert.True(await db.DataExportJobs.AnyAsync(j => j.Id == jobId && j.Status == DataExportJobStatus.Pending));
 
         var factory = new ExportTestScopeFactory(postgres, CreateTokenSessions(), blob, opts);
-        var worker = new DataExportWorker(factory, opts, NullLogger<DataExportWorker>.Instance);
+        var worker = new DataExportWorker(
+            factory,
+            opts,
+            Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4, DataExport = 2 }),
+            new WorkerConcurrencyManager(Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4 })),
+            NullLogger<DataExportWorker>.Instance);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         await worker.StartAsync(cts.Token);
 
@@ -231,7 +237,12 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         await db.SaveChangesAsync();
 
         var factory = new ExportTestScopeFactory(postgres, CreateTokenSessions(), blob, opts);
-        var worker = new DataExportWorker(factory, opts, NullLogger<DataExportWorker>.Instance);
+        var worker = new DataExportWorker(
+            factory,
+            opts,
+            Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4, DataExport = 2 }),
+            new WorkerConcurrencyManager(Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4 })),
+            NullLogger<DataExportWorker>.Instance);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         await worker.StartAsync(cts.Token);
 

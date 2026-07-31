@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Ephemeral;
 using Core.Interfaces;
+using Core.Models.Friend;
 using Core.Settings;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -69,32 +70,28 @@ public sealed class PresenceAuthorizeWorker(
         var allowed = new List<long>(targets.Length);
         List<long>? needMembership = null;
 
+        IReadOnlyDictionary<long, FriendshipStatusInfo> relationships;
+        try
+        {
+            relationships = await friendship
+                .CheckRelationshipsAsync(query.WatcherUserId, targets, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "批量关系查询失败，全部降级到成员检查");
+            relationships = new Dictionary<long, FriendshipStatusInfo>();
+        }
+
         foreach (var targetId in targets)
         {
             if (targetId == query.WatcherUserId)
                 continue;
 
-            try
-            {
-                var status = await friendship
-                    .CheckRelationshipAsync(query.WatcherUserId, targetId, ct)
-                    .ConfigureAwait(false);
-                if (status.IsMutual)
-                {
-                    allowed.Add(targetId);
-                    continue;
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug(
-                    ex,
-                    "Presence 好友校验失败 Watcher={Watcher} Target={Target}",
-                    query.WatcherUserId,
-                    targetId);
-            }
-
-            (needMembership ??= []).Add(targetId);
+            if (relationships.TryGetValue(targetId, out var status) && status.IsMutual)
+                allowed.Add(targetId);
+            else
+                (needMembership ??= []).Add(targetId);
         }
 
         if (needMembership is { Count: > 0 })

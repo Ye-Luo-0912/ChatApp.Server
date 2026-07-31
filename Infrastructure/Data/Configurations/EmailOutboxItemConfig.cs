@@ -36,6 +36,9 @@ public sealed class EmailOutboxItemConfig : IEntityTypeConfiguration<EmailOutbox
         builder.Property(x => x.LockOwner)
             .HasMaxLength(128);
 
+        builder.Property(x => x.LeaseToken)
+            .HasMaxLength(64);
+
         builder.HasIndex(x => new { x.Status, x.NextAttemptAt })
             .HasDatabaseName("IX_EmailOutbox_Status_NextAttemptAt");
 

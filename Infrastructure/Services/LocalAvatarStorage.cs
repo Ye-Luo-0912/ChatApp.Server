@@ -24,7 +24,7 @@ public sealed class LocalAvatarStorage(
     private const int MaxPixels = 2048;
     private const int OutputSize = 512;
 
-    public sealed record AvatarTicketInfo(long UserId, string ObjectKey, string ContentType, long ContentLength);
+    public sealed record AvatarTicketInfo(long UserId, string ObjectKey, string ContentType, long ContentLength, long ExpiresAtUnixMs);
 
     public long MaxBytes => _options.MaxBytes;
 
@@ -48,7 +48,7 @@ public sealed class LocalAvatarStorage(
 
         await cache.SetAsync(
             TicketKey(ticket),
-            new AvatarTicketInfo(userId, objectKey, contentType, contentLength),
+            new AvatarTicketInfo(userId, objectKey, contentType, contentLength, expires.ToUnixTimeMilliseconds()),
             ttl,
             cancellationToken).ConfigureAwait(false);
 
@@ -164,12 +164,21 @@ public sealed class LocalAvatarStorage(
     private async Task RestoreTicketAsync(
         string ticketKey, AvatarTicketInfo info, CancellationToken cancellationToken)
     {
+        // P0 正确性：恢复时使用原始绝对截止时间的剩余 TTL，不重置为完整 TicketMinutes。
+        // 多次失败恢复不会延长票据寿命超过原始截止时间；已过期则不再恢复。
+        var remaining = DateTimeOffset.FromUnixTimeMilliseconds(info.ExpiresAtUnixMs) - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            logger.LogWarning("头像上传票已过期，不再恢复，ExpiresAtUnixMs={ExpiresAtUnixMs}", info.ExpiresAtUnixMs);
+            return;
+        }
+
         try
         {
             await cache.SetAsync(
                     ticketKey,
                     info,
-                    TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                    remaining,
                     cancellationToken)
                 .ConfigureAwait(false);
         }

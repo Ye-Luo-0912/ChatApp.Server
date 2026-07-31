@@ -32,6 +32,11 @@ public interface ICacheValueStore
 
     Task RemoveAsync(string key, CancellationToken cancellationToken = default);
 
+    /// <summary>批量删除多个键，单次往返。空列表直接返回。</summary>
+    Task RemoveManyAsync(
+        IReadOnlyList<string> keys,
+        CancellationToken cancellationToken = default);
+
     bool IsHealthy { get; }
 }
 
@@ -82,6 +87,16 @@ public interface IAtomicCacheStore
         string consumeKey,
         Func<T, AtomicConsumePlan<TResult>?> createPlan,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 执行复合原子 Lua 脚本，返回 long 数组。
+    /// 仅用于无法用现有原语表达的复合原子操作（如验证码校验）。
+    /// </summary>
+    Task<long[]> EvaluateScriptAsync(
+        string script,
+        IReadOnlyList<string> keys,
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>Redis SET 索引操作。</summary>
@@ -100,5 +115,11 @@ public interface ICacheSetStore
 
     Task<IReadOnlyList<string>> SetMembersAsync(
         string key,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>从 SET 中批量移除多个成员，单次往返。</summary>
+    Task SetRemoveManyAsync(
+        string key,
+        IReadOnlyList<string> members,
         CancellationToken cancellationToken = default);
 }

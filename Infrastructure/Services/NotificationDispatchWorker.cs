@@ -33,6 +33,7 @@ public sealed class NotificationOutboxDispatcher(
                 s => s.SetProperty(x => x.Status, NotificationOutboxStatus.Failed)
                     .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
                     .SetProperty(x => x.LockOwner, (string?)null)
+                    .SetProperty(x => x.LeaseToken, (string?)null)
                     .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow)
                     .SetProperty(x => x.NextAttemptAt, DateTimeOffset.UtcNow),
                 cancellationToken);
@@ -62,6 +63,8 @@ public sealed class NotificationOutboxDispatcher(
         int batchSize, CancellationToken cancellationToken)
     {
         var now = DateTimeOffset.UtcNow;
+        // P0-4：每次领取生成唯一 LeaseToken 作为 fencing token，替代 LockedAt 精度匹配。
+        var leaseToken = Guid.NewGuid().ToString("N");
         List<long> ids;
         await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken))
         {
@@ -71,6 +74,7 @@ public sealed class NotificationOutboxDispatcher(
                     SET "Status" = {(int)NotificationOutboxStatus.Processing},
                         "LockedAt" = {now},
                         "LockOwner" = {InstanceId},
+                        "LeaseToken" = {leaseToken},
                         "UpdatedAt" = {now}
                     WHERE o."Id" IN (
                         SELECT i."Id" FROM "T_NotificationOutbox" AS i
@@ -88,7 +92,7 @@ public sealed class NotificationOutboxDispatcher(
 
         if (ids.Count == 0) return [];
         metrics.RecordClaimed(ids.Count);
-        return await db.NotificationOutbox.Where(x => ids.Contains(x.Id)).ToListAsync(cancellationToken);
+        return await db.NotificationOutbox.AsNoTracking().Where(x => ids.Contains(x.Id)).ToListAsync(cancellationToken);
     }
 
     /// <summary>批量写入站内通知，减少逐条 SaveChanges。</summary>
@@ -106,7 +110,8 @@ public sealed class NotificationOutboxDispatcher(
             .Where(x => ids.Contains(x.Id)
                 && x.InAppDeliveredAt == null
                 && x.Status == NotificationOutboxStatus.Processing
-                && x.LockOwner == InstanceId)
+                && x.LockOwner == InstanceId
+                && x.LeaseToken == pending[0].LeaseToken)
             .ExecuteUpdateAsync(
                 s => s.SetProperty(x => x.InAppDeliveredAt, now)
                     .SetProperty(x => x.UpdatedAt, now),
@@ -133,7 +138,7 @@ public sealed class NotificationOutboxDispatcher(
                         && x.InAppDeliveredAt == null
                         && x.Status == NotificationOutboxStatus.Processing
                         && x.LockOwner == InstanceId
-                        && x.LockedAt == item.LockedAt)
+                        && x.LeaseToken == item.LeaseToken)
                     .ExecuteUpdateAsync(
                         s => s.SetProperty(x => x.InAppDeliveredAt, deliveredAt)
                             .SetProperty(x => x.UpdatedAt, deliveredAt),
@@ -145,17 +150,20 @@ public sealed class NotificationOutboxDispatcher(
             if (item.PreferEmail && item.EmailDeliveredAt is null)
             {
                 var renewedAt = DateTimeOffset.UtcNow;
+                var renewedToken = Guid.NewGuid().ToString("N");
                 var renewed = await db.NotificationOutbox
                     .Where(x => x.Id == item.Id
                         && x.Status == NotificationOutboxStatus.Processing
                         && x.LockOwner == InstanceId
-                        && x.LockedAt == item.LockedAt)
+                        && x.LeaseToken == item.LeaseToken)
                     .ExecuteUpdateAsync(
                         s => s.SetProperty(x => x.LockedAt, renewedAt)
+                            .SetProperty(x => x.LeaseToken, renewedToken)
                             .SetProperty(x => x.UpdatedAt, renewedAt),
                         cancellationToken);
                 if (renewed == 0) return;
                 item.LockedAt = renewedAt;
+                item.LeaseToken = renewedToken;
 
                 var user = await db.Users.AsNoTracking()
                     .FirstOrDefaultAsync(u => u.Id == item.UserId, cancellationToken);
@@ -179,7 +187,7 @@ public sealed class NotificationOutboxDispatcher(
                         && x.EmailDeliveredAt == null
                         && x.Status == NotificationOutboxStatus.Processing
                         && x.LockOwner == InstanceId
-                        && x.LockedAt == item.LockedAt)
+                        && x.LeaseToken == item.LeaseToken)
                     .ExecuteUpdateAsync(
                         s => s.SetProperty(x => x.EmailDeliveredAt, deliveredAt)
                             .SetProperty(x => x.UpdatedAt, deliveredAt),
@@ -192,11 +200,12 @@ public sealed class NotificationOutboxDispatcher(
                 .Where(x => x.Id == item.Id
                     && x.Status == NotificationOutboxStatus.Processing
                     && x.LockOwner == InstanceId
-                    && x.LockedAt == item.LockedAt)
+                    && x.LeaseToken == item.LeaseToken)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(x => x.Status, NotificationOutboxStatus.Sent)
                         .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
                         .SetProperty(x => x.LockOwner, (string?)null)
+                        .SetProperty(x => x.LeaseToken, (string?)null)
                         .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow)
                         .SetProperty(x => x.LastError, (string?)null),
                     cancellationToken);
@@ -218,13 +227,14 @@ public sealed class NotificationOutboxDispatcher(
                 .Where(x => x.Id == item.Id
                     && x.Status == NotificationOutboxStatus.Processing
                     && x.LockOwner == InstanceId
-                    && x.LockedAt == item.LockedAt)
+                    && x.LeaseToken == item.LeaseToken)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(x => x.Status, dead ? NotificationOutboxStatus.Dead : NotificationOutboxStatus.Failed)
                         .SetProperty(x => x.AttemptCount, attempts)
                         .SetProperty(x => x.LastError, ex.Message.Length > 1000 ? ex.Message[..1000] : ex.Message)
                         .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
                         .SetProperty(x => x.LockOwner, (string?)null)
+                        .SetProperty(x => x.LeaseToken, (string?)null)
                         .SetProperty(x => x.NextAttemptAt, DateTimeOffset.UtcNow.Add(delay))
                         .SetProperty(x => x.UpdatedAt, DateTimeOffset.UtcNow),
                     cancellationToken);
@@ -274,11 +284,12 @@ public sealed class NotificationOutboxDispatcher(
             .Where(x => x.Id == item.Id
                 && x.Status == NotificationOutboxStatus.Processing
                 && x.LockOwner == InstanceId
-                && x.LockedAt == item.LockedAt)
+                && x.LeaseToken == item.LeaseToken)
             .ExecuteUpdateAsync(
                 s => s.SetProperty(x => x.Status, NotificationOutboxStatus.Failed)
                     .SetProperty(x => x.LockedAt, (DateTimeOffset?)null)
                     .SetProperty(x => x.LockOwner, (string?)null)
+                        .SetProperty(x => x.LeaseToken, (string?)null)
                     .SetProperty(x => x.NextAttemptAt, now)
                     .SetProperty(x => x.UpdatedAt, now),
                 cancellationToken);

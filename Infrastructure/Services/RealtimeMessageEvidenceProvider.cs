@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using Microsoft.Extensions.Caching.Memory;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Security.Cryptography;
@@ -26,7 +26,11 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
     private readonly MessageEvidenceOptions _options;
     private readonly IRealtimeMessageBus? _bus;
     private readonly ILogger<RealtimeMessageEvidenceProvider> _logger;
-    private readonly ConcurrentDictionary<string, (MessageEvidenceSnapshot Snapshot, long ExpireUnix)> _cache = new();
+    private readonly MemoryCache _cache = new(new MemoryCacheOptions
+    {
+        SizeLimit = 4096,
+        CompactionPercentage = 0.25,
+    });
 
     private int _consecutiveFailures;
     private long _circuitOpenUntilUnix;
@@ -55,10 +59,10 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
 
         var key = messageId.Trim();
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        if (_cache.TryGetValue(key, out var cached) && cached.ExpireUnix > now)
+        if (_cache.TryGetValue<MessageEvidenceSnapshot>(key, out var cached))
         {
             _hits.Add(1);
-            return cached.Snapshot;
+            return cached;
         }
 
         if (Volatile.Read(ref _circuitOpenUntilUnix) > now)
@@ -86,7 +90,11 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
             {
                 _hits.Add(1);
                 var ttl = Math.Max(1, _options.CacheSeconds);
-                _cache[key] = (snapshot, now + ttl);
+                _cache.Set(key, snapshot, new MemoryCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(ttl),
+                    Size = 1,
+                });
             }
 
             Interlocked.Exchange(ref _consecutiveFailures, 0);

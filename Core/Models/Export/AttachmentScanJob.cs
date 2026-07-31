@@ -34,4 +34,11 @@ public sealed class AttachmentScanJob
 
     /// <summary>租约过期后可被其他实例重新领取（崩溃恢复）。</summary>
     public DateTimeOffset? LeaseExpiresAt { get; set; }
+
+    /// <summary>
+    /// 租约 fencing token：每次领取时生成的随机 GUID，用于替代 LeaseExpiresAt 精度匹配。
+    /// <para>P0-5.2：完成/失败/续租操作必须匹配 Id + Status + LeaseOwner + LeaseToken，
+    /// 防止租约过期后被另一实例重新领取后，旧持有者仍覆盖终态造成重复扫描/重复 Confirm。</para>
+    /// </summary>
+    public string? LeaseToken { get; set; }
 }

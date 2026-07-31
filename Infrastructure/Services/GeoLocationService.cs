@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
-using Core.Exceptions;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Microsoft.Extensions.Logging;
@@ -12,7 +11,7 @@ public class GeoLocationService : IGeoLocationService
 {
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GeoLocationService> _logger;
-    private readonly ICacheValueStore _cache;
+    private readonly IDerivedCache _cache;
 
     private const string HttpClientName = nameof(GeoLocationService);
     private const string CacheKeyPrefix = "geo:ip:";
@@ -20,7 +19,7 @@ public class GeoLocationService : IGeoLocationService
     private static readonly TimeSpan UnknownCacheTtl = TimeSpan.FromHours(1);
     private const int MaxRetries = 3;
 
-    public GeoLocationService(IHttpClientFactory httpClientFactory, ILogger<GeoLocationService> logger, ICacheValueStore cache)
+    public GeoLocationService(IHttpClientFactory httpClientFactory, ILogger<GeoLocationService> logger, IDerivedCache cache)
     {
         _httpClientFactory = httpClientFactory;
         _logger = logger;
@@ -35,34 +34,19 @@ public class GeoLocationService : IGeoLocationService
             return "未知";
         }
 
-        // 优先读缓存，避免重复调用外部 API
+        // 优先读缓存，避免重复调用外部 API（IDerivedCache 内置 fail-open，连接失败视为未命中）
         var cacheKey = CacheKeyPrefix + clientIp;
-        try
-        {
-            var cached = await _cache.StringGetAsync(cacheKey, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
-            if (cached is not null)
-                return cached;
-        }
-        catch (CacheUnavailableException ex)
-        {
-            _logger.LogWarning(ex, "Cache unavailable, falling through to API for IP: {IP}", clientIp);
-        }
+        var cached = await _cache.TryGetAsync<string>(cacheKey, cancellationToken).ConfigureAwait(false);
+        if (cached.Found && cached.Value is not null)
+            return cached.Value;
 
         var result = await FetchWithRetryAsync(clientIp, cancellationToken).ConfigureAwait(false);
 
         // 网络异常时 result 为 null，不缓存，留待下次重试
         if (result is not null)
         {
-            try
-            {
-                var ttl = result == "未知" ? UnknownCacheTtl : SuccessCacheTtl;
-                await _cache.StringSetAsync(cacheKey, result, ttl, cancellationToken).ConfigureAwait(false);
-            }
-            catch (CacheUnavailableException ex)
-            {
-                _logger.LogWarning(ex, "Failed to cache geolocation result for IP: {IP}", clientIp);
-            }
+            var ttl = result == "未知" ? UnknownCacheTtl : SuccessCacheTtl;
+            await _cache.SetAsync(cacheKey, result, ttl, cancellationToken).ConfigureAwait(false);
         }
 
         return result ?? "未知";

@@ -1,5 +1,7 @@
 using Core.Interfaces;
+using Core.Models.Export;
 using Core.Settings;
+using Infrastructure.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -7,25 +9,60 @@ using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
-/// <summary>处理附件内容扫描作业（瞬时失败退避重试）。</summary>
+/// <summary>
+/// 附件内容扫描 Worker。
+/// <para>P0-5.2：使用 <see cref="WorkerConcurrencyManager"/> 全局+专属并发预算；</para>
+/// <para>只领取当前可并发处理的作业数量，每个作业在独立作用域中处理并配心跳续租；</para>
+/// <para>终态更新由 <see cref="IAttachmentScanService.ProcessClaimedJobAsync"/> 通过 LeaseToken fencing 落库。</para>
+/// </summary>
 public sealed class AttachmentScanWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<AttachmentStorageOptions> options,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
+    WorkerConcurrencyManager concurrencyManager,
     ILogger<AttachmentScanWorker> logger) : BackgroundService
 {
+    private const string WorkerName = "attachment_scan";
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken).ConfigureAwait(false);
+
+        var workerConcurrency = Math.Max(1, workerConcurrencyOptions.Value.AttachmentScan);
+        var poll = TimeSpan.FromSeconds(Math.Clamp(options.Value.ScanBackoffSeconds, 5, 60));
+        var inFlight = new List<Task>();
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
+                // 只领取当前真正拥有执行槽的任务数量，避免一次领大批量后串行处理导致后续作业租约过期。
+                // inFlight 已完成的清理后再计算可用槽位。
+                inFlight.RemoveAll(static t => t.IsCompleted);
+                var available = Math.Max(0, workerConcurrency - inFlight.Count);
+                if (available == 0)
+                {
+                    await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+
                 await using var scope = scopeFactory.CreateAsyncScope();
                 var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
-                var completed = await svc.ProcessDueAsync(stoppingToken).ConfigureAwait(false);
-                if (completed > 0)
-                    logger.LogInformation("附件扫描完成 {Count} 个作业", completed);
+                var claimed = await svc.ClaimDueJobsAsync(available, stoppingToken).ConfigureAwait(false);
+                if (claimed.Count == 0)
+                {
+                    await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                foreach (var job in claimed)
+                {
+                    var concurrencyScope = await concurrencyManager.AcquireAsync(
+                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
+                    inFlight.Add(ProcessOneAsync(job, concurrencyScope, stoppingToken));
+                }
+
+                inFlight.RemoveAll(static t => t.IsCompleted);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -33,11 +70,89 @@ public sealed class AttachmentScanWorker(
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "附件扫描 Worker 失败");
+                logger.LogWarning(ex, "附件扫描 Worker 轮询异常");
+                await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
             }
+        }
 
-            var delaySeconds = Math.Clamp(options.Value.ScanBackoffSeconds, 5, 60);
-            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(inFlight).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "附件扫描 Worker 关闭时等待在途任务失败");
+        }
+    }
+
+    /// <summary>
+    /// 单个作业处理：独立作用域 + 独立 DbContext，长扫描期间周期性续租。
+    /// 终态由 Service 的 ApplyFencedUpdateAsync 以 LeaseToken 匹配落库；租约已易主时返回 false。
+    /// </summary>
+    private async Task ProcessOneAsync(
+        AttachmentScanJob claimed, IAsyncDisposable concurrencyScope, CancellationToken cancellationToken)
+    {
+        // 心跳续租：lease/3 周期续租，租约丢失时仅记录，不强制中断（终态 fenced 更新会自然失败）。
+        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeatInterval = TimeSpan.FromMinutes(Math.Max(1, AttachmentScanService.LeaseMinutes / 3.0));
+        var heartbeat = Task.Run(async () =>
+        {
+            while (!heartbeatCts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(heartbeatInterval, heartbeatCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (heartbeatCts.Token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                try
+                {
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+                    await svc.RenewLeaseAsync(
+                            claimed.Id, claimed.LeaseOwner!, claimed.LeaseToken!, heartbeatCts.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(
+                        ex,
+                        "附件扫描心跳续租失败 JobId={Id}（可能已被重新领取）",
+                        claimed.Id);
+                }
+            }
+        }, CancellationToken.None);
+
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+            var terminal = await svc.ProcessClaimedJobAsync(claimed, cancellationToken).ConfigureAwait(false);
+            if (terminal)
+                logger.LogInformation("附件扫描完成 JobId={Id} AttachmentId={Aid}", claimed.Id, claimed.AttachmentId);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 进程关闭：保持 Processing，租约过期后会被重新领取。
+        }
+        catch (Exception ex)
+        {
+            // Service 内部已对扫描异常做 fenced 重试；此处异常通常是基础设施问题，记录即可。
+            logger.LogWarning(ex, "附件扫描处理异常 JobId={Id}", claimed.Id);
+        }
+        finally
+        {
+            heartbeatCts.Cancel();
+            try { await heartbeat.ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* expected */ }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "附件扫描心跳任务异常退出 JobId={Id}", claimed.Id);
+            }
+            await concurrencyScope.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

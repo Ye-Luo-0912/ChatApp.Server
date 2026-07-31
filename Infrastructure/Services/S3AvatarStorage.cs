@@ -78,7 +78,7 @@ public sealed class S3AvatarStorage : IAvatarStorage, IDisposable
 
         await _cache.SetAsync(
             $"avatar:ticket:{ticket}",
-            new LocalAvatarStorage.AvatarTicketInfo(userId, objectKey, contentType, contentLength),
+            new LocalAvatarStorage.AvatarTicketInfo(userId, objectKey, contentType, contentLength, expires.ToUnixTimeMilliseconds()),
             expires - DateTimeOffset.UtcNow,
             cancellationToken).ConfigureAwait(false);
 

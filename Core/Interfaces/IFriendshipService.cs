@@ -93,6 +93,15 @@ public interface IFriendshipService
     Task<FriendshipStatusInfo> CheckRelationshipAsync(long userId1, long userId2,CancellationToken ct = default);
 
     /// <summary>
+    /// 批量检查 watcher 与多个 target 的关系状态。
+    /// 使用 MGET + 批量 SQL，替代逐个查询的 N+1 模式。
+    /// </summary>
+    Task<IReadOnlyDictionary<long, FriendshipStatusInfo>> CheckRelationshipsAsync(
+        long watcherUserId,
+        IReadOnlyList<long> targetUserIds,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 更新好友备注
     /// </summary>
     /// <param name="userId">用户ID</param>

@@ -210,16 +210,23 @@ jobs:
             --out json=steady-15m.json \
             tests/load/mixed-workload.k6.js
 
-      - name: Refresh baseline
+      - name: Refresh baseline (summary JSON only)
         working-directory: ChatApp.Server
         run: |
           mkdir -p tests/load/baselines
-          cp tests/load/steady-15m.json tests/load/baselines/baseline-steady-rate20.json
+          # 不再提交原始 k6 事件流（数 MB，每日变化，污染 git 历史）。
+          # 仅保存压缩 summary JSON（几 KB，含 p50/p95/p99/avg/sum/count）。
+          # 原始事件流由下方 Upload all runs 步骤作为 artifact 保留 90 天。
+          node tests/load/extract-summary.mjs \
+            --input tests/load/steady-15m.json \
+            --output tests/load/baselines/baseline-steady-rate20.json \
+            --runner ubuntu-latest \
+            --runtime "steady 15m RATE=20"
           git add tests/load/baselines/baseline-steady-rate20.json
           if git diff --cached --quiet; then
             echo "基线无变化"
           else
-            git commit -m "perf: refresh steady baseline (nightly $(date -u +%Y-%m-%d))"
+            git commit -m "perf: refresh steady baseline summary (nightly $(date -u +%Y-%m-%d))"
             # schedule 触发时处于 detached HEAD，显式推到 master
             git push origin "HEAD:master"
             echo "基线已推送"
@@ -424,4 +431,4 @@ jobs:
             fi
           done
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "基线已更新至 \`tests/load/baselines/baseline-steady-rate20.json\`（若稳态通过）。" >> "$GITHUB_STEP_SUMMARY"
+          echo "基线已更新至 \`tests/load/baselines/baseline-steady-rate20.json\`（summary JSON，若稳态通过）。原始事件流见 artifact。" >> "$GITHUB_STEP_SUMMARY"

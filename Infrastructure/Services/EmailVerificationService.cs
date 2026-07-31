@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models;
@@ -19,6 +19,51 @@ public class EmailVerificationService(
     private static readonly TimeSpan ResendCooldown = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan FailWindow = TimeSpan.FromMinutes(15);
     private const int MaxVerifyFailures = 5;
+
+    /// <summary>
+    /// PR3: 邮箱验证码校验单 Lua 脚本——将 4 次往返合并为 1 次。
+    /// KEYS[1] = 验证码键, KEYS[2] = 失败计数键
+    /// ARGV[1] = 期望验证码, ARGV[2] = 最大失败次数, ARGV[3] = 失败窗口 TTL(ms)
+    /// 返回: {状态码, 当前失败次数}
+    ///   1 = Consumed（验证码正确，已消费）
+    ///   2 = WrongCodeAndIncremented（验证码错误，失败计数已递增）
+    ///   3 = Locked（失败次数已达上限）
+    ///   4 = Expired（验证码不存在/已过期）
+    /// </summary>
+    private const string VerifyEmailCodeScript = """
+        local codeKey = KEYS[1]
+        local failKey = KEYS[2]
+        local expectedCode = ARGV[1]
+        local maxFailures = tonumber(ARGV[2])
+        local failTtlMs = tonumber(ARGV[3])
+
+        -- 检查失败锁定
+        local failCount = tonumber(redis.call('GET', failKey) or '0')
+        if failCount >= maxFailures then
+            return {3, failCount}
+        end
+
+        -- 尝试 CAS-DELETE 验证码
+        local current = redis.call('GET', codeKey)
+        if current == false then
+            -- 验证码不存在/已过期
+            return {4, failCount}
+        end
+
+        if current == expectedCode then
+            -- 验证码正确：删除验证码 + 删除失败计数
+            redis.call('DEL', codeKey)
+            redis.call('DEL', failKey)
+            return {1, 0}
+        end
+
+        -- 验证码错误：递增失败计数
+        local newFailCount = redis.call('INCR', failKey)
+        if newFailCount == 1 then
+            redis.call('PEXPIRE', failKey, failTtlMs)
+        end
+        return {2, newFailCount}
+        """;
 
     /// <inheritdoc />
     public async Task<EmailResult> SendEmailCodeAsync(
@@ -100,38 +145,28 @@ public class EmailVerificationService(
         var cacheKey = GetCacheKey(normalizedEmail, codePurpose);
         var failKey = GetFailKey(normalizedEmail, codePurpose);
 
-        var failures = await cache.StringGetAsync(failKey, cancellation)
+        // PR3: 单次 EVAL 合并「锁定检查 + CAS-DELETE + 区分过期 + 失败递增」4 步原子操作。
+        var result = await atomicCache
+            .EvaluateScriptAsync(
+                VerifyEmailCodeScript,
+                [cacheKey, failKey],
+                [
+                    normalizedCode,
+                    MaxVerifyFailures.ToString(),
+                    ((long)FailWindow.TotalMilliseconds).ToString()
+                ],
+                cancellation)
             .ConfigureAwait(false);
-        if (failures is not null
-            && long.TryParse(failures, out var failCount)
-            && failCount >= MaxVerifyFailures)
+
+        // result[0] 状态码：1=已消费 2=验证码错误且已递增 3=已锁定 4=已过期
+        var status = result.Length > 0 ? result[0] : 4L;
+        return status switch
         {
-            return new EmailResult { IsSuccess = false, ErrorMessage = "验证失败次数过多，请稍后再试" };
-        }
-
-        // 原子 compare-and-delete：并发验证同一码时严格只有一次成功。
-        var consumed = await atomicCache
-            .TryStringCompareAndDeleteAsync(cacheKey, normalizedCode, cancellation)
-            .ConfigureAwait(false);
-
-        if (consumed)
-        {
-            await cache.RemoveAsync(failKey, cancellation).ConfigureAwait(false);
-            return new EmailResult { IsSuccess = true };
-        }
-
-        var savedCode = await cache
-            .StringGetAsync(cacheKey, cancellationToken: cancellation)
-            .ConfigureAwait(false);
-
-        if (string.IsNullOrEmpty(savedCode))
-            return new EmailResult { IsSuccess = false, ErrorMessage = "验证码已过期或尚未发送" };
-
-        await atomicCache
-            .StringIncrementAsync(failKey, FailWindow, cancellation)
-            .ConfigureAwait(false);
-
-        return new EmailResult { IsSuccess = false, ErrorMessage = "验证码错误" };
+            1L => new EmailResult { IsSuccess = true },
+            2L => new EmailResult { IsSuccess = false, ErrorMessage = "验证码错误" },
+            3L => new EmailResult { IsSuccess = false, ErrorMessage = "验证失败次数过多，请稍后再试" },
+            _ => new EmailResult { IsSuccess = false, ErrorMessage = "验证码已过期或尚未发送" }
+        };
     }
 
     private static string GetCacheKey(string normalizedEmail, EmailCodePurpose purpose)

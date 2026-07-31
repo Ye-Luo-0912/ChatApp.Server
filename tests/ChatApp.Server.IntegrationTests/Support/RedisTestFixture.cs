@@ -25,6 +25,10 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
 
     public RedisCacheStore Cache { get; private set; } = null!;
 
+    public IDerivedCache DerivedCache { get; private set; } = null!;
+
+    public IOneTimeStateStore OneTimeState { get; private set; } = null!;
+
     public string ConnectionString { get; private set; } = "127.0.0.1:6379,abortConnect=false";
 
     public async Task InitializeAsync()
@@ -124,6 +128,18 @@ public sealed class RedisTestFixture : IAsyncLifetime, IDisposable
                 new TextJsonSerializer(),
                 NullLogger<RedisCacheStore>.Instance,
                 cacheOptions);
+
+            DerivedCache = new GarnetDerivedCache(
+                _multiplexer,
+                new TextJsonSerializer(),
+                cacheOptions,
+                NullLogger<GarnetDerivedCache>.Instance);
+
+            OneTimeState = new GarnetOneTimeStateStore(
+                _multiplexer,
+                new TextJsonSerializer(),
+                cacheOptions,
+                NullLogger<GarnetOneTimeStateStore>.Instance);
 
             return true;
         }

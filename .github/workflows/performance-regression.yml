@@ -203,28 +203,18 @@ jobs:
             echo "找到基线: $BASELINE"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "未找到基线 $BASELINE（首次运行或基线未生成），仅检查绝对目标与错误率"
+            echo "::error::未找到基线 $BASELINE。Nightly workflow 负责生成基线；请先手动触发 Performance Nightly workflow_dispatch 生成基线后再提 PR。"
+            exit 1
           fi
 
       - name: Compare against baseline
-        if: steps.baseline.outputs.exists == 'true'
         working-directory: ChatApp.Server/tests/load
         run: |
           node compare-baseline.mjs \
             --baseline "${{ steps.baseline.outputs.path }}" \
             --current current.json \
-            --absolute absolute-goals.json
-
-      - name: Absolute goals only (no baseline)
-        if: steps.baseline.outputs.exists == 'false'
-        working-directory: ChatApp.Server/tests/load
-        run: |
-          # 首次运行：用脚本以基线=current 跑一遍，仅触发绝对目标与错误率检查
-          node compare-baseline.mjs \
-            --baseline current.json \
-            --current current.json \
-            --absolute absolute-goals.json
-          echo "::notice::首次运行无基线可比对，仅校验绝对目标。Nightly 将生成基线。"
+            --absolute absolute-goals.json \
+            --strict
 
       - name: Upload current run
         if: always()

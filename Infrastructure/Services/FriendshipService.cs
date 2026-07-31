@@ -1,4 +1,4 @@
-﻿using System.Linq.Expressions;
+using System.Linq.Expressions;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models.Common;
@@ -11,11 +11,32 @@ using Microsoft.Extensions.Logging;
 namespace Infrastructure.Services;
 
 /// <summary>
-/// 好友关系业务逻辑服务
+/// 好友关系业务逻辑服务。
 /// </summary>
+/// <remarks>
+/// <para>P0-6 好友域唯一状态机（A 与 B 的成对逻辑状态，由 UserFriendEntry + BlockRecord + FriendRequest 派生）：</para>
+/// <list type="bullet">
+/// <item><c>None</c>：无任何关系。</item>
+/// <item><c>Pending(A -&gt; B)</c>：A 已向 B 发起申请，B 未处理。</item>
+/// <item><c>Accepted</c>：双向好友关系成立（双方 UserFriendEntry 均 IsDeleted=false）。</item>
+/// <item><c>BlockedByA</c>：A 拉黑 B（存在 BlockRecord(A-&gt;B)），B 未拉黑 A。</item>
+/// <item><c>BlockedByB</c>：B 拉黑 A，A 未拉黑 B。</item>
+/// <item><c>BlockedMutual</c>：双方互拉黑。</item>
+/// <item><c>Removed</c>：曾为 Accepted，至少一方软删（IsDeleted=true）且未拉黑。</item>
+/// </list>
+/// <para>合法迁移与副作用：</para>
+/// <list type="bullet">
+/// <item><c>None -&gt; Pending(A-&gt;B)</c>：SendRequest，前置拒绝任一方向拉黑。</item>
+/// <item><c>Pending(A-&gt;B) -&gt; Accepted</c>：Accept，事务内重新校验拉黑、建立双向关系、关闭反方向 pending、写 Outbox。</item>
+/// <item><c>Any -&gt; BlockedByX / BlockedMutual</c>：Block，事务内关闭双方 pending、软删 friendship。</item>
+/// <item><c>BlockedByX -&gt; None/Removed</c>：Unblock，仅删除 BlockRecord，不自动恢复历史 friendship，需重新申请。</item>
+/// <item><c>Accepted -&gt; Removed</c>：DeleteFriendship，单边软删；双方均删则物理删。</item>
+/// </list>
+/// <para>Everyone 自动接受策略：申请创建、接受、建立双向关系、关闭反方向 pending、Outbox 必须在单一 PostgreSQL 事务内完成，失败整体回滚不残留 pending。</para>
+/// </remarks>
 public class FriendshipService(
     UserDbContext context,
-    ICacheValueStore cacheService,
+    IDerivedCache cacheService,
     ILogger<FriendshipService> logger,
     ISecurityNotificationService? securityNotifications = null)
     : IFriendshipService
@@ -59,6 +80,16 @@ public class FriendshipService(
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "目标账户不可用");
+
+        // P0-6：申请前检查任一方向的拉黑关系（BlockedByA/BlockedByB/BlockedMutual 均禁止发起申请）
+        var blockedEitherDirection = await context.BlockRecords.AsNoTracking()
+            .AnyAsync(b => (b.BlockerId == requesterId && b.BlockedUserId == targetUserId)
+                        || (b.BlockerId == targetUserId && b.BlockedUserId == requesterId), ct)
+            .ConfigureAwait(false);
+        if (blockedEitherDirection)
+            return SendFriendRequestResult.Failed(
+                FriendshipOperationResultErrorCode.RequestAlreadyBlocked,
+                "存在拉黑关系，无法发送好友申请");
 
         if (targetUser.FriendRequestPolicy == FriendRequestPolicy.NoStrangers)
         {
@@ -116,23 +147,11 @@ public class FriendshipService(
                 .ConfigureAwait(false);
         }
 
-        // Everyone：自动通过（创建待处理申请后立即以对方身份接受）
+        // P0-6：Everyone 自动接受改为单一事务内的 AcceptEveryoneAsync，失败整体回滚不残留 pending 申请
         if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
         {
-            var create = await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
+            return await AcceptEveryoneAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
                 .ConfigureAwait(false);
-            if (!create.IsSuccess
-                && create.Outcome != SendFriendRequestOutcome.RequestAlreadyPending
-                && create.Outcome != SendFriendRequestOutcome.RequestSent)
-                return create;
-
-            var accept = await AcceptRequestAsync(targetUserId, requesterId, ct).ConfigureAwait(false);
-            return !accept.Succeeded
-                ? SendFriendRequestResult.Failed(accept.ErrorCode, accept.Message)
-                : SendFriendRequestResult.Success(
-                    SendFriendRequestOutcome.AcceptedDirectly,
-                    "对方允许所有人添加，已自动成为好友",
-                    accept.Data);
         }
 
         return await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
@@ -268,21 +287,32 @@ public class FriendshipService(
     }
 
     /// <summary>
-    /// 安全清理缓存，失败只记日志
+    /// 安全清理缓存，失败只记日志。
     /// </summary>
+    /// <remarks>
+    /// P0 正确性：数据库事务提交后的缓存失效不能绑定客户端 CancellationToken（RequestAborted）。
+    /// 若客户端断开导致 ct 取消，旧关系状态会保留在缓存中直至 TTL（默认 5 分钟），
+    /// 而 IsMutual=true 还用于 Presence 授权，会继续放行已撤销的在线状态查看。
+    /// 此处使用独立 500ms 短超时，不传播 OperationCanceledException（视为缓存清理失败，仅记日志）。
+    /// </remarks>
     private async Task SafeClearCacheAsync(
         long userId1, long userId2, CancellationToken ct)
     {
+        using var cleanupCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cleanupCts.CancelAfter(TimeSpan.FromMilliseconds(500));
         try
         {
-            await Task.WhenAll(
-                cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId1, userId2), ct),
-                cacheService.RemoveAsync(string.Format(RelationshipCacheKey, userId2, userId1), ct)
-            ).ConfigureAwait(false);
+            await cacheService.RemoveManyAsync(
+                [
+                    string.Format(RelationshipCacheKey, userId1, userId2),
+                    string.Format(RelationshipCacheKey, userId2, userId1)
+                ],
+                cleanupCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            throw;
+            // 客户端断开但仍已提交：不抛出，让缓存清理用独立超时完成或超时后仅记日志。
+            _logger.LogWarning("客户端取消但事务已提交，缓存清理可能未完成，UserId1={UserId1}, UserId2={UserId2}", userId1, userId2);
         }
         catch (Exception ex)
         {
@@ -308,58 +338,29 @@ public class FriendshipService(
                 FriendshipOperationResultErrorCode.FriendshipRequestNotFound, "没有对应的好友请求");
 
 
-        var existingRelationships = await context.Friendships.IgnoreQueryFilters()
-            .Where(f => (f.UserId == acceptorId && f.FriendId == requesterId) ||
-                        (f.UserId == requesterId && f.FriendId == acceptorId))
-            .ToListAsync(cancellationToken: ct).ConfigureAwait(false);
+        // P0-6：接受时重新校验拉黑状态（拉黑可能在申请后发生，任一方向拉黑均拒绝接受）
+        var blockedOnAccept = await context.BlockRecords.AsNoTracking()
+            .AnyAsync(b => (b.BlockerId == acceptorId && b.BlockedUserId == requesterId)
+                        || (b.BlockerId == requesterId && b.BlockedUserId == acceptorId), ct)
+            .ConfigureAwait(false);
+        if (blockedOnAccept)
+            return FriendshipOperationResult<FriendDto>.Failed(
+                FriendshipOperationResultErrorCode.RequestAlreadyBlocked,
+                "存在拉黑关系，无法接受好友申请");
 
-        var acceptorRecord = existingRelationships.FirstOrDefault(f => f.UserId == acceptorId);
-        var requesterRecord = existingRelationships.FirstOrDefault(f => f.UserId == requesterId);
+        UserFriendEntry acceptorRecord;
+        UserFriendEntry requesterRecord;
 
         await using var transaction = await context.Database.BeginTransactionAsync(ct);
         try
         {
             request.Status = RequestStatus.Accepted;
             request.RespondedAt = DateTime.UtcNow;
-            var newRecords = new List<UserFriendEntry>();
 
-            if (acceptorRecord != null)
-            {
-                // 如果历史记录存在，执行“复活”操作
-                acceptorRecord.IsDeleted = false;
-                acceptorRecord.DeletedAt = null;
-            }
-            else
-            {
-                // 只有真没记录时才新建
-                acceptorRecord = new UserFriendEntry
-                {
-                    UserId = acceptorId,
-                    FriendId = requesterId,
-                    CreatedAt = DateTime.UtcNow
-                };
-                newRecords.Add(acceptorRecord);
-            }
-
-            // 处理 请求者 -> 接受者 的关系记录
-            if (requesterRecord != null)
-            {
-                requesterRecord.IsDeleted = false;
-                requesterRecord.DeletedAt = null;
-            }
-            else
-            {
-                requesterRecord = new UserFriendEntry
-                {
-                    UserId = requesterId,
-                    FriendId = acceptorId,
-                    CreatedAt = DateTime.UtcNow
-                };
-                newRecords.Add(requesterRecord);
-            }
-
-            if (newRecords.Count > 0)
-                await context.Friendships.AddRangeAsync(newRecords, ct).ConfigureAwait(false);
+            // P0-6：建立双向关系（复用历史记录或新建），同一事务内关闭反方向 pending（双方互发场景）
+            (acceptorRecord, requesterRecord) = await EnsureMutualRowsAsync(acceptorId, requesterId, ct)
+                .ConfigureAwait(false);
+            await CloseReversePendingAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
 
             await context.Entry(acceptorRecord)
                 .Reference(f => f.Friend)
@@ -446,6 +447,9 @@ public class FriendshipService(
                         BlockedAt = DateTime.UtcNow
                     }, ct).ConfigureAwait(false);
 
+                    // P0-6：拒绝并拉黑时关闭双方 pending（含反方向 decliner->requester 的待处理申请）
+                    await ClosePendingForBlockAsync(declinerId, requesterId, ct).ConfigureAwait(false);
+
                     var friendships = await context.Friendships
                         .IgnoreQueryFilters()
                         .Where(f => (f.UserId == declinerId && f.FriendId == requesterId) ||
@@ -493,21 +497,7 @@ public class FriendshipService(
 
         if (blockAfterDecline)
         {
-            try
-            {
-                await Task.WhenAll(
-                    cacheService.RemoveAsync(string.Format(RelationshipCacheKey, declinerId, requesterId), ct),
-                    cacheService.RemoveAsync(string.Format(RelationshipCacheKey, requesterId, declinerId), ct)
-                ).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "拒绝好友请求后缓存清理失败");
-            }
+            await SafeClearCacheAsync(declinerId, requesterId, ct).ConfigureAwait(false);
         }
 
         return FriendshipOperationResult.Success(request.RequesterId.ToString());
@@ -593,6 +583,9 @@ public class FriendshipService(
                 friendship.DeletedAt = DateTime.UtcNow;
             }
 
+            // P0-6：拉黑时关闭双方已有 pending 请求（blocker 发出的 Withdrawn，收到的 Declined）
+            await ClosePendingForBlockAsync(blockerId, targetUserId, ct).ConfigureAwait(false);
+
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
@@ -640,21 +633,9 @@ public class FriendshipService(
 
         try
         {
+            // P0-6：解除拉黑仅删除 BlockRecord，不自动恢复历史 friendship（需重新申请）。
+            // 历史若为 Accepted 则保持 Removed 状态，由双方重新发起申请建立关系。
             context.BlockRecords.Remove(blockRecord);
-
-            // 用 Change Tracker 替代 ExecuteUpdateAsync，避免事务中混用
-            var friendships = await context.Friendships
-                .IgnoreQueryFilters()
-                .Where(f => (f.UserId == unblockerId && f.FriendId == targetUserId) ||
-                            (f.UserId == targetUserId && f.FriendId == unblockerId))
-                .ToListAsync(ct)
-                .ConfigureAwait(false);
-
-            foreach (var friendship in friendships)
-            {
-                friendship.IsDeleted = false;
-                friendship.DeletedAt = null;
-            }
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
@@ -840,12 +821,86 @@ public class FriendshipService(
     {
         var cacheKey = string.Format(RelationshipCacheKey, userId1, userId2);
         // 关系状态变化频率不高，用短缓存可以减少重复查库。
-        var cachedResult = await cacheService.GetAsync<FriendshipStatusInfo>(cacheKey, cancellationToken: ct).ConfigureAwait(false);
-        if (cachedResult != null) return cachedResult;
+        var cached = await cacheService.TryGetAsync<FriendshipStatusInfo>(cacheKey, ct).ConfigureAwait(false);
+        if (cached.Found)
+            return cached.Value!;
 
         var result = await CheckRelationshipCoreAsync(userId1, userId2);
 
-        await cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(5), cancellationToken: ct).ConfigureAwait(false);
+        await cacheService.SetAsync(cacheKey, result, TimeSpan.FromMinutes(5), ct).ConfigureAwait(false);
+        return result;
+    }
+
+    /// <summary>
+    /// 批量检查 watcher 与多个 target 的关系状态。
+    /// PR3: 使用 MGET + 批量 SQL，替代逐个查询的 N+1 模式。
+    /// 100 目标：从最多 100 次 GET + 100 次 SQL 降为 1 次 MGET + 1 次 SQL。
+    /// </summary>
+    public async Task<IReadOnlyDictionary<long, FriendshipStatusInfo>> CheckRelationshipsAsync(
+        long watcherUserId,
+        IReadOnlyList<long> targetUserIds,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(targetUserIds);
+        if (targetUserIds.Count == 0)
+            return new Dictionary<long, FriendshipStatusInfo>();
+
+        // 去重 + 排除自己
+        var targets = targetUserIds.Where(id => id > 0 && id != watcherUserId).Distinct().ToList();
+        if (targets.Count == 0)
+            return new Dictionary<long, FriendshipStatusInfo>();
+
+        // 1 次 MGET 批量读取缓存
+        var cacheKeys = new string[targets.Count];
+        for (var i = 0; i < targets.Count; i++)
+            cacheKeys[i] = string.Format(RelationshipCacheKey, watcherUserId, targets[i]);
+
+        var cached = await cacheService.TryGetManyAsync<FriendshipStatusInfo>(cacheKeys, ct)
+            .ConfigureAwait(false);
+
+        var result = new Dictionary<long, FriendshipStatusInfo>(targets.Count);
+        var missedTargets = new List<long>();
+        for (var i = 0; i < targets.Count; i++)
+        {
+            if (cached[i].Found)
+                result[targets[i]] = cached[i].Value!;
+            else
+                missedTargets.Add(targets[i]);
+        }
+
+        if (missedTargets.Count == 0)
+            return result;
+
+        // 1 条集合式 SQL 查询全部未命中关系
+        var watcherId = watcherUserId;
+        var rows = await context.Friendships
+            .IgnoreQueryFilters()
+            .Where(f => (f.UserId == watcherId && missedTargets.Contains(f.FriendId)) ||
+                        (missedTargets.Contains(f.UserId) && f.FriendId == watcherId))
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        // 按 target 分组计算 IsMutual
+        foreach (var targetId in missedTargets)
+        {
+            var f1 = rows.FirstOrDefault(f => f.UserId == watcherUserId && f.FriendId == targetId);
+            var f2 = rows.FirstOrDefault(f => f.UserId == targetId && f.FriendId == watcherUserId);
+            var user1HasUser2 = f1 is { IsDeleted: false };
+            var user2HasUser1 = f2 is { IsDeleted: false };
+
+            var info = (user1HasUser2 && user2HasUser1)
+                ? new FriendshipStatusInfo { IsMutual = true, Status = FriendshipStatus.Approved, EstablishedDate = f1?.CreatedAt }
+                : new FriendshipStatusInfo { IsMutual = false, Status = FriendshipStatus.None };
+
+            result[targetId] = info;
+            // 回填缓存
+            await cacheService.SetAsync(
+                string.Format(RelationshipCacheKey, watcherUserId, targetId),
+                info,
+                TimeSpan.FromMinutes(5),
+                ct).ConfigureAwait(false);
+        }
+
         return result;
     }
 
@@ -1283,6 +1338,189 @@ public class FriendshipService(
                 r.RequesterId == requesterId && r.TargetUserId == targetUserId && r.Status == status, cancellationToken: ctx);
     }
 
+
+    /// <summary>
+    /// P0-6：建立/恢复双向好友关系记录。复用历史软删记录或新建，返回 (acceptorRecord, requesterRecord)。
+    /// 调用方须已在事务内。
+    /// </summary>
+    private async Task<(UserFriendEntry AcceptorRecord, UserFriendEntry RequesterRecord)> EnsureMutualRowsAsync(
+        long acceptorId, long requesterId, CancellationToken ct)
+    {
+        var existing = await context.Friendships.IgnoreQueryFilters()
+            .Where(f => (f.UserId == acceptorId && f.FriendId == requesterId) ||
+                        (f.UserId == requesterId && f.FriendId == acceptorId))
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var acceptorRecord = existing.FirstOrDefault(f => f.UserId == acceptorId);
+        var requesterRecord = existing.FirstOrDefault(f => f.UserId == requesterId);
+
+        if (acceptorRecord != null)
+        {
+            acceptorRecord.IsDeleted = false;
+            acceptorRecord.DeletedAt = null;
+        }
+        else
+        {
+            acceptorRecord = new UserFriendEntry
+            {
+                UserId = acceptorId,
+                FriendId = requesterId,
+                CreatedAt = DateTime.UtcNow
+            };
+            context.Friendships.Add(acceptorRecord);
+        }
+
+        if (requesterRecord != null)
+        {
+            requesterRecord.IsDeleted = false;
+            requesterRecord.DeletedAt = null;
+        }
+        else
+        {
+            requesterRecord = new UserFriendEntry
+            {
+                UserId = requesterId,
+                FriendId = acceptorId,
+                CreatedAt = DateTime.UtcNow
+            };
+            context.Friendships.Add(requesterRecord);
+        }
+
+        return (acceptorRecord, requesterRecord);
+    }
+
+    /// <summary>
+    /// P0-6：关闭反方向待处理申请（acceptor-&gt;requester）。接受 forward(requester-&gt;acceptor) 后，
+    /// 反方向若也有 pending 应一并标记 Accepted，避免残留。调用方须已在事务内。
+    /// </summary>
+    private async Task CloseReversePendingAsync(long acceptorId, long requesterId, CancellationToken ct)
+    {
+        var reverse = await context.FriendRequests
+            .Where(r => r.RequesterId == acceptorId
+                && r.TargetUserId == requesterId
+                && r.Status == RequestStatus.Pending)
+            .FirstOrDefaultAsync(ct)
+            .ConfigureAwait(false);
+        if (reverse is not null)
+        {
+            reverse.Status = RequestStatus.Accepted;
+            reverse.RespondedAt = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// P0-6：拉黑时关闭双方 pending 申请。blocker 发出的标记 Withdrawn，blocker 收到的标记 Declined。
+    /// 调用方须已在事务内，随后统一 SaveChanges。
+    /// </summary>
+    private async Task ClosePendingForBlockAsync(long blockerId, long blockedUserId, CancellationToken ct)
+    {
+        var pending = await context.FriendRequests
+            .Where(r => r.Status == RequestStatus.Pending
+                && ((r.RequesterId == blockerId && r.TargetUserId == blockedUserId)
+                    || (r.RequesterId == blockedUserId && r.TargetUserId == blockerId)))
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+        var now = DateTime.UtcNow;
+        foreach (var r in pending)
+        {
+            r.Status = r.RequesterId == blockerId ? RequestStatus.Withdrawn : RequestStatus.Declined;
+            r.RespondedAt = now;
+        }
+    }
+
+    /// <summary>
+    /// P0-6：Everyone 自动接受——申请创建、通知 Outbox、接受、建立双向关系、关闭反方向 pending
+    /// 全部在单一 PostgreSQL 事务内完成，失败整体回滚不残留 pending 申请。
+    /// </summary>
+    private async Task<SendFriendRequestResult> AcceptEveryoneAsync(
+        long requesterId, long targetUserId, string? message, bool targetNotifiesFriendRequests, CancellationToken ct)
+    {
+        // 接受方为 target，申请方为 requester。
+        var request = await context.FriendRequests
+            .FirstOrDefaultAsync(r => r.RequesterId == requesterId && r.TargetUserId == targetUserId, ct)
+            .ConfigureAwait(false);
+        if (request?.Status == RequestStatus.Pending)
+            return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestAlreadyPending, "好友请求已发送，请勿重复操作");
+
+        await using var transaction = await context.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (request is null)
+            {
+                request = new FriendRequest
+                {
+                    RequesterId = requesterId,
+                    TargetUserId = targetUserId,
+                    Message = message,
+                    Status = RequestStatus.Pending,
+                    CreatedAt = DateTime.UtcNow
+                };
+                context.FriendRequests.Add(request);
+            }
+            else
+            {
+                request.Status = RequestStatus.Pending;
+                request.Message = message;
+                request.CreatedAt = DateTime.UtcNow;
+                request.RespondedAt = null;
+            }
+
+            if (targetNotifiesFriendRequests && securityNotifications is not null)
+            {
+                securityNotifications.StageNotify(
+                    targetUserId, "FriendRequest", "新的好友申请",
+                    $"用户 {requesterId} 向你发送了好友申请。",
+                    preferEmail: false);
+            }
+
+            request.Status = RequestStatus.Accepted;
+            request.RespondedAt = DateTime.UtcNow;
+
+            var (acceptorRecord, requesterRecord) = await EnsureMutualRowsAsync(targetUserId, requesterId, ct)
+                .ConfigureAwait(false);
+            await CloseReversePendingAsync(targetUserId, requesterId, ct).ConfigureAwait(false);
+
+            await context.Entry(requesterRecord)
+                .Reference(f => f.Friend)
+                .LoadAsync(ct)
+                .ConfigureAwait(false);
+
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+            var dto = new FriendDto
+            {
+                FriendId = requesterRecord.FriendId,
+                FriendName = requesterRecord.Friend?.UserName,
+                AvatarUrl = requesterRecord.Friend?.AvatarUrl,
+                GroupId = requesterRecord.GroupId,
+                GroupName = requesterRecord.Group?.GroupName,
+                CreatedAt = requesterRecord.CreatedAt,
+                Note = requesterRecord.Note
+            };
+
+            await SafeClearCacheAsync(requesterId, targetUserId, ct).ConfigureAwait(false);
+            return SendFriendRequestResult.Success(
+                SendFriendRequestOutcome.AcceptedDirectly,
+                "对方允许所有人添加，已自动成为好友",
+                dto);
+        }
+        catch (OperationCanceledException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            _logger.LogError(ex, "Everyone 自动接受失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
+                requesterId, targetUserId);
+            return SendFriendRequestResult.Failed(
+                FriendshipOperationResultErrorCode.InternalSystemError,
+                "操作失败，请稍后重试");
+        }
+    }
 
     /// <summary>
     /// 检查两个用户之间的关系状态

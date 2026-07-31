@@ -26,7 +26,8 @@ public sealed class LocalAttachmentStorage(
         string ContentType,
         long ContentLength,
         string? OriginalName,
-        string? ClientAttachmentId);
+        string? ClientAttachmentId,
+        long ExpiresAtUnixMs);
 
     public long MaxBytes => _options.MaxBytes;
 
@@ -60,7 +61,8 @@ public sealed class LocalAttachmentStorage(
         await cache.SetAsync(
             TicketKey(ticket),
             new AttachmentTicketInfo(
-                userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId),
+                userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId,
+                expires.ToUnixTimeMilliseconds()),
             ttl,
             cancellationToken).ConfigureAwait(false);
 
@@ -174,7 +176,12 @@ public sealed class LocalAttachmentStorage(
         }
 
         // Local：上传完成后把票写回短 TTL，供 confirm 消费（绑定 attachmentId/objectKey）。
-        var confirmInfo = info with { ContentLength = written };
+        var confirmExpires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
+        var confirmInfo = info with
+        {
+            ContentLength = written,
+            ExpiresAtUnixMs = confirmExpires.ToUnixTimeMilliseconds(),
+        };
         await cache.SetAsync(
                 ticketKey,
                 confirmInfo,
@@ -355,12 +362,21 @@ public sealed class LocalAttachmentStorage(
     private async Task RestoreTicketAsync(
         string ticketKey, AttachmentTicketInfo info, CancellationToken cancellationToken)
     {
+        // P0 正确性：恢复时使用原始绝对截止时间的剩余 TTL，不重置为完整 TicketMinutes。
+        // 多次失败恢复不会延长票据寿命超过原始截止时间；已过期则不再恢复。
+        var remaining = DateTimeOffset.FromUnixTimeMilliseconds(info.ExpiresAtUnixMs) - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            logger.LogWarning("附件上传票已过期，不再恢复，ExpiresAtUnixMs={ExpiresAtUnixMs}", info.ExpiresAtUnixMs);
+            return;
+        }
+
         try
         {
             await cache.SetAsync(
                     ticketKey,
                     info,
-                    TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                    remaining,
                     cancellationToken)
                 .ConfigureAwait(false);
         }

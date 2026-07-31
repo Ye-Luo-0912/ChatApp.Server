@@ -77,7 +77,8 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         await _cache.SetAsync(
             $"attachment:ticket:{ticket}",
             new LocalAttachmentStorage.AttachmentTicketInfo(
-                userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId),
+                userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId,
+                expires.ToUnixTimeMilliseconds()),
             expires - DateTimeOffset.UtcNow,
             cancellationToken).ConfigureAwait(false);
 
@@ -268,10 +269,18 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IDisposable
         LocalAttachmentStorage.AttachmentTicketInfo info,
         CancellationToken cancellationToken)
     {
+        // P0 正确性：恢复时使用原始绝对截止时间的剩余 TTL，不重置为完整 TicketMinutes。
+        var remaining = DateTimeOffset.FromUnixTimeMilliseconds(info.ExpiresAtUnixMs) - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            _logger.LogWarning("附件上传票已过期，不再恢复，ExpiresAtUnixMs={ExpiresAtUnixMs}", info.ExpiresAtUnixMs);
+            return;
+        }
+
         try
         {
             await _cache.SetAsync(
-                ticketKey, info, TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                ticketKey, info, remaining,
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)

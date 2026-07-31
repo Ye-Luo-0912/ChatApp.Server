@@ -9,6 +9,7 @@ using Core.Models.Auth;
 using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -758,6 +759,7 @@ public sealed class DataExportService(
                 job.AttemptCount = Math.Max(job.AttemptCount, 1);
                 job.ConsumedAt ??= DateTimeOffset.UtcNow;
                 job.LeaseOwner = null;
+                job.LeaseToken = null;
                 job.LeaseUntil = null;
             }
         }
@@ -804,6 +806,7 @@ public sealed class DataExportService(
                         .SetProperty(j => j.Error, TruncateError($"blob_delete_failed:{source}:{ex.Message}"))
                         .SetProperty(j => j.ObjectKey, objectKey)
                         .SetProperty(j => j.LeaseOwner, (string?)null)
+                        .SetProperty(j => j.LeaseToken, (string?)null)
                         .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null),
                     CancellationToken.None)
                 .ConfigureAwait(false);
@@ -871,15 +874,21 @@ public sealed class DataExportService(
 public sealed class DataExportWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<DataExportStorageOptions> options,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
+    WorkerConcurrencyManager concurrencyManager,
     ILogger<DataExportWorker> logger) : BackgroundService
 {
-    private readonly string _instanceId = $"{Environment.MachineName}:{Guid.NewGuid():N}"[..32];
+    private const string WorkerName = "data_export";
+    private static readonly string ProcessOwner = $"{Environment.MachineName}:{Environment.ProcessId}";
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var poll = Math.Max(500, options.Value.PollIntervalMilliseconds);
         var cleanupEvery = TimeSpan.FromMinutes(Math.Max(1, options.Value.CleanupIntervalMinutes));
         var nextCleanup = DateTimeOffset.UtcNow;
+        var workerConcurrency = Math.Max(1, workerConcurrencyOptions.Value.DataExport);
+        var inFlight = new List<Task>();
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -890,9 +899,25 @@ public sealed class DataExportWorker(
                     nextCleanup = DateTimeOffset.UtcNow + cleanupEvery;
                 }
 
-                var claimed = await ClaimAndProcessAsync(stoppingToken).ConfigureAwait(false);
-                if (!claimed)
-                    await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
+                // P0-5.2：只领取当前真正拥有执行槽的任务数量；每个作业独立作用域+独立 DbContext 并发处理。
+                inFlight.RemoveAll(static t => t.IsCompleted);
+                var available = Math.Max(0, workerConcurrency - inFlight.Count);
+                for (var i = 0; i < available; i++)
+                {
+                    var claimed = await ClaimOneAsync(stoppingToken).ConfigureAwait(false);
+                    if (claimed is null) break;
+
+                    var concurrencyScope = await concurrencyManager.AcquireAsync(
+                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
+                    inFlight.Add(ProcessOneAsync(
+                        claimed.Value.Job, claimed.Value.LeaseToken, concurrencyScope, stoppingToken));
+                }
+
+                inFlight.RemoveAll(static t => t.IsCompleted);
+
+                // 没有在途任务时按 poll 间隔退避；有在途任务时短暂退避让出 CPU。
+                var delay = inFlight.Count == 0 ? poll : Math.Min(poll, 200);
+                await Task.Delay(delay, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -903,6 +928,15 @@ public sealed class DataExportWorker(
                 logger.LogError(ex, "导出 Worker 循环异常");
                 await Task.Delay(poll, stoppingToken).ConfigureAwait(false);
             }
+        }
+
+        try
+        {
+            await Task.WhenAll(inFlight).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "导出 Worker 关闭时等待在途任务失败");
         }
     }
 
@@ -1004,18 +1038,20 @@ public sealed class DataExportWorker(
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<bool> ClaimAndProcessAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// 原子领取一个到期作业。生成唯一 LeaseOwner+LeaseToken 作为 fencing token。
+    /// <para>P0-5.2：每次领取使用独立 owner 与 token，避免跨进程/跨作业误匹配；后续终态/续租/失败更新均匹配这两个字段。</para>
+    /// </summary>
+    private async Task<(DataExportJob Job, string LeaseToken)?> ClaimOneAsync(CancellationToken cancellationToken)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-        var blob = scope.ServiceProvider.GetRequiredService<IDataExportBlobStore>();
-        var sessions = scope.ServiceProvider.GetRequiredService<ISessionStore>();
-        var chatExport = scope.ServiceProvider.GetRequiredService<IRealtimeChatExportReader>();
-        var attachmentMeta = scope.ServiceProvider.GetRequiredService<IAttachmentMetadataStore>();
         var opts = options.Value;
         var now = DateTimeOffset.UtcNow;
         var leaseSeconds = Math.Max(30, opts.LeaseSeconds);
         var leaseUntil = now.AddSeconds(leaseSeconds);
+        var leaseToken = Guid.NewGuid().ToString("N");
+        var owner = $"{ProcessOwner}:{Guid.NewGuid():N}"[..32];
 
         var job = await db.DataExportJobs
             .Where(j => j.Status == DataExportJobStatus.Pending
@@ -1025,7 +1061,7 @@ public sealed class DataExportWorker(
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
         if (job is null)
-            return false;
+            return null;
 
         var claimed = await db.DataExportJobs
             .Where(j => j.Id == job.Id
@@ -1034,19 +1070,47 @@ public sealed class DataExportWorker(
                                 && (j.LeaseUntil == null || j.LeaseUntil < now))))
             .ExecuteUpdateAsync(
                 s => s.SetProperty(j => j.Status, DataExportJobStatus.Processing)
-                    .SetProperty(j => j.LeaseOwner, _instanceId)
+                    .SetProperty(j => j.LeaseOwner, owner)
+                    .SetProperty(j => j.LeaseToken, leaseToken)
                     .SetProperty(j => j.LeaseUntil, leaseUntil)
                     .SetProperty(j => j.AttemptCount, j => j.AttemptCount + 1),
                 cancellationToken)
             .ConfigureAwait(false);
         if (claimed == 0)
-            return false;
+            return null;
 
+        // 重新读取快照，脱离 DbContext；处理在独立作用域中进行。
+        db.ChangeTracker.Clear();
+        var snapshot = await db.DataExportJobs.AsNoTracking()
+            .FirstAsync(j => j.Id == job.Id, cancellationToken)
+            .ConfigureAwait(false);
+        return (snapshot, leaseToken);
+    }
+
+    /// <summary>
+    /// 处理单个已领取作业：独立作用域 + 独立 DbContext + 独立心跳续租。
+    /// 终态由 <see cref="ProcessJobAsync"/> 内部以 LeaseOwner+LeaseToken fencing 落库；租约已易主时抛 InvalidOperationException 由失败分支处理。
+    /// </summary>
+    private async Task ProcessOneAsync(
+        DataExportJob job,
+        string leaseToken,
+        IAsyncDisposable concurrencyScope,
+        CancellationToken cancellationToken)
+    {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            var blob = scope.ServiceProvider.GetRequiredService<IDataExportBlobStore>();
+            var sessions = scope.ServiceProvider.GetRequiredService<ISessionStore>();
+            var chatExport = scope.ServiceProvider.GetRequiredService<IRealtimeChatExportReader>();
+            var attachmentMeta = scope.ServiceProvider.GetRequiredService<IAttachmentMetadataStore>();
             await ProcessJobAsync(
-                    db, blob, sessions, chatExport, attachmentMeta, scopeFactory, job.Id, job.UserId, opts, _instanceId, leaseSeconds, cancellationToken)
+                    db, blob, sessions, chatExport, attachmentMeta, scopeFactory,
+                    job.Id, job.UserId, options.Value,
+                    job.LeaseOwner!, leaseToken, options.Value.LeaseSeconds,
+                    cancellationToken)
                 .ConfigureAwait(false);
             AuthSecurityMetrics.ExportFinished("ready", sw.Elapsed.TotalMilliseconds);
         }
@@ -1054,19 +1118,38 @@ public sealed class DataExportWorker(
         {
             logger.LogError(ex, "导出作业失败 JobId={JobId}", job.Id);
             var publicCode = DataExportJobErrors.MapPublicCode(ex);
-            await db.DataExportJobs
-                .Where(j => j.Id == job.Id && j.LeaseOwner == _instanceId)
-                .ExecuteUpdateAsync(
-                    s => s.SetProperty(j => j.Status, DataExportJobStatus.Failed)
-                        .SetProperty(j => j.Error, publicCode)
-                        .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
-                        .SetProperty(j => j.LeaseOwner, (string?)null),
-                    cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await using var scope = scopeFactory.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+                // P0-5.2：失败标记必须匹配 LeaseOwner+LeaseToken+Status=Processing；
+                // 防止租约过期后被另一实例重新领取并完成后，本旧持有者仍覆盖终态。
+                var updated = await db.DataExportJobs
+                    .Where(j => j.Id == job.Id
+                        && j.LeaseOwner == job.LeaseOwner
+                        && j.LeaseToken == leaseToken
+                        && j.Status == DataExportJobStatus.Processing)
+                    .ExecuteUpdateAsync(
+                        s => s.SetProperty(j => j.Status, DataExportJobStatus.Failed)
+                            .SetProperty(j => j.Error, publicCode)
+                            .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
+                            .SetProperty(j => j.LeaseOwner, (string?)null)
+                            .SetProperty(j => j.LeaseToken, (string?)null),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (updated == 0)
+                    logger.LogWarning("导出失败标记未命中 JobId={JobId}：租约已易主或状态已变更", job.Id);
+            }
+            catch (Exception markEx)
+            {
+                logger.LogWarning(markEx, "导出标记失败状态时异常 JobId={JobId}", job.Id);
+            }
             AuthSecurityMetrics.ExportFinished("failed", sw.Elapsed.TotalMilliseconds);
         }
-
-        return true;
+        finally
+        {
+            await concurrencyScope.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     private static async Task ProcessJobAsync(
@@ -1080,6 +1163,7 @@ public sealed class DataExportWorker(
         long userId,
         DataExportStorageOptions opts,
         string leaseOwner,
+        string leaseToken,
         int leaseSeconds,
         CancellationToken cancellationToken)
     {
@@ -1093,14 +1177,14 @@ public sealed class DataExportWorker(
                 await Task.Delay(heartbeatInterval, heartbeatCts.Token).ConfigureAwait(false);
                 await using var scope = scopeFactory.CreateAsyncScope();
                 var hbDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-                await RenewLeaseAsync(hbDb, jobId, leaseOwner, leaseSeconds, heartbeatCts.Token)
+                await RenewLeaseAsync(hbDb, jobId, leaseOwner, leaseToken, leaseSeconds, heartbeatCts.Token)
                     .ConfigureAwait(false);
             }
         }, CancellationToken.None);
 
         try
         {
-            await RenewLeaseAsync(db, jobId, leaseOwner, leaseSeconds, cancellationToken).ConfigureAwait(false);
+            await RenewLeaseAsync(db, jobId, leaseOwner, leaseToken, leaseSeconds, cancellationToken).ConfigureAwait(false);
 
             var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId, cancellationToken)
                        ?? throw new InvalidOperationException("用户不存在");
@@ -1182,9 +1266,12 @@ public sealed class DataExportWorker(
 
             var readyAt = DateTimeOffset.UtcNow;
             var ttlHours = Math.Clamp(opts.JobTtlHours, 1, 168);
-            // 终态仅当本实例仍持有租约，避免旧 Worker 覆盖新租约持有者。
+            // P0-5.2：终态匹配 Id + Status(Processing) + LeaseOwner + LeaseToken，避免旧 Worker 覆盖新租约持有者。
             var updated = await db.DataExportJobs
-                .Where(j => j.Id == jobId && j.LeaseOwner == leaseOwner && j.Status == DataExportJobStatus.Processing)
+                .Where(j => j.Id == jobId
+                    && j.LeaseOwner == leaseOwner
+                    && j.LeaseToken == leaseToken
+                    && j.Status == DataExportJobStatus.Processing)
                 .ExecuteUpdateAsync(
                     s => s.SetProperty(j => j.Status, DataExportJobStatus.Ready)
                         .SetProperty(j => j.ReadyAt, readyAt)
@@ -1192,7 +1279,8 @@ public sealed class DataExportWorker(
                         .SetProperty(j => j.ObjectKey, objectKey)
                         .SetProperty(j => j.Error, (string?)null)
                         .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
-                        .SetProperty(j => j.LeaseOwner, (string?)null),
+                        .SetProperty(j => j.LeaseOwner, (string?)null)
+                        .SetProperty(j => j.LeaseToken, (string?)null),
                     cancellationToken)
                 .ConfigureAwait(false);
             if (updated == 0)
@@ -1471,12 +1559,17 @@ public sealed class DataExportWorker(
         UserDbContext db,
         string jobId,
         string leaseOwner,
+        string leaseToken,
         int leaseSeconds,
         CancellationToken cancellationToken)
     {
         var until = DateTimeOffset.UtcNow.AddSeconds(leaseSeconds);
+        // P0-5.2：续租必须匹配 LeaseOwner + LeaseToken，确保只有当前持有者能延长租约。
         var n = await db.DataExportJobs
-            .Where(j => j.Id == jobId && j.LeaseOwner == leaseOwner && j.Status == DataExportJobStatus.Processing)
+            .Where(j => j.Id == jobId
+                && j.LeaseOwner == leaseOwner
+                && j.LeaseToken == leaseToken
+                && j.Status == DataExportJobStatus.Processing)
             .ExecuteUpdateAsync(s => s.SetProperty(j => j.LeaseUntil, until), cancellationToken)
             .ConfigureAwait(false);
         if (n == 0)

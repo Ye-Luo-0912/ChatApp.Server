@@ -164,23 +164,26 @@ public abstract partial class Program
             Predicate = check => check.Tags.Contains("ready"),
         });
 
-        // 诊断端点：供 k6 压测采样 allocations/Redis commands/DB queries，计算 per-request 指标。
-        // 无需鉴权——仅暴露累计计数器，不含敏感信息。
-        app.MapGet("/debug/metrics", (IConnectionMultiplexer redis, DbCommandCounterInterceptor dbCounter) =>
+        // 诊断端点：仅供压测/测试环境采样 allocations/Redis commands/DB queries。
+        // 生产环境不映射——暴露 uptime/资源压力/后端活动趋势会构成信息泄露。
+        if (app.Environment.IsEnvironment("Performance") || app.Environment.IsEnvironment("Testing"))
         {
-            return Results.Ok(new Dictionary<string, object>
+            app.MapGet("/debug/metrics", (IConnectionMultiplexer redis, DbCommandCounterInterceptor dbCounter) =>
             {
-                ["allocated_bytes"] = GC.GetTotalAllocatedBytes(),
-                ["gc_heap_bytes"] = GC.GetTotalMemory(false),
-                ["gen0_collections"] = GC.CollectionCount(0),
-                ["gen1_collections"] = GC.CollectionCount(1),
-                ["gen2_collections"] = GC.CollectionCount(2),
-                ["working_set_bytes"] = Environment.WorkingSet,
-                ["redis_total_commands"] = redis.OperationCount,
-                ["db_total_commands"] = dbCounter.TotalCommandsExecuted,
-                ["uptime_ms"] = Environment.TickCount64,
+                return Results.Ok(new Dictionary<string, object>
+                {
+                    ["allocated_bytes"] = GC.GetTotalAllocatedBytes(),
+                    ["gc_heap_bytes"] = GC.GetTotalMemory(false),
+                    ["gen0_collections"] = GC.CollectionCount(0),
+                    ["gen1_collections"] = GC.CollectionCount(1),
+                    ["gen2_collections"] = GC.CollectionCount(2),
+                    ["working_set_bytes"] = Environment.WorkingSet,
+                    ["redis_total_commands"] = redis.OperationCount,
+                    ["db_total_commands"] = dbCounter.TotalCommandsExecuted,
+                    ["uptime_ms"] = Environment.TickCount64,
+                });
             });
-        });
+        }
 
         app.MapControllers();
 

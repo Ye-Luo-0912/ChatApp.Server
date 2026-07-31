@@ -57,7 +57,12 @@ public sealed class WorkerConcurrencyManager : IDisposable
     }
 
     /// <summary>
-    /// 获取并发槽。先获取全局信号量，再获取 Worker 专属信号量。
+    /// 获取并发槽。先获取 Worker 专属信号量，再获取全局信号量。
+    /// <para>
+    /// P0-5.1：顺序必须是 专属 → 全局。若先拿全局再等专属，一类 Worker 大量提交任务时会占满所有全局槽，
+    /// 然后在自己的专属信号量前排队，导致其他 Worker 完全无法执行（队头阻塞）。
+    /// 先拿专属槽保证调用方已获得本类 Worker 的执行权，再竞争全局槽；其他 Worker 类型不会被本类排队项阻塞。
+    /// </para>
     /// 返回的 <see cref="IAsyncDisposable"/> 释放时归还两个信号量。
     /// </summary>
     public async Task<IAsyncDisposable> AcquireAsync(
@@ -70,14 +75,15 @@ public sealed class WorkerConcurrencyManager : IDisposable
                 Math.Max(1, workerMaxConcurrency)));
 
         var sw = Stopwatch.StartNew();
-        await _globalSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        // 先专属：确保本类 Worker 已有执行权，避免占着全局槽空等专属槽。
+        await workerSemaphore.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await workerSemaphore.WaitAsync(ct).ConfigureAwait(false);
+            await _globalSemaphore.WaitAsync(ct).ConfigureAwait(false);
         }
         catch
         {
-            _globalSemaphore.Release();
+            workerSemaphore.Release();
             throw;
         }
         sw.Stop();

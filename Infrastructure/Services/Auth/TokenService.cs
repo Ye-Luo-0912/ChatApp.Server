@@ -79,12 +79,12 @@ public sealed class TokenService(
     /// 将访问令牌元数据写入 Redis，键为 AT:{SHA-256(token)}，防止原始令牌暴露在日志中。
     /// 同时填充 L1 缓存，使后续认证请求无需访问 Redis。
     /// </summary>
-    public Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default)
+    public async Task StoreAccessTokenAsync(string token, AccessTokenData data, TimeSpan expiry, CancellationToken cancellationToken = default)
     {
         var key = AccessTokenKey(token);
+        await values.SetAsync(key, data, expiry, cancellationToken).ConfigureAwait(false);
         if (_l1Cache is not null && !data.IsExpired)
             _l1Cache.SetPositive(key, data);
-        return values.SetAsync(key, data, expiry, cancellationToken);
     }
 
     /// <summary>
@@ -244,6 +244,9 @@ public sealed class TokenService(
         var ssKey  = SessionKey(userId, device.DeviceId);
         var now    = DateTime.UtcNow;
 
+        // 在 CAS 回调外捕获旧 AT key，便于轮换成功后驱逐 L1（与 IssueRefreshTokensAsync 一致）。
+        string? oldAtKeyCaptured = null;
+
         var rotated = await atomic.TryAtomicConsumeAsync<RefreshToken, bool>(
             RefreshTokenKey(userId, oldRefreshToken),
             oldRt =>
@@ -256,7 +259,10 @@ public sealed class TokenService(
                 var session = oldRt.SessionId;
                 var deletes = new List<string>(1);
                 if (oldRt.CurrentAccessTokenKey is { } oldAtKey)
+                {
                     deletes.Add(oldAtKey);
+                    oldAtKeyCaptured = oldAtKey;
+                }
 
                 var newRtData = new RefreshToken
                 {
@@ -298,6 +304,10 @@ public sealed class TokenService(
 
         if (rotated.Succeeded)
         {
+            // P0-2：CAS 已提交 → Redis 事务内已删除旧 AT key，同步驱逐本机 L1。
+            if (oldAtKeyCaptured is not null)
+                _l1Cache?.Evict(oldAtKeyCaptured);
+
             await IndexDeviceAsync(userId, device.DeviceId, expiry, cancellationToken);
             logger.LogDebug("刷新令牌已轮换，UserId={UserId}, DeviceId={DeviceId}",
                 userId, device.DeviceId);
@@ -432,6 +442,11 @@ public sealed class TokenService(
         var rtKey = RefreshTokenKey(userId, rawRt);
         var ssKey = SessionKey(userId, device.DeviceId);
 
+        // 在 CAS 回调外捕获旧 AT key，便于轮换成功后驱逐 L1。
+        // oldRt.CurrentAccessTokenKey 在并发轮换下可能被另一请求改写，
+        // 但 CAS 成功意味着本次看到的 oldRt 就是已被消费的快照，其 oldAtKey 即待失效的 AT。
+        string? oldAtKeyCaptured = null;
+
         var rotated = await atomic.TryAtomicConsumeAsync<RefreshToken, (string accessToken, string refreshToken)>(
             RefreshTokenKey(userId, oldRefreshToken),
             oldRt =>
@@ -445,7 +460,10 @@ public sealed class TokenService(
 
                 var deletes = new List<string>(1);
                 if (oldRt.CurrentAccessTokenKey is { } oldAtKey)
+                {
                     deletes.Add(oldAtKey);
+                    oldAtKeyCaptured = oldAtKey;
+                }
 
                 var atData = new AccessTokenData
                 {
@@ -509,6 +527,12 @@ public sealed class TokenService(
             return null;
         }
 
+        // P0-2：CAS 已提交 → Redis 事务内已删除旧 AT key。
+        // 必须同步驱逐本机 L1 正缓存，否则旧 AT 最长可在 L1 存活至 TTL（默认 5s）。
+        // 与 RevokeSessionAsync 保持一致的驱逐时机。
+        if (oldAtKeyCaptured is not null)
+            _l1Cache?.Evict(oldAtKeyCaptured);
+
         await IndexDeviceAsync(userId, device.DeviceId, refreshExpiry, cancellationToken);
 
         logger.LogDebug("令牌已轮换，UserId={UserId}, DeviceId={DeviceId}", userId, device.DeviceId);
@@ -564,46 +588,83 @@ public sealed class TokenService(
 
     /// <summary>
     /// 撤销（删除）指定用户在指定设备上的会话记录，并同步删除对应的访问令牌和刷新令牌。
+    /// PR3: 使用 RemoveMany 批量删除，将 3～4 次 DEL 合并为 1 次。
     /// </summary>
     public async Task RevokeSessionAsync(string userId, string deviceId, CancellationToken cancellationToken = default)
     {
         var session = await GetSessionAsync(userId, deviceId, cancellationToken);
-        var tasks = new List<Task>(4)
-        {
-            values.RemoveAsync(SessionKey(userId, deviceId), cancellationToken),
-            sets.SetRemoveAsync(UserDeviceIndexKey(userId), deviceId, cancellationToken),
-        };
 
-        if (session?.CurrentAccessTokenKey  is not null)
+        var keysToDelete = new List<string>(3) { SessionKey(userId, deviceId) };
+        if (session?.CurrentAccessTokenKey is not null)
         {
             _l1Cache?.Evict(session.CurrentAccessTokenKey);
-            tasks.Add(values.RemoveAsync(session.CurrentAccessTokenKey, cancellationToken));
+            keysToDelete.Add(session.CurrentAccessTokenKey);
         }
-        if (session?.CurrentRefreshTokenKey is not null) tasks.Add(values.RemoveAsync(session.CurrentRefreshTokenKey, cancellationToken));
+        if (session?.CurrentRefreshTokenKey is not null)
+            keysToDelete.Add(session.CurrentRefreshTokenKey);
 
-        await Task.WhenAll(tasks);
+        await Task.WhenAll(
+            values.RemoveManyAsync(keysToDelete, cancellationToken),
+            sets.SetRemoveAsync(UserDeviceIndexKey(userId), deviceId, cancellationToken));
+
         logger.LogDebug("会话已撤销，UserId={UserId}, DeviceId={DeviceId}", userId, deviceId);
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// PR3: 批量化撤销——1 次 SMEMBERS + 1 次 MGET + 1 次 RemoveMany + 1 次 SetRemoveMany，
+    /// 替代原来 O(n) 顺序逐设备往返。
+    /// </remarks>
     public async Task<int> RevokeAllSessionsAsync(string userId, string? exceptDeviceId = null, CancellationToken cancellationToken = default)
     {
         var deviceIds = await sets.SetMembersAsync(UserDeviceIndexKey(userId), cancellationToken).ConfigureAwait(false);
-        var revoked = 0;
+        if (deviceIds.Count == 0)
+            return 0;
 
+        // 过滤掉保留设备
+        var toRevoke = new List<string>(deviceIds.Count);
         foreach (var deviceId in deviceIds)
         {
             if (exceptDeviceId is not null && string.Equals(deviceId, exceptDeviceId, StringComparison.Ordinal))
                 continue;
-
-            await RevokeSessionAsync(userId, deviceId, cancellationToken).ConfigureAwait(false);
-            revoked++;
+            toRevoke.Add(deviceId);
         }
 
+        if (toRevoke.Count == 0)
+            return 0;
+
+        // 批量读取所有会话，收集需删除的键
+        var sessionKeys = new string[toRevoke.Count];
+        for (var i = 0; i < toRevoke.Count; i++)
+            sessionKeys[i] = SessionKey(userId, toRevoke[i]);
+
+        var sessions = await values.GetManyAsync<SessionRecord>(sessionKeys, cancellationToken)
+            .ConfigureAwait(false);
+
+        var keysToDelete = new List<string>(toRevoke.Count * 3);
+        for (var i = 0; i < toRevoke.Count; i++)
+        {
+            keysToDelete.Add(sessionKeys[i]);
+            var session = sessions[i];
+            if (session?.CurrentAccessTokenKey is not null)
+            {
+                _l1Cache?.Evict(session.CurrentAccessTokenKey);
+                keysToDelete.Add(session.CurrentAccessTokenKey);
+            }
+            if (session?.CurrentRefreshTokenKey is not null)
+                keysToDelete.Add(session.CurrentRefreshTokenKey);
+        }
+
+        // 批量删除所有键 + 批量从设备索引移除
+        await Task.WhenAll(
+            values.RemoveManyAsync(keysToDelete, cancellationToken),
+            sets.SetRemoveManyAsync(UserDeviceIndexKey(userId), toRevoke, cancellationToken));
+
+        // 如果没有保留设备，直接删除整个索引键
         if (exceptDeviceId is null)
             await values.RemoveAsync(UserDeviceIndexKey(userId), cancellationToken).ConfigureAwait(false);
 
-        return revoked;
+        return toRevoke.Count;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -613,11 +674,17 @@ public sealed class TokenService(
     private Task IndexDeviceAsync(string userId, string deviceId, TimeSpan ttl, CancellationToken cancellationToken)
         => sets.SetAddAsync(UserDeviceIndexKey(userId), deviceId, ttl, cancellationToken);
 
-    /// <summary>对令牌做 SHA-256 哈希，用于构造 Redis 键，避免原始值出现在键名中。</summary>
+    /// <summary>
+    /// 对令牌做 SHA-256 哈希，用于构造 Redis 键，避免原始值出现在键名中。
+    /// 令牌为 ASCII/Base64url，使用栈内存避免 byte[] 分配。
+    /// </summary>
     private static string HashToken(string token)
     {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(token));
-        return Convert.ToHexString(bytes);
+        Span<byte> input = stackalloc byte[128];
+        var length = Encoding.UTF8.GetBytes(token, input);
+        Span<byte> hash = stackalloc byte[32];
+        SHA256.HashData(input[..length], hash);
+        return Convert.ToHexString(hash);
     }
 
     private static string AccessTokenKey(string token)

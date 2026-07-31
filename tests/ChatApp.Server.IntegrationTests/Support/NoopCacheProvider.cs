@@ -5,8 +5,10 @@ namespace ChatApp.Server.IntegrationTests.Support;
 
 /// <summary>
 /// 无操作缓存，供仅需数据库的集成测试使用。
+/// 同时实现派生缓存与一次性状态接口，避免测试替身碎片化。
 /// </summary>
-internal sealed class NoopCacheProvider : ICacheValueStore, IAtomicCacheStore, ICacheSetStore
+internal sealed class NoopCacheProvider
+    : ICacheValueStore, IAtomicCacheStore, ICacheSetStore, IDerivedCache, IOneTimeStateStore
 {
     public bool IsHealthy => true;
 
@@ -72,6 +74,11 @@ internal sealed class NoopCacheProvider : ICacheValueStore, IAtomicCacheStore, I
     public Task RemoveAsync(string key, CancellationToken cancellationToken = default)
         => Task.CompletedTask;
 
+    public Task RemoveManyAsync(
+        IReadOnlyList<string> keys,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
     public Task<T?> TryGetAndDeleteAsync<T>(
         string key, CancellationToken cancellationToken = default)
         => Task.FromResult<T?>(default);
@@ -87,6 +94,13 @@ internal sealed class NoopCacheProvider : ICacheValueStore, IAtomicCacheStore, I
         CancellationToken cancellationToken = default)
         => Task.FromResult(AtomicConsumeResult<TResult>.Fail());
 
+    public Task<long[]> EvaluateScriptAsync(
+        string script,
+        IReadOnlyList<string> keys,
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<long[]>([]);
+
     public Task SetAddAsync(
         string key,
         string member,
@@ -100,4 +114,64 @@ internal sealed class NoopCacheProvider : ICacheValueStore, IAtomicCacheStore, I
     public Task<IReadOnlyList<string>> SetMembersAsync(string key, CancellationToken cancellationToken = default)
         => Task.FromResult<IReadOnlyList<string>>([]);
 
+    public Task SetRemoveManyAsync(
+        string key,
+        IReadOnlyList<string> members,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    // ─────────────────────────────────────────────────────────
+    // IDerivedCache：派生缓存（fail-open 语义，noop 始终未命中）
+    // ─────────────────────────────────────────────────────────
+
+    public Task<CacheLookup<T>> TryGetAsync<T>(
+        string key,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(CacheLookup<T>.Miss);
+
+    public Task<IReadOnlyList<CacheLookup<T>>> TryGetManyAsync<T>(
+        IReadOnlyList<string> keys,
+        CancellationToken cancellationToken = default)
+    {
+        var missAll = new CacheLookup<T>[keys.Count];
+        Array.Fill(missAll, CacheLookup<T>.Miss);
+        return Task.FromResult<IReadOnlyList<CacheLookup<T>>>(missAll);
+    }
+
+    // SetAsync<T> 与 RemoveManyAsync 由 ICacheValueStore 的同名实现满足，
+    // 两接口签名一致，无需重复实现。
+
+    // ─────────────────────────────────────────────────────────
+    // IOneTimeStateStore：一次性状态（fail-closed 语义，noop 始终无状态）
+    // ─────────────────────────────────────────────────────────
+
+    public Task IssueAsync<T>(
+        string key,
+        T payload,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task<T?> TryConsumeAsync<T>(
+        string key,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<T?>(default);
+
+    public Task RestoreAsync<T>(
+        string key,
+        T payload,
+        DateTimeOffset originalExpiresAt,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task<bool> TryConsumeIfEqualAsync(
+        string key,
+        string expectedValue,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
+    public Task<string?> PeekAsync(
+        string key,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<string?>(null);
 }

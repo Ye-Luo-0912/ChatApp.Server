@@ -29,6 +29,12 @@ public sealed class AttachmentScanService(
         AttachmentScanJobStatus.Finalizing
     ];
 
+    /// <summary>P0-5.2：扫描租约时长（分钟）。Worker 心跳按 lease/3 续租，避免大文件扫描期间租约过期被重新领取。</summary>
+    public const int LeaseMinutes = 5;
+
+    /// <summary>P0-5.2：扫描租约时长。Worker 心跳按 lease/3 续租，避免大文件扫描期间租约过期被重新领取。</summary>
+    private static readonly TimeSpan Lease = TimeSpan.FromMinutes(LeaseMinutes);
+
     public async Task EnqueueAsync(
         string attachmentId,
         long userId,
@@ -74,19 +80,14 @@ public sealed class AttachmentScanService(
             userId);
     }
 
+    /// <summary>
+    /// 串行处理到期作业（测试与单次排空入口）。生产 Worker 应使用
+    /// <see cref="ClaimDueJobsAsync"/> + <see cref="ProcessClaimedJobAsync"/> 以获得有界并发与心跳续租。
+    /// </summary>
     public async Task<int> ProcessDueAsync(CancellationToken cancellationToken = default)
     {
-        var opts = options.Value;
-        var batchSize = Math.Clamp(opts.ScanBatchSize, 1, 200);
-        var maxAttempts = Math.Max(1, opts.MaxScanAttempts);
-        var now = DateTimeOffset.UtcNow;
-        var leaseTtl = TimeSpan.FromMinutes(5);
-        var owner = $"{ProcessOwner}:{Guid.NewGuid():N}";
-        if (owner.Length > 128)
-            owner = owner[..128];
-
-        var claimed = await ClaimDueJobsAsync(batchSize, owner, now, leaseTtl, cancellationToken)
-            .ConfigureAwait(false);
+        var batchSize = Math.Clamp(options.Value.ScanBatchSize, 1, 200);
+        var claimed = await ClaimDueJobsAsync(batchSize, cancellationToken).ConfigureAwait(false);
         if (claimed.Count == 0)
         {
             await PurgeOldDoneAsync(cancellationToken).ConfigureAwait(false);
@@ -96,56 +97,35 @@ public sealed class AttachmentScanService(
         var completed = 0;
         foreach (var job in claimed)
         {
-            try
-            {
-                var outcome = await ExecuteScanAsync(job, cancellationToken).ConfigureAwait(false);
-                if (outcome == ScanOutcome.Transient)
-                {
-                    await ScheduleRetryAsync(job, opts, maxAttempts, job.LastError ?? "transient_scan_failure", cancellationToken)
-                        .ConfigureAwait(false);
-                    continue;
-                }
-
-                // Confirmed / Rejected：元数据已成功写入，才允许 Done。
-                MarkDone(job, outcome == ScanOutcome.Rejected ? Truncate(job.LastError ?? "rejected", 500) : null);
-                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
+            if (await ProcessClaimedJobAsync(job, cancellationToken).ConfigureAwait(false))
                 completed++;
-            }
-            catch (Exception ex)
-            {
-                await ScheduleRetryAsync(job, opts, maxAttempts, Truncate(ex.Message, 500), cancellationToken)
-                    .ConfigureAwait(false);
-                logger.LogWarning(
-                    ex,
-                    "附件扫描瞬时失败，保留可重试 JobId={Id} AttachmentId={Aid} Attempt={Attempt}",
-                    job.Id,
-                    job.AttachmentId,
-                    job.AttemptCount);
-            }
         }
 
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await PurgeOldDoneAsync(cancellationToken).ConfigureAwait(false);
         return completed;
     }
 
-    private async Task<List<AttachmentScanJob>> ClaimDueJobsAsync(
-        int batchSize,
-        string owner,
-        DateTimeOffset now,
-        TimeSpan leaseTtl,
-        CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<AttachmentScanJob>> ClaimDueJobsAsync(
+        int batchSize, CancellationToken cancellationToken = default)
     {
-        var leaseUntil = now.Add(leaseTtl);
+        var now = DateTimeOffset.UtcNow;
+        var leaseUntil = now.Add(Lease);
+        // P0-5.2：每次领取生成唯一 owner + LeaseToken 作为 fencing token。
+        var owner = $"{ProcessOwner}:{Guid.NewGuid():N}";
+        if (owner.Length > 128)
+            owner = owner[..128];
+        var leaseToken = Guid.NewGuid().ToString("N");
+
         if (IsNpgsql())
         {
             var claimedIds = await ClaimDueJobIdsNpgsqlAsync(
-                    batchSize, owner, now, leaseUntil, cancellationToken)
+                    batchSize, owner, leaseToken, now, leaseUntil, cancellationToken)
                 .ConfigureAwait(false);
             if (claimedIds.Count == 0)
                 return [];
 
             return await db.AttachmentScanJobs
+                .AsNoTracking()
                 .Where(j => claimedIds.Contains(j.Id))
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
@@ -171,11 +151,60 @@ public sealed class AttachmentScanService(
         {
             job.Status = AttachmentScanJobStatus.Processing;
             job.LeaseOwner = owner;
+            job.LeaseToken = leaseToken;
             job.LeaseExpiresAt = leaseUntil;
         }
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return due;
+    }
+
+    /// <summary>
+    /// 处理单个已领取作业。执行内容扫描与元数据写入，随后以 LeaseToken fencing 落终态。
+    /// 租约已易主（被重新领取）时终态更新命中 0 行，返回 false 且不重复写元数据终态。
+    /// </summary>
+    public async Task<bool> ProcessClaimedJobAsync(
+        AttachmentScanJob claimed, CancellationToken cancellationToken = default)
+    {
+        var maxAttempts = Math.Max(1, options.Value.MaxScanAttempts);
+
+        ScanOutcome outcome;
+        string? lastError;
+        try
+        {
+            (outcome, lastError) = await ExecuteScanAsync(claimed, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // 扫描本身异常：按瞬时失败走 fenced 重试路径，避免旧租约覆盖。
+            logger.LogWarning(
+                ex,
+                "附件扫描瞬时失败，保留可重试 JobId={Id} AttachmentId={Aid} Attempt={Attempt}",
+                claimed.Id,
+                claimed.AttachmentId,
+                claimed.AttemptCount);
+            return await ApplyTerminalAsync(
+                claimed, ScanOutcome.Transient, Truncate(ex.Message, 500), maxAttempts, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        return await ApplyTerminalAsync(claimed, outcome, lastError, maxAttempts, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public Task RenewLeaseAsync(
+        long jobId, string leaseOwner, string leaseToken, CancellationToken cancellationToken = default)
+    {
+        var until = DateTimeOffset.UtcNow.Add(Lease);
+        return db.AttachmentScanJobs
+            .Where(j => j.Id == jobId
+                && j.LeaseOwner == leaseOwner
+                && j.LeaseToken == leaseToken
+                && (j.Status == AttachmentScanJobStatus.Processing
+                    || j.Status == AttachmentScanJobStatus.Finalizing))
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(j => j.LeaseExpiresAt, until),
+                cancellationToken);
     }
 
     private bool IsNpgsql() =>
@@ -184,6 +213,7 @@ public sealed class AttachmentScanService(
     private async Task<List<long>> ClaimDueJobIdsNpgsqlAsync(
         int batchSize,
         string owner,
+        string leaseToken,
         DateTimeOffset now,
         DateTimeOffset leaseUntil,
         CancellationToken cancellationToken)
@@ -198,6 +228,7 @@ public sealed class AttachmentScanService(
             UPDATE "T_AttachmentScanJob" AS j
             SET "Status" = 'Processing',
                 "LeaseOwner" = @owner,
+                "LeaseToken" = @lease_token,
                 "LeaseExpiresAt" = @lease_until
             WHERE j."Id" IN (
                 SELECT c."Id"
@@ -217,6 +248,11 @@ public sealed class AttachmentScanService(
         pOwner.ParameterName = "owner";
         pOwner.Value = owner;
         command.Parameters.Add(pOwner);
+
+        var pToken = command.CreateParameter();
+        pToken.ParameterName = "lease_token";
+        pToken.Value = leaseToken;
+        command.Parameters.Add(pToken);
 
         var pLease = command.CreateParameter();
         pLease.ParameterName = "lease_until";
@@ -241,158 +277,272 @@ public sealed class AttachmentScanService(
         return ids;
     }
 
-    private async Task ScheduleRetryAsync(
-        AttachmentScanJob job,
-        AttachmentStorageOptions opts,
+    /// <summary>
+    /// 以 LeaseToken fencing 落终态。构建 target 快照后调用 <see cref="ApplyFencedUpdateAsync"/>：
+    /// Npgsql 走 ExecuteUpdateAsync（匹配 Id+Status(Processing/Finalizing)+LeaseOwner+LeaseToken）；
+    /// InMemory（单测）走 tracked 重载 + lease 校验 + SaveChanges。
+    /// 返回 true 表示进入终态（Done/DeadLetter），false 表示已重试为 Pending 或租约丢失。
+    /// </summary>
+    private async Task<bool> ApplyTerminalAsync(
+        AttachmentScanJob claimed,
+        ScanOutcome outcome,
+        string? lastError,
         int maxAttempts,
-        string error,
         CancellationToken cancellationToken)
     {
-        job.AttemptCount = Math.Max(1, job.AttemptCount + 1);
-        job.LastError = Truncate(error, 500);
-        job.NextAttemptAt = DateTimeOffset.UtcNow.Add(ComputeBackoff(opts, job.AttemptCount));
-        job.LeaseOwner = null;
-        job.LeaseExpiresAt = null;
-        AuthSecurityMetrics.AttachmentScan("retry");
+        var now = DateTimeOffset.UtcNow;
+        var truncatedError = lastError is null ? null : Truncate(lastError, 500);
 
-        if (job.AttemptCount < maxAttempts)
+        if (outcome is ScanOutcome.Confirmed or ScanOutcome.Rejected)
         {
-            job.Status = AttachmentScanJobStatus.Pending;
-            return;
+            var done = await ApplyFencedUpdateAsync(claimed, new TargetFields
+            {
+                Status = AttachmentScanJobStatus.Done,
+                CompletedAt = now,
+                AttemptCount = claimed.AttemptCount,
+                LastError = outcome == ScanOutcome.Rejected ? truncatedError : null,
+                NextAttemptAt = claimed.NextAttemptAt,
+                LeaseOwner = null,
+                LeaseToken = null,
+                LeaseExpiresAt = null,
+            }, cancellationToken).ConfigureAwait(false);
+            if (done)
+                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
+            return done;
         }
 
-        // 重试耗尽：必须先让 Realtime 进入 Rejected，作业才能 Done；否则 DeadLetter 以便人工/后续恢复。
-        job.Status = AttachmentScanJobStatus.Finalizing;
+        // Transient：重试或耗尽。
+        var attemptCount = Math.Max(1, claimed.AttemptCount + 1);
+        AuthSecurityMetrics.AttachmentScan("retry");
+
+        if (attemptCount < maxAttempts)
+        {
+            var nextAttemptAt = now.Add(ComputeBackoff(options.Value, attemptCount));
+            await ApplyFencedUpdateAsync(claimed, new TargetFields
+            {
+                Status = AttachmentScanJobStatus.Pending,
+                CompletedAt = claimed.CompletedAt,
+                AttemptCount = attemptCount,
+                LastError = truncatedError ?? "transient_scan_failure",
+                NextAttemptAt = nextAttemptAt,
+                LeaseOwner = null,
+                LeaseToken = null,
+                LeaseExpiresAt = null,
+            }, cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
+        // 重试耗尽：先让 Realtime 进入 Rejected，作业才 Done；元数据不可用则 DeadLetter。
         logger.LogError(
             "附件扫描重试已耗尽 JobId={Id} AttachmentId={Aid} Attempts={Attempt}",
-            job.Id,
-            job.AttachmentId,
-            job.AttemptCount);
+            claimed.Id,
+            claimed.AttachmentId,
+            attemptCount);
 
         if (!metadata.IsAvailable)
         {
-            MarkDeadLetter(job, job.LastError ?? "扫描重试已耗尽且元数据不可用");
-            return;
+            var dead = await ApplyFencedUpdateAsync(claimed, new TargetFields
+            {
+                Status = AttachmentScanJobStatus.DeadLetter,
+                CompletedAt = now,
+                AttemptCount = attemptCount,
+                LastError = Truncate(truncatedError ?? "扫描重试已耗尽且元数据不可用", 500),
+                NextAttemptAt = claimed.NextAttemptAt,
+                LeaseOwner = null,
+                LeaseToken = null,
+                LeaseExpiresAt = null,
+            }, cancellationToken).ConfigureAwait(false);
+            if (dead)
+            {
+                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
+                AuthSecurityMetrics.AttachmentScan("dead_letter");
+            }
+            return dead;
         }
 
         try
         {
             await metadata.MarkRejectedAsync(
-                    job.AttachmentId,
-                    job.UserId,
-                    job.LastError ?? "扫描重试已耗尽",
+                    claimed.AttachmentId,
+                    claimed.UserId,
+                    truncatedError ?? "扫描重试已耗尽",
                     cancellationToken)
                 .ConfigureAwait(false);
             AuthSecurityMetrics.AttachmentScan("rejected");
             AuthSecurityMetrics.AttachmentScan("exhausted");
-            MarkDone(job, job.LastError);
-            AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "扫描耗尽后 MarkRejected 失败 AttachmentId={Id}", job.AttachmentId);
-            MarkDeadLetter(job, Truncate($"exhausted_reject_failed:{ex.Message}", 500));
+            logger.LogWarning(ex, "扫描耗尽后 MarkRejected 失败 AttachmentId={Id}", claimed.AttachmentId);
+            var dead = await ApplyFencedUpdateAsync(claimed, new TargetFields
+            {
+                Status = AttachmentScanJobStatus.DeadLetter,
+                CompletedAt = now,
+                AttemptCount = attemptCount,
+                LastError = Truncate($"exhausted_reject_failed:{ex.Message}", 500),
+                NextAttemptAt = claimed.NextAttemptAt,
+                LeaseOwner = null,
+                LeaseToken = null,
+                LeaseExpiresAt = null,
+            }, cancellationToken).ConfigureAwait(false);
+            if (dead)
+            {
+                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
+                AuthSecurityMetrics.AttachmentScan("dead_letter");
+            }
+            return dead;
         }
+
+        var doneExhausted = await ApplyFencedUpdateAsync(claimed, new TargetFields
+        {
+            Status = AttachmentScanJobStatus.Done,
+            CompletedAt = now,
+            AttemptCount = attemptCount,
+            LastError = truncatedError,
+            NextAttemptAt = claimed.NextAttemptAt,
+            LeaseOwner = null,
+            LeaseToken = null,
+            LeaseExpiresAt = null,
+        }, cancellationToken).ConfigureAwait(false);
+        if (doneExhausted)
+            AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
+        return doneExhausted;
     }
 
-    private async Task<ScanOutcome> ExecuteScanAsync(
-        AttachmentScanJob job,
+    /// <summary>终态字段快照（仅 AttachmentScanJob 的可变字段）。</summary>
+    private sealed class TargetFields
+    {
+        public string Status { get; set; } = string.Empty;
+        public DateTimeOffset? CompletedAt { get; set; }
+        public int AttemptCount { get; set; }
+        public string? LastError { get; set; }
+        public DateTimeOffset NextAttemptAt { get; set; }
+        public string? LeaseOwner { get; set; }
+        public string? LeaseToken { get; set; }
+        public DateTimeOffset? LeaseExpiresAt { get; set; }
+    }
+
+    /// <summary>
+    /// Fenced 终态更新。Npgsql：ExecuteUpdateAsync 匹配 Id+Status(Processing/Finalizing)+LeaseOwner+LeaseToken，命中 1 行返回 true。
+    /// InMemory：重载 tracked 实体校验 lease 后写回 target 字段 + SaveChanges（单测单线程）。
+    /// </summary>
+    private async Task<bool> ApplyFencedUpdateAsync(
+        AttachmentScanJob claimed, TargetFields target, CancellationToken cancellationToken)
+    {
+        if (!IsNpgsql())
+        {
+            var tracked = await db.AttachmentScanJobs
+                .FirstOrDefaultAsync(j => j.Id == claimed.Id, cancellationToken)
+                .ConfigureAwait(false);
+            if (tracked is null
+                || tracked.LeaseOwner != claimed.LeaseOwner
+                || tracked.LeaseToken != claimed.LeaseToken
+                || (tracked.Status != AttachmentScanJobStatus.Processing
+                    && tracked.Status != AttachmentScanJobStatus.Finalizing))
+                return false;
+
+            tracked.Status = target.Status;
+            tracked.CompletedAt = target.CompletedAt;
+            tracked.AttemptCount = target.AttemptCount;
+            tracked.LastError = target.LastError;
+            tracked.NextAttemptAt = target.NextAttemptAt;
+            tracked.LeaseOwner = target.LeaseOwner;
+            tracked.LeaseToken = target.LeaseToken;
+            tracked.LeaseExpiresAt = target.LeaseExpiresAt;
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        var n = await db.AttachmentScanJobs
+            .Where(j => j.Id == claimed.Id
+                && (j.Status == AttachmentScanJobStatus.Processing
+                    || j.Status == AttachmentScanJobStatus.Finalizing)
+                && j.LeaseOwner == claimed.LeaseOwner
+                && j.LeaseToken == claimed.LeaseToken)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(j => j.Status, target.Status)
+                .SetProperty(j => j.CompletedAt, target.CompletedAt)
+                .SetProperty(j => j.AttemptCount, target.AttemptCount)
+                .SetProperty(j => j.LastError, target.LastError)
+                .SetProperty(j => j.NextAttemptAt, target.NextAttemptAt)
+                .SetProperty(j => j.LeaseOwner, target.LeaseOwner)
+                .SetProperty(j => j.LeaseToken, target.LeaseToken)
+                .SetProperty(j => j.LeaseExpiresAt, target.LeaseExpiresAt),
+                cancellationToken)
+            .ConfigureAwait(false);
+        return n == 1;
+    }
+
+    private async Task<(ScanOutcome Outcome, string? LastError)> ExecuteScanAsync(
+        AttachmentScanJob claimed,
         CancellationToken cancellationToken)
     {
         var (ok, sniffedType, error, transient) = await ScanContentAsync(
-                job.ObjectKey,
-                job.ContentType,
-                job.OriginalName,
-                job.SizeBytes,
+                claimed.ObjectKey,
+                claimed.ContentType,
+                claimed.OriginalName,
+                claimed.SizeBytes,
                 cancellationToken)
             .ConfigureAwait(false);
 
         if (transient)
         {
-            job.LastError = Truncate(error ?? "transient", 500);
-            return ScanOutcome.Transient;
+            return (ScanOutcome.Transient, Truncate(error ?? "transient", 500));
         }
-
-        job.Status = AttachmentScanJobStatus.Finalizing;
-        job.LeaseExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
 
         if (!ok)
         {
-            job.LastError = Truncate(error ?? "rejected", 500);
+            var rejectError = Truncate(error ?? "rejected", 500);
             if (!metadata.IsAvailable)
             {
-                job.LastError = Truncate("rejected_but_metadata_unavailable", 500);
-                return ScanOutcome.Transient;
+                return (ScanOutcome.Transient, Truncate("rejected_but_metadata_unavailable", 500));
             }
 
             try
             {
                 await metadata.MarkRejectedAsync(
-                        job.AttachmentId, job.UserId, job.LastError, cancellationToken)
+                        claimed.AttachmentId, claimed.UserId, rejectError, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                job.LastError = Truncate($"reject_metadata_failed:{ex.Message}", 500);
-                return ScanOutcome.Transient;
+                return (ScanOutcome.Transient, Truncate($"reject_metadata_failed:{ex.Message}", 500));
             }
 
             AuthSecurityMetrics.AttachmentScan("rejected");
-            return ScanOutcome.Rejected;
+            return (ScanOutcome.Rejected, rejectError);
         }
 
         if (!metadata.IsAvailable)
         {
-            job.LastError = "metadata_unavailable";
-            return ScanOutcome.Transient;
+            return (ScanOutcome.Transient, "metadata_unavailable");
         }
 
         var finalContentType = sniffedType
-                               ?? (string.IsNullOrWhiteSpace(job.ContentType)
+                               ?? (string.IsNullOrWhiteSpace(claimed.ContentType)
                                    ? "application/octet-stream"
-                                   : job.ContentType);
+                                   : claimed.ContentType);
 
         try
         {
             await metadata.ConfirmAsync(
-                    job.AttachmentId,
-                    job.UserId,
-                    job.ObjectKey,
+                    claimed.AttachmentId,
+                    claimed.UserId,
+                    claimed.ObjectKey,
                     publicUrl: null,
                     contentType: finalContentType,
-                    sizeBytes: job.SizeBytes,
-                    originalName: job.OriginalName,
+                    sizeBytes: claimed.SizeBytes,
+                    originalName: claimed.OriginalName,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            job.LastError = Truncate($"confirm_metadata_failed:{ex.Message}", 500);
-            return ScanOutcome.Transient;
+            return (ScanOutcome.Transient, Truncate($"confirm_metadata_failed:{ex.Message}", 500));
         }
 
         AuthSecurityMetrics.AttachmentScan("confirmed");
-        return ScanOutcome.Confirmed;
-    }
-
-    private static void MarkDone(AttachmentScanJob job, string? lastError)
-    {
-        job.Status = AttachmentScanJobStatus.Done;
-        job.CompletedAt = DateTimeOffset.UtcNow;
-        job.LeaseOwner = null;
-        job.LeaseExpiresAt = null;
-        job.LastError = lastError;
-    }
-
-    private static void MarkDeadLetter(AttachmentScanJob job, string error)
-    {
-        job.Status = AttachmentScanJobStatus.DeadLetter;
-        job.CompletedAt = DateTimeOffset.UtcNow;
-        job.LeaseOwner = null;
-        job.LeaseExpiresAt = null;
-        job.LastError = Truncate(error, 500);
-        AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
-        AuthSecurityMetrics.AttachmentScan("dead_letter");
+        return (ScanOutcome.Confirmed, null);
     }
 
     private async Task PurgeOldDoneAsync(CancellationToken cancellationToken)

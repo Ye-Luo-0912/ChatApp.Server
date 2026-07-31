@@ -152,6 +152,8 @@ namespace Infrastructure.Data
                 e.Property(x => x.ObjectKey).HasMaxLength(512);
                 e.Property(x => x.Error).HasMaxLength(500);
                 e.Property(x => x.LeaseOwner).HasMaxLength(64);
+                // P0-5.2：LeaseToken fencing 列，与 LeaseOwner 同时匹配以保证只有当前持有者能落终态。
+                e.Property(x => x.LeaseToken).HasMaxLength(64);
                 e.HasIndex(x => new { x.Status, x.LeaseUntil, x.CreatedAt })
                     .HasDatabaseName("IX_DataExportJob_Claim");
                 e.HasIndex(x => new { x.UserId, x.Status, x.CreatedAt })
@@ -193,6 +195,7 @@ namespace Infrastructure.Data
                 e.Property(x => x.Status).HasMaxLength(32).IsRequired();
                 e.Property(x => x.LastError).HasMaxLength(500);
                 e.Property(x => x.LeaseOwner).HasMaxLength(128);
+                e.Property(x => x.LeaseToken).HasMaxLength(64);
                 e.HasIndex(x => new { x.Status, x.NextAttemptAt })
                     .HasDatabaseName("IX_AttachmentScanJob_Due");
                 e.HasIndex(x => x.AttachmentId)

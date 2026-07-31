@@ -188,6 +188,28 @@ public sealed class RedisCacheStore : ICacheValueStore, IAtomicCacheStore, ICach
             cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>批量删除：单次 DEL 多键，减少往返。</summary>
+    public async Task RemoveManyAsync(
+        IReadOnlyList<string> keys,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(keys);
+        if (keys.Count == 0)
+            return;
+
+        var redisKeys = new RedisKey[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+        {
+            if (!string.IsNullOrEmpty(keys[i]))
+                redisKeys[i] = NormalizeKey(keys[i]);
+        }
+
+        _ = await ExecuteAsync(
+            "key.delete_many",
+            () => _db.KeyDeleteAsync(redisKeys),
+            cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<bool> StringSetIfNotExistsAsync(
         string key,
         string value,
@@ -378,6 +400,42 @@ public sealed class RedisCacheStore : ICacheValueStore, IAtomicCacheStore, ICach
             : AtomicConsumeResult<TResult>.Fail();
     }
 
+    public async Task<long[]> EvaluateScriptAsync(
+        string script,
+        IReadOnlyList<string> keys,
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(script);
+        ArgumentNullException.ThrowIfNull(keys);
+        ArgumentNullException.ThrowIfNull(args);
+
+        var redisKeys = new RedisKey[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+            redisKeys[i] = NormalizeKey(keys[i]);
+
+        var redisArgs = new RedisValue[args.Count];
+        for (var i = 0; i < args.Count; i++)
+            redisArgs[i] = args[i];
+
+        var result = await ExecuteAsync(
+            "script.evaluate",
+            () => _db.ScriptEvaluateAsync(script, redisKeys, redisArgs),
+            cancellationToken).ConfigureAwait(false);
+
+        if (result.IsNull)
+            return [];
+
+        var arr = (RedisResult[]?)result;
+        if (arr is null || arr.Length == 0)
+            return [];
+
+        var longs = new long[arr.Length];
+        for (var i = 0; i < arr.Length; i++)
+            longs[i] = (long)arr[i];
+        return longs;
+    }
+
     public async Task SetAddAsync(
         string key,
         string member,
@@ -441,6 +499,26 @@ public sealed class RedisCacheStore : ICacheValueStore, IAtomicCacheStore, ICach
         for (var i = 0; i < members.Length; i++)
             result[i] = members[i].ToString();
         return result;
+    }
+
+    /// <summary>批量 SREM：单次移除多个成员，减少往返。</summary>
+    public async Task SetRemoveManyAsync(
+        string key,
+        IReadOnlyList<string> members,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(members);
+        if (string.IsNullOrEmpty(key) || members.Count == 0)
+            return;
+
+        var values = new RedisValue[members.Count];
+        for (var i = 0; i < members.Count; i++)
+            values[i] = members[i];
+
+        _ = await ExecuteAsync(
+            "set.remove_many",
+            () => _db.SetRemoveAsync(NormalizeKey(key), values),
+            cancellationToken).ConfigureAwait(false);
     }
 
     private string NormalizeKey(string key) =>

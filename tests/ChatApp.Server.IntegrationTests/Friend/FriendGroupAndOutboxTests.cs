@@ -21,7 +21,7 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
 
         await using var db = postgres.CreateContext();
-        var friendship = new FriendshipService(db, redis.Cache, NullLogger<FriendshipService>.Instance);
+        var friendship = new FriendshipService(db, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
 
         var ownerId = new TsidGeneratorService().GenerateTsid();
         var otherId = new TsidGeneratorService().GenerateTsid();

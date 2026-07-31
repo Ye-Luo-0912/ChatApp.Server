@@ -49,6 +49,7 @@ const BASE_URL = (__ENV.BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
 const BASE_URL_A = (__ENV.BASE_URL_A || BASE_URL).replace(/\/$/, '');
 const BASE_URL_B = (__ENV.BASE_URL_B || BASE_URL).replace(/\/$/, '');
 const LOGIN_RATIO = Number(__ENV.LOGIN_RATIO || 0.1); // steady/soak: 默认 ≤10% 登录
+const REFRESH_RATIO = Number(__ENV.REFRESH_RATIO || 0.05); // steady/soak: 默认 ≤5% 刷新
 
 const users = new SharedArray('users', () => {
   if (__ENV.CREDS_FILE) return JSON.parse(open(__ENV.CREDS_FILE));
@@ -68,6 +69,10 @@ const tokens = new SharedArray('tokens', () => {
 const isChurn = PROFILE === 'device_churn' || PROFILE === 'mixed';
 const isAuthCapacity = PROFILE === 'auth_capacity';
 const isSteadyLike = PROFILE === 'steady' || PROFILE === 'soak';
+
+// VU 级会话状态：跨迭代保持令牌，refresh 成功后写回新令牌，避免无效刷新风暴。
+// k6 中每个 VU 有独立 JS 上下文，全局对象天然按 VU 隔离。
+const vuSessions = {};
 
 const profiles = {
   steady: {
@@ -216,14 +221,23 @@ function doLogin(headers) {
   };
 }
 
-function authedReads(headers, accessToken, refreshToken, userId) {
+// 执行已认证读取 + 可选 refresh。
+// refresh 成功时返回新令牌，调用方据此更新 VU 级会话状态。
+function authedReads(headers, accessToken, refreshToken, userId, doRefresh) {
   const auth = Object.assign({}, headers, { Authorization: `Bearer ${accessToken}` });
+  let newAccessToken = accessToken;
+  let newRefreshToken = refreshToken;
 
   group('me', () => {
     const res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
     meTrend.add(res.timings.duration);
     const ok = check(res, { 'me 200': (r) => r.status === 200 });
     errorRate.add(!ok);
+    // AT 失效或被撤销：清除会话以触发下次迭代重新登录
+    if (res.status === 401 || res.status === 403) {
+      newAccessToken = '';
+      newRefreshToken = '';
+    }
   });
 
   group('friends', () => {
@@ -265,17 +279,28 @@ function authedReads(headers, accessToken, refreshToken, userId) {
     errorRate.add(!ok);
   });
 
-  group('refresh', () => {
-    if (!refreshToken || !userId) return;
-    const res = http.post(
-      `${BASE_URL}/api/auth/refresh-token`,
-      `{"userId":${userId},"refreshToken":${JSON.stringify(refreshToken)}}`,
-      { headers, tags: { endpoint: 'refresh' } },
-    );
-    refreshTrend.add(res.timings.duration);
-    const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
-    errorRate.add(!ok);
-  });
+  if (doRefresh && refreshToken && userId) {
+    group('refresh', () => {
+      const res = http.post(
+        `${BASE_URL}/api/auth/refresh-token`,
+        `{"userId":${userId},"refreshToken":${JSON.stringify(refreshToken)}}`,
+        { headers, tags: { endpoint: 'refresh' } },
+      );
+      refreshTrend.add(res.timings.duration);
+      const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
+      errorRate.add(!ok);
+      // 刷新成功后写回新令牌，避免下次迭代用已消费的旧 refresh token
+      if (res.status === 200) {
+        try {
+          const body = res.json();
+          if (body.accessToken) newAccessToken = body.accessToken;
+          if (body.refreshToken) newRefreshToken = body.refreshToken;
+        } catch (e) { /* 解析失败保留旧令牌 */ }
+      }
+    });
+  }
+
+  return { accessToken: newAccessToken, refreshToken: newRefreshToken, userId };
 }
 
 export default function () {
@@ -301,38 +326,47 @@ export default function () {
       session = doLogin(headers);
     });
     if (session.accessToken) {
-      authedReads(headers, session.accessToken, session.refreshToken, session.userId);
+      authedReads(headers, session.accessToken, session.refreshToken, session.userId, false);
     }
     sleep(Number(__ENV.THINK || 0.2));
     return;
   }
 
-  // steady / soak：固定设备；默认 ≥90% 已认证流量
+  // steady / soak：VU 级会话跨迭代保持，refresh 成功后写回新令牌
   const forceLogin = Math.random() < LOGIN_RATIO;
-  let accessToken = '';
-  let refreshToken = '';
-  let userId = '';
+  const doRefresh = Math.random() < REFRESH_RATIO;
 
-  const preset = pickToken();
-  if (!forceLogin && preset && preset.accessToken) {
-    accessToken = preset.accessToken;
-    refreshToken = preset.refreshToken || '';
-    userId = preset.userId || '';
-  } else {
-    group('login', () => {
-      const session = doLogin(headers);
-      accessToken = session.accessToken;
-      refreshToken = session.refreshToken;
-      userId = session.userId;
-    });
+  // 首次迭代或会话丢失时初始化
+  if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
+    if (!forceLogin) {
+      const preset = pickToken();
+      if (preset && preset.accessToken) {
+        vuSessions[__VU] = {
+          accessToken: preset.accessToken,
+          refreshToken: preset.refreshToken || '',
+          userId: preset.userId || '',
+        };
+      }
+    }
+    // 无预设令牌或强制登录时走 login
+    if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
+      group('login', () => {
+        vuSessions[__VU] = doLogin(headers);
+      });
+    }
   }
 
-  if (!accessToken) {
+  if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
     sleep(0.5);
     return;
   }
 
-  authedReads(headers, accessToken, refreshToken, userId);
+  const s = vuSessions[__VU];
+  const updated = authedReads(headers, s.accessToken, s.refreshToken, s.userId, doRefresh);
+
+  // 写回更新后的令牌（refresh 成功时为新令牌，me 401 时为空触发重新登录）
+  vuSessions[__VU] = updated;
+
   sleep(Number(__ENV.THINK || 0.2));
 }
 

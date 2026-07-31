@@ -68,14 +68,22 @@ jobs:
             sleep 2
           done
 
-      - name: Start Redis (standalone for tests; compose gate validates Garnet)
+      # P0-6: 使用真实 Garnet 1.0.84（而非 redis:7.2）运行集成测试，
+      # 验证 Lua 脚本在 --lua-transaction-mode 下的原子性契约。
+      # compose gate 仍独立验证带 AOF/持久化的完整生产配置。
+      - name: Start Garnet (real Garnet 1.0.84 with --lua-transaction-mode)
         run: |
           docker rm -f chatapp_garnet || true
-          docker run -d --name chatapp_garnet -p 6379:6379 \
-            redis:7.2 \
-            redis-server --bind 0.0.0.0 --port 6379 --appendonly yes
-          sleep 2
-          docker exec chatapp_garnet redis-cli PING
+          docker run -d --name chatapp_garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 \
+            --bind 0.0.0.0 --port 6379 --lua --lua-transaction-mode
+          for i in $(seq 1 15); do
+            if docker exec chatapp_garnet bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              echo "Garnet is ready"
+              break
+            fi
+            sleep 1
+          done
 
       - name: Release build
         working-directory: ChatApp.Server

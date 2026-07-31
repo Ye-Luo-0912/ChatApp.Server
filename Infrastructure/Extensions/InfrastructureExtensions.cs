@@ -64,6 +64,9 @@ public static class InfrastructureExtensions
             services.AddSingleton<ICacheValueStore>(sp => sp.GetRequiredService<RedisCacheStore>());
             services.AddSingleton<IAtomicCacheStore>(sp => sp.GetRequiredService<RedisCacheStore>());
             services.AddSingleton<ICacheSetStore>(sp => sp.GetRequiredService<RedisCacheStore>());
+            // PR2: 语义边界接口——派生缓存（fail-open）与一次性状态（fail-closed）
+            services.AddSingleton<IDerivedCache, GarnetDerivedCache>();
+            services.AddSingleton<IOneTimeStateStore, GarnetOneTimeStateStore>();
             return services;
         }
 
