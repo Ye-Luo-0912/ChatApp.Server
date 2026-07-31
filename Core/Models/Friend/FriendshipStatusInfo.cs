@@ -20,4 +20,9 @@ public class FriendshipStatusInfo
     /// 如果双方都确认了好友关系，该属性值为 true；否则为 false。
     /// </summary>
     public bool IsMutual { get; set; }
+
+    /// <summary>
+    /// 任一方向存在 BlockRecord。该信号必须在好友/共享会话成员授权之前优先拒绝。
+    /// </summary>
+    public bool IsBlocked { get; set; }
 }

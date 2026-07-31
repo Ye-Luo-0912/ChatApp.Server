@@ -80,6 +80,25 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
         Assert.Null(second);
     }
 
+    [Fact]
+    public async Task IssueRefreshTokensAsync_SecurityVersionMismatch_RejectsOrphanedRefreshToken()
+    {
+        const string deviceId = "device-security-version";
+        const long userId = 7007;
+
+        var tokenService = CreateTokenService(deviceId);
+        var user = new ApplicationUser { Id = userId, UserName = "version-user" };
+        IList<string> roles = ["User"];
+
+        var login = await tokenService.IssueLoginTokensAsync(user, roles);
+        user.AdvanceSecurityVersion();
+
+        var rotated = await tokenService.IssueRefreshTokensAsync(
+            userId.ToString(), login.RefreshToken, user, roles);
+
+        Assert.Null(rotated);
+    }
+
     private TokenService CreateTokenService(string deviceId)
     {
         var jwt = Options.Create(new JwtSettings

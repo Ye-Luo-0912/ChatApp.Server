@@ -57,7 +57,7 @@ export default function () {
     {
       headers: {
         'Content-Type': 'application/json',
-        'X-Device-Id': `k6-login-${__VU}`,
+        'X-Installation-Id': `k6-login-installation-${String(__VU).padStart(6, '0')}`,
         'X-Correlation-Id': `login-${__VU}-${__ITER}`,
       },
     },

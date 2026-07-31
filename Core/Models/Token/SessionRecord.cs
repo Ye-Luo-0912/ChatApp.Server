@@ -53,6 +53,9 @@ public sealed class SessionRecord
     /// <summary>所属会话的唯一标识，跟随刷新令牌轮换继承。</summary>
     public string? SessionId { get; set; }
 
+    /// <summary>服务端设备凭据摘要；不保存可直接用于认证的明文。</summary>
+    public string? DeviceCredentialHash { get; set; }
+
     /// <summary>当前活跃访问令牌的 Redis 键（<c>AT:{hash}</c>）；撤销会话时用于同步删除访问令牌。</summary>
     public string? CurrentAccessTokenKey { get; set; }
 
@@ -60,6 +63,9 @@ public sealed class SessionRecord
     public string? CurrentRefreshTokenKey { get; set; }
     /// <summary>令牌轮换次数（每次 Rotate +1），与 <see cref="RefreshToken.RefreshCount"/> 保持同步。</summary>
     public int RefreshCount { get; set; }
+
+    /// <summary>建立会话时的用户认证快照版本。</summary>
+    public long SecurityVersion { get; set; }
 
     /// <summary>会话是否仍处于活跃状态（主动注销后置 <see langword="false"/>）。</summary>
     public bool IsActive { get; set; } = true;

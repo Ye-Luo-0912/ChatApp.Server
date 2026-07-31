@@ -1,9 +1,13 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
+using Core.Settings;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
@@ -12,6 +16,7 @@ public class GeoLocationService : IGeoLocationService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GeoLocationService> _logger;
     private readonly IDerivedCache _cache;
+    private readonly byte[] _cacheKeySecret;
 
     private const string HttpClientName = nameof(GeoLocationService);
     private const string CacheKeyPrefix = "geo:ip:";
@@ -19,23 +24,32 @@ public class GeoLocationService : IGeoLocationService
     private static readonly TimeSpan UnknownCacheTtl = TimeSpan.FromHours(1);
     private const int MaxRetries = 3;
 
-    public GeoLocationService(IHttpClientFactory httpClientFactory, ILogger<GeoLocationService> logger, IDerivedCache cache)
+    public GeoLocationService(
+        IHttpClientFactory httpClientFactory,
+        ILogger<GeoLocationService> logger,
+        IDerivedCache cache,
+        IOptions<SecurityOptions> securityOptions)
     {
         _httpClientFactory = httpClientFactory;
         _logger = logger;
         _cache = cache;
+        var secret = securityOptions.Value.SecretEncryptionKey;
+        _cacheKeySecret = string.IsNullOrWhiteSpace(secret)
+            ? SHA256.HashData(Encoding.UTF8.GetBytes("ChatApp.GeoLocation.CacheKey.v1"))
+            : SHA256.HashData(Encoding.UTF8.GetBytes(secret));
     }
 
     public async Task<string?> GetLocationAsync(string? clientIp, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(clientIp) || !IsValidPublicIp(clientIp))
         {
-            _logger.LogDebug("Private or invalid IP skipped: {IP}", clientIp);
+            _logger.LogDebug("Private or invalid IP skipped: {IpRef}", SafeIpReference(clientIp));
             return "未知";
         }
 
         // 优先读缓存，避免重复调用外部 API（IDerivedCache 内置 fail-open，连接失败视为未命中）
-        var cacheKey = CacheKeyPrefix + clientIp;
+        // 不把原始 IP 写入 Redis key；使用服务端密钥 HMAC，避免日志/缓存泄露可回溯的完整地址。
+        var cacheKey = CacheKeyPrefix + ComputeIpReference(clientIp);
         var cached = await _cache.TryGetAsync<string>(cacheKey, cancellationToken).ConfigureAwait(false);
         if (cached.Found && cached.Value is not null)
             return cached.Value;
@@ -69,8 +83,8 @@ public class GeoLocationService : IGeoLocationService
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    _logger.LogWarning("Geolocation API returned HTTP {StatusCode} for IP {IP}",
-                        (int)response.StatusCode, clientIp);
+                    _logger.LogWarning("Geolocation API returned HTTP {StatusCode} for IpRef {IpRef}",
+                        (int)response.StatusCode, SafeIpReference(clientIp));
                     return "未知"; // HTTP 错误不重试
                 }
 
@@ -85,15 +99,15 @@ public class GeoLocationService : IGeoLocationService
             {
                 if (attempt == MaxRetries)
                 {
-                    _logger.LogError(ex, "Geolocation failed after {MaxRetries} attempts for IP: {IP}",
-                        MaxRetries, clientIp);
+                    _logger.LogError(ex, "Geolocation failed after {MaxRetries} attempts for IpRef {IpRef}",
+                        MaxRetries, SafeIpReference(clientIp));
                     return null; // 返回 null 表示网络故障，跳过缓存
                 }
 
                 var delay = TimeSpan.FromMilliseconds(150 * attempt);
                 _logger.LogWarning(ex,
-                    "Geolocation attempt {Attempt}/{MaxRetries} failed for IP {IP}, retrying in {DelayMs}ms",
-                    attempt, MaxRetries, clientIp, (int)delay.TotalMilliseconds);
+                    "Geolocation attempt {Attempt}/{MaxRetries} failed for IpRef {IpRef}, retrying in {DelayMs}ms",
+                    attempt, MaxRetries, SafeIpReference(clientIp), (int)delay.TotalMilliseconds);
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -102,7 +116,7 @@ public class GeoLocationService : IGeoLocationService
     }
 
     /// <summary>
-    /// 解析 ip-api.com 响应 JSON，使用 TryGetProperty 避免异常控制流。
+    /// 解析 GeoIP 响应 JSON，使用 TryGetProperty 避免异常控制流。
     /// </summary>
     private string ParseLocation(string json, string clientIp)
     {
@@ -114,8 +128,8 @@ public class GeoLocationService : IGeoLocationService
             if (!root.TryGetProperty("status", out var statusProp) ||
                 statusProp.GetString() != "success")
             {
-                _logger.LogWarning("Geolocation API returned non-success for IP {IP}: {Response}",
-                    clientIp, json);
+                _logger.LogWarning("Geolocation API returned non-success for IpRef {IpRef}",
+                    SafeIpReference(clientIp));
                 return "未知";
             }
 
@@ -128,10 +142,16 @@ public class GeoLocationService : IGeoLocationService
         }
         catch (JsonException ex)
         {
-            _logger.LogError(ex, "Failed to parse geolocation response for IP: {IP}", clientIp);
+            _logger.LogError(ex, "Failed to parse geolocation response for IpRef {IpRef}", SafeIpReference(clientIp));
             return "未知";
         }
     }
+
+    private string ComputeIpReference(string ip)
+        => Convert.ToHexString(HMACSHA256.HashData(_cacheKeySecret, Encoding.UTF8.GetBytes(ip)))[..32];
+
+    private string SafeIpReference(string? ip)
+        => string.IsNullOrWhiteSpace(ip) ? "none" : ComputeIpReference(ip);
 
     /// <summary>
     /// 过滤私有地址、回环、链路本地等非公网 IP。

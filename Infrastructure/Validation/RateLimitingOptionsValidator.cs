@@ -80,6 +80,11 @@ public sealed class RateLimitingOptionsValidator : IValidateOptions<RateLimiting
             failures.Add("RateLimiting:UserSensitiveWindowSeconds 必须大于 0。");
         }
 
+        if (options.ClusterShardCount <= 0 || options.ClusterShardCount > 1024)
+        {
+            failures.Add("RateLimiting:ClusterShardCount 必须在 1 到 1024 之间。");
+        }
+
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);

@@ -25,7 +25,21 @@ public class ApplicationUser
 
     // ---------- 安全戳（用于并发保护） ----------
     public string? SecurityStamp { get; set; }
+    /// <summary>
+    /// 认证快照的单调递增版本。密码、角色、封禁和其它会话安全边界变化时递增，
+    /// 用于给 AT/RT/Session 打版本栅栏，避免孤立缓存记录继续被轮换。
+    /// </summary>
+    public long SecurityVersion { get; set; } = 1;
     public string? ConcurrencyStamp { get; set; } = Guid.NewGuid().ToString();
+
+    /// <summary>推进认证快照版本；避免版本溢出后回绕为有效的旧版本。</summary>
+    public void AdvanceSecurityVersion()
+    {
+        if (SecurityVersion == long.MaxValue)
+            throw new InvalidOperationException("SecurityVersion 已达到最大值，无法继续推进");
+
+        SecurityVersion = Math.Max(1, SecurityVersion + 1);
+    }
 
     // ---------- 手机 ----------
     public string? PhoneNumber { get; set; }

@@ -2,6 +2,7 @@ using System.Security.Claims;
 using System.Text.Encodings.Web;
 using Core.Exceptions;
 using Core.Interfaces.Auth;
+using Core.Models.Token;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -37,13 +38,27 @@ public sealed class OpaqueTokenAuthHandler(
         if (!Request.Headers.TryGetValue("Authorization", out var headerValues))
             return AuthenticateResult.NoResult();
 
-        var header = headerValues.ToString();
-        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        if (headerValues.Count == 0)
             return AuthenticateResult.NoResult();
 
-        var token = header["Bearer ".Length..].Trim();
-        if (string.IsNullOrEmpty(token))
+        // 只保留一次 token 字符串分配：避免 StringValues.ToString() 后再切片复制。
+        var header = headerValues[0];
+        var headerSpan = header.AsSpan();
+        const string bearerPrefix = "Bearer ";
+        if (headerSpan.Length <= bearerPrefix.Length
+            || !headerSpan.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase))
             return AuthenticateResult.NoResult();
+
+        var tokenSpan = headerSpan[bearerPrefix.Length..].Trim();
+        if (tokenSpan.IsEmpty)
+            return AuthenticateResult.NoResult();
+
+        // access token 始终由 Generate(16) 产生。先校验长度和 Base64url 字符集，
+        // 避免任意长 Authorization header 进入 Redis key 哈希路径。
+        if (!OpaqueTokenFormat.IsAccessToken(tokenSpan))
+            return AuthenticateResult.Fail("令牌格式无效");
+
+        var token = tokenSpan.ToString();
 
         try
         {
@@ -70,8 +85,11 @@ public sealed class OpaqueTokenAuthHandler(
             if (data.DeviceIdHash is { } didh)
                 claims.Add(new Claim(Core.Models.Auth.AuthClaimTypes.DeviceIdHash, didh.ToString("x16")));
 
-            if (data.Roles is not null)
-                claims.AddRange(data.Roles.Select(role => new Claim(ClaimTypes.Role, role)));
+            if (data.Roles is { Length: > 0 } roles)
+            {
+                foreach (var role in roles)
+                    claims.Add(new Claim(ClaimTypes.Role, role));
+            }
 
             var identity = new ClaimsIdentity(claims, Scheme.Name);
             var principal = new ClaimsPrincipal(identity);

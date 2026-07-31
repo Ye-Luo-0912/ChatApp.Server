@@ -279,6 +279,7 @@ public partial class UserAccountService(
             user.NormalizedPendingEmail = null;
             user.PendingEmailRequestedAt = null;
             user.SecurityStamp = Guid.NewGuid().ToString();
+            user.AdvanceSecurityVersion();
 
             var ok = await userRepository.UpdateAsync(user, cancellationToken);
             if (!ok)
@@ -356,6 +357,7 @@ public partial class UserAccountService(
 
             user.PasswordHash = await passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
             user.SecurityStamp = Guid.NewGuid().ToString();
+            user.AdvanceSecurityVersion();
             user.AccessFailedCount = 0;
             user.MustChangePassword = false;
 
@@ -399,6 +401,7 @@ public partial class UserAccountService(
         user.LockoutEnabled = true;
         user.LockoutEnd = DateTimeOffset.MaxValue;
         user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AdvanceSecurityVersion();
 
         var ok = await userRepository.UpdateAsync(user, cancellationToken);
         if (!ok)
@@ -424,6 +427,7 @@ public partial class UserAccountService(
         user.LockoutEnd = null;
         user.AccessFailedCount = 0;
         user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AdvanceSecurityVersion();
 
         var ok = await userRepository.UpdateAsync(user, cancellationToken);
         if (!ok)
@@ -547,8 +551,7 @@ public partial class UserAccountService(
     public async Task<AuthOperationResult?> ReportNotMeAsync(
         long userId, long securityEventId, CancellationToken cancellationToken = default)
     {
-        var page = await userRepository.ListSecurityEventsAsync(userId, null, 200, cancellationToken);
-        var evt = page.Items.FirstOrDefault(e => e.Id == securityEventId);
+        var evt = await userRepository.GetSecurityEventAsync(userId, securityEventId, cancellationToken);
         if (evt is null)
             return AuthOperationResult.Fail("NotFound", "安全事件不存在");
 
@@ -562,6 +565,7 @@ public partial class UserAccountService(
         await trustedDevices.RevokeAllAsync(userId, cancellationToken);
         user.MustChangePassword = true;
         user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AdvanceSecurityVersion();
         await userRepository.UpdateAsync(user, cancellationToken);
 
         await securityEventStore.RecordAsync(
@@ -579,8 +583,7 @@ public partial class UserAccountService(
     public async Task<AuthOperationResult?> RejectSuspiciousLoginAsync(
         long userId, long securityEventId, CancellationToken cancellationToken = default)
     {
-        var page = await userRepository.ListSecurityEventsAsync(userId, null, 200, cancellationToken);
-        var evt = page.Items.FirstOrDefault(e => e.Id == securityEventId);
+        var evt = await userRepository.GetSecurityEventAsync(userId, securityEventId, cancellationToken);
         if (evt is null)
             return AuthOperationResult.Fail("NotFound", "安全事件不存在");
 
@@ -591,7 +594,7 @@ public partial class UserAccountService(
         var user = await userRepository.FindByIdAsync(userId, cancellationToken);
         if (user is null) return null;
 
-        // 优先撤销该次登录的设备会话；Detail 中若含 session= 则一并记录。
+        // 优先撤销该次登录的设备会话；SessionId 是结构化列，不再从 Detail 解析。
         if (!string.IsNullOrWhiteSpace(evt.DeviceId))
             await sessionStore.RevokeSessionAsync(userId.ToString(), evt.DeviceId, cancellationToken);
 
@@ -606,11 +609,11 @@ public partial class UserAccountService(
             }
         }
 
-        var sessionHint = ExtractSessionId(evt.Detail);
         await securityEventStore.RecordAsync(
             userId, SecurityEventType.LoginRejected, evt.DeviceId, evt.ClientIp,
-            detail: $"sourceEvent={securityEventId};session={sessionHint ?? "-"}",
-            cancellationToken: cancellationToken);
+            detail: $"sourceEvent={securityEventId}",
+            cancellationToken: cancellationToken,
+            sessionId: evt.SessionId);
 
         await securityNotifications.NotifyAsync(
             userId, "LoginRejected", "已拒绝可疑登录",
@@ -618,21 +621,6 @@ public partial class UserAccountService(
             preferEmail: true, cancellationToken);
 
         return AuthOperationResult.Success();
-    }
-
-    private static string? ExtractSessionId(string? detail)
-    {
-        if (string.IsNullOrWhiteSpace(detail))
-            return null;
-        const string marker = "session=";
-        var idx = detail.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        if (idx < 0) return null;
-        var start = idx + marker.Length;
-        var end = start;
-        while (end < detail.Length && !char.IsWhiteSpace(detail[end]) && detail[end] is not ';' and not ',')
-            end++;
-        var value = detail[start..end].Trim();
-        return string.IsNullOrWhiteSpace(value) ? null : value;
     }
 
     private async Task<AuthOperationResult> TryChangeUserNameAsync(

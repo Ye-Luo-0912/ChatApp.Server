@@ -44,6 +44,9 @@ public interface IUserRepository
 
     Task<CursorPage<SecurityEventDto>> ListSecurityEventsAsync(
         long userId, string? cursor, int limit, CancellationToken cancellationToken = default);
+
+    Task<SecurityEventDto?> GetSecurityEventAsync(
+        long userId, long eventId, CancellationToken cancellationToken = default);
 }
 
 public enum RoleMutationOutcome

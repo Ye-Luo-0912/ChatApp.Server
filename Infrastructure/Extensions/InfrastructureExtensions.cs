@@ -1,5 +1,6 @@
 using Core.Interfaces;
 using Core.Interfaces.Cache;
+using Core.Settings;
 using Infrastructure.Caching;
 using Infrastructure.Data;
 using Infrastructure.Diagnostics;
@@ -9,6 +10,8 @@ using Infrastructure.Services.Utilities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Npgsql;
 using StackExchange.Redis;
 
 namespace Infrastructure.Extensions;
@@ -27,6 +30,19 @@ public static class InfrastructureExtensions
         /// </summary>
         public IServiceCollection AddUserDbContext(IConfiguration configuration)
         {
+            services.AddOptions<DatabasePoolOptions>()
+                .Bind(configuration.GetSection(DatabasePoolOptions.SectionName))
+                .Validate(o => string.Equals(o.Role?.Trim(), "Api", StringComparison.OrdinalIgnoreCase)
+                               || string.Equals(o.Role?.Trim(), "Worker", StringComparison.OrdinalIgnoreCase)
+                               || string.Equals(o.Role?.Trim(), "All", StringComparison.OrdinalIgnoreCase),
+                    "DatabasePool:Role 必须为 Api、Worker 或 All")
+                .Validate(o => o.ApiMaximumPoolSize >= 1, "DatabasePool:ApiMaximumPoolSize 必须 >= 1")
+                .Validate(o => o.WorkerMaximumPoolSize >= 1, "DatabasePool:WorkerMaximumPoolSize 必须 >= 1")
+                .Validate(o => o.MinimumPoolSize >= 0, "DatabasePool:MinimumPoolSize 必须 >= 0")
+                .Validate(o => o.MinimumPoolSize <= o.EffectiveMaximumPoolSize,
+                    "DatabasePool:MinimumPoolSize 不能大于当前进程最大连接数")
+                .ValidateOnStart();
+
             services.AddSingleton<ITsidGenerator, TsidGeneratorService>();
             services.AddSingleton<RealtimeDomainOutboxInterceptor>();
             services.AddSingleton<DbCommandCounterInterceptor>();
@@ -38,7 +54,14 @@ public static class InfrastructureExtensions
                 if (string.IsNullOrWhiteSpace(connectionString))
                     throw new InvalidOperationException("缺少 ConnectionStrings:DefaultConnection");
 
-                options.UseNpgsql(connectionString, npgsql =>
+                var pool = serviceProvider.GetRequiredService<IOptions<DatabasePoolOptions>>().Value;
+                var connectionBuilder = new NpgsqlConnectionStringBuilder(connectionString)
+                {
+                    MaxPoolSize = pool.EffectiveMaximumPoolSize,
+                    MinPoolSize = pool.MinimumPoolSize,
+                };
+
+                options.UseNpgsql(connectionBuilder.ConnectionString, npgsql =>
                 {
                     npgsql.CommandTimeout(15);
                 }).AddInterceptors(

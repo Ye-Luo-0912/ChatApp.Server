@@ -24,7 +24,8 @@ public sealed class SecurityEventStore(
         string? location = null,
         string? detail = null,
         string? actorUserId = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? sessionId = null)
     {
         return RecordAsync(new SecurityEvent
         {
@@ -35,6 +36,7 @@ public sealed class SecurityEventStore(
             Location = location,
             Detail = detail,
             ActorUserId = actorUserId,
+            SessionId = sessionId,
             CreatedAt = DateTimeOffset.UtcNow,
         }, cancellationToken);
     }

@@ -157,11 +157,25 @@ public abstract partial class Program
         app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = _ => false,
+            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
         });
 
         app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = check => check.Tags.Contains("ready"),
+            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
+        });
+
+        app.MapHealthChecks("/health/dependencies", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+        {
+            Predicate = check => check.Tags.Contains("dependencies"),
+            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
+        });
+
+        app.MapHealthChecks("/health/capabilities", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+        {
+            Predicate = check => check.Tags.Contains("capabilities"),
+            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
         });
 
         // 诊断端点：仅供压测/测试环境采样 allocations/Redis commands/DB queries。

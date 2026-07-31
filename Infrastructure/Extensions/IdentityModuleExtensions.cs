@@ -1,6 +1,7 @@
 using Core.Interfaces;
 using Core.Interfaces.Auth;
 using Core.Settings;
+using Infrastructure.Auth;
 using Infrastructure.Services;
 using Infrastructure.Services.Auth;
 using Infrastructure.Validation;
@@ -28,6 +29,10 @@ public static class IdentityModuleExtensions
             .Validate(s => !string.IsNullOrWhiteSpace(s.Issuer), "JwtSettings:Issuer 必填")
             .Validate(s => !string.IsNullOrWhiteSpace(s.Audience), "JwtSettings:Audience 必填")
             .Validate(s => s.AccessTokenExpirationMinutes > 0, "JwtSettings:AccessTokenExpirationMinutes 必须 > 0")
+            .Validate(s => s.MaxActiveSessionsPerUser > 0 && s.MaxActiveSessionsPerUser <= 1000,
+                "JwtSettings:MaxActiveSessionsPerUser 必须在 1..1000")
+            .Validate(s => s.SessionChurnCleanupBatchSize > 0 && s.SessionChurnCleanupBatchSize <= 1000,
+                "JwtSettings:SessionChurnCleanupBatchSize 必须在 1..1000")
             .ValidateOnStart();
 
         services.AddOptions<SecurityOptions>()
@@ -41,10 +46,16 @@ public static class IdentityModuleExtensions
             .Validate(s => s.KeyVersion > 0, "Security:KeyVersion 必须 > 0")
             .ValidateOnStart();
 
-        services.Configure<PasswordHashingOptions>(config.GetSection(PasswordHashingOptions.SectionName));
-        services.Configure<TrustedDeviceOptions>(config.GetSection(TrustedDeviceOptions.SectionName));
+        services.AddValidatedOptions<PasswordHashingOptions, PasswordHashingOptionsValidator>(
+            config, PasswordHashingOptions.SectionName);
+        services.AddValidatedOptions<TrustedDeviceOptions, TrustedDeviceOptionsValidator>(
+            config, TrustedDeviceOptions.SectionName);
 
         services.AddSingleton<IDeviceInfo, DeviceInfoService>();
+        services.AddSingleton<AccessTokenL1InvalidationBus>();
+        services.AddSingleton<IAccessTokenL1InvalidationBus>(sp =>
+            sp.GetRequiredService<AccessTokenL1InvalidationBus>());
+        services.AddHostedService(sp => sp.GetRequiredService<AccessTokenL1InvalidationBus>());
         services.AddSingleton<IAuthCpuLimiter, AuthCpuLimiter>();
         services.AddSingleton<IPasswordHasher, BcryptPasswordHasher>();
 
@@ -71,14 +82,13 @@ public static class IdentityModuleExtensions
         // 使用命名 HttpClient，IHttpClientFactory 管理连接池，避免套接字耗尽
         services.AddHttpClient(nameof(GeoLocationService), client =>
         {
-            client.BaseAddress = new Uri("http://ip-api.com/");
+            // GeoIP 请求包含公网 IP，生产环境必须走 TLS；后续可替换为本地 GeoIP 数据库。
+            var baseUrl = config["GeoLocation:BaseUrl"] ?? "https://ip-api.com/";
+            client.BaseAddress = new Uri(baseUrl, UriKind.Absolute);
             client.Timeout = TimeSpan.FromSeconds(5);
             client.DefaultRequestHeaders.Add("Accept", "application/json");
         });
         services.AddSingleton<IGeoLocationService, GeoLocationService>();
-
-        services.AddSingleton<IValidateOptions<PasswordHashingOptions>, PasswordHashingOptionsValidator>();
-        services.AddSingleton<IValidateOptions<TrustedDeviceOptions>, TrustedDeviceOptionsValidator>();
 
         return services;
     }

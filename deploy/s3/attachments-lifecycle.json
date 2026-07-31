@@ -1,0 +1,43 @@
+{
+  "Rules": [
+    {
+      "ID": "delete-unconfirmed-attachments",
+      "Status": "Enabled",
+      "Filter": {
+        "Tag": {
+          "Key": "chatapp-scan-state",
+          "Value": "unconfirmed"
+        }
+      },
+      "Expiration": {
+        "Days": 1
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    },
+    {
+      "ID": "delete-quarantined-attachments",
+      "Status": "Enabled",
+      "Filter": {
+        "Tag": {
+          "Key": "chatapp-scan-state",
+          "Value": "quarantine"
+        }
+      },
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "abort-incomplete-attachment-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "attachments/"
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}

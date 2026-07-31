@@ -18,9 +18,12 @@ public static class AttachmentModuleExtensions
     /// <summary>注册附件与头像存储模块。</summary>
     public static IServiceCollection AddAttachmentModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<AttachmentStorageOptions>(config.GetSection(AttachmentStorageOptions.SectionName));
-        services.Configure<AvatarStorageOptions>(config.GetSection(AvatarStorageOptions.SectionName));
-        services.Configure<ProfileOptions>(config.GetSection(ProfileOptions.SectionName));
+        services.AddValidatedOptions<AttachmentStorageOptions, AttachmentStorageOptionsValidator>(
+            config, AttachmentStorageOptions.SectionName);
+        services.AddValidatedOptions<AvatarStorageOptions, AvatarStorageOptionsValidator>(
+            config, AvatarStorageOptions.SectionName);
+        services.AddValidatedOptions<ProfileOptions, ProfileOptionsValidator>(
+            config, ProfileOptions.SectionName);
 
         services.AddSingleton<AvatarReencodeMetrics>();
         services.AddSingleton<AvatarReencodeQueue>();
@@ -35,10 +38,21 @@ public static class AttachmentModuleExtensions
         services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
         services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
         services.AddScoped<AttachmentAbandonedAgeSweeper>();
+        services.AddScoped<IAttachmentScanProjectionService, AttachmentScanProjectionService>();
         services.AddScoped<IAttachmentScanService, AttachmentScanService>();
         services.AddSingleton<AttachmentScanEnqueuer>();
         services.AddSingleton<IAttachmentDownloadTicketService, AttachmentDownloadTicketService>();
-        services.AddSingleton<IAttachmentContentScanner, DenyListAttachmentContentScanner>();
+        services.AddSingleton<IAttachmentContentScanner>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<AttachmentStorageOptions>>().Value;
+            var policy = ActivatorUtilities.CreateInstance<DenyListAttachmentContentScanner>(sp);
+            if (!string.Equals(options.ScannerProvider, "ClamAV", StringComparison.OrdinalIgnoreCase))
+                return policy;
+
+            return new CompositeAttachmentContentScanner(
+                policy,
+                ActivatorUtilities.CreateInstance<ClamAvAttachmentContentScanner>(sp));
+        });
         services.AddSingleton<IAttachmentStorage>(sp =>
         {
             var opts = sp.GetRequiredService<IOptions<AttachmentStorageOptions>>().Value;
@@ -64,11 +78,8 @@ public static class AttachmentModuleExtensions
         services.AddScoped<IAttachmentService, AttachmentService>();
         services.AddHostedService<AttachmentCleanupWorker>();
         services.AddHostedService<AttachmentScanWorker>();
+        services.AddHostedService<AttachmentScanProjectionWorker>();
         services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
-
-        services.AddSingleton<IValidateOptions<AttachmentStorageOptions>, AttachmentStorageOptionsValidator>();
-        services.AddSingleton<IValidateOptions<AvatarStorageOptions>, AvatarStorageOptionsValidator>();
-        services.AddSingleton<IValidateOptions<ProfileOptions>, ProfileOptionsValidator>();
 
         return services;
     }

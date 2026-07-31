@@ -34,9 +34,17 @@ public sealed class RefreshToken
     [JsonPropertyName("s")]
     public string? SessionId { get; set; }
 
+    /// <summary>服务端设备凭据摘要；明文凭据只在登录/轮换响应中出现。</summary>
+    [JsonPropertyName("dc")]
+    public string? DeviceCredentialHash { get; set; }
+
     /// <summary>当前绑定访问令牌的 Redis 键（<c>AT:{hash}</c>）；轮换时用于撤销旧访问令牌。</summary>
     [JsonPropertyName("at")]
     public string? CurrentAccessTokenKey { get; set; }
+
+    /// <summary>签发时的用户认证快照版本；轮换时校验并继承。</summary>
+    [JsonPropertyName("v")]
+    public long SecurityVersion { get; set; }
 
     /// <summary>令牌是否仍然有效：未过期（Redis TTL 为主要保障，此为兜底）。</summary>
     [JsonIgnore]

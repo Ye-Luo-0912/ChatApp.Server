@@ -1,18 +1,17 @@
-name: Performance Regression (PR)
+name: Performance Stage Gate
 
 on:
-  pull_request:
-    branches: [master, main]
   workflow_dispatch:
 
-# 避免同一 PR 多次推送并发跑压测
+# 阶段性手动执行；避免同一分支重复触发并发压测。
 concurrency:
   group: perf-regression-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   regression:
-    runs-on: ubuntu-latest
+    # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       DOTNET_NOLOGO: "1"
@@ -76,7 +75,7 @@ jobs:
           dotnet-version: "10.0.x"
 
       - name: Setup k6
-        uses: grafana/k6-action@v0.3.1
+        uses: grafana/setup-k6-action@v1
         with:
           k6-version: "0.54.0"
 
@@ -133,47 +132,17 @@ jobs:
 
       - name: Generate preset tokens
         working-directory: ChatApp.Server/tests/load
-        run: |
-          node -e '
-            const http = require("http");
-            const tokens = [];
-            let done = 0;
-            const total = 50;
-            for (let i = 1; i <= total; i++) {
-              const data = JSON.stringify({ username: "loaduser" + i, password: "Passw0rd!" });
-              const req = http.request({
-                hostname: "127.0.0.1", port: 5088, path: "/api/auth/login", method: "POST",
-                headers: { "Content-Type": "application/json", "X-Device-Id": "seed-" + i, "Content-Length": Buffer.byteLength(data) }
-              }, (res) => {
-                let body = "";
-                res.on("data", (c) => body += c);
-                res.on("end", () => {
-                  try {
-                    const j = JSON.parse(body);
-                    if (res.statusCode === 200 && j.accessToken) {
-                      const idMatch = body.match(/"userId"\s*:\s*(\d+)/i);
-                      tokens.push({ accessToken: j.accessToken, refreshToken: j.refreshToken || "", userId: idMatch ? Number(idMatch[1]) : 0 });
-                    }
-                  } catch (e) {}
-                  if (++done === total) {
-                    require("fs").writeFileSync("tokens.json", JSON.stringify(tokens));
-                    console.log("Generated " + tokens.length + " tokens");
-                    process.exit(tokens.length >= 40 ? 0 : 1);
-                  }
-                });
-              });
-              req.on("error", () => { if (++done === total) { require("fs").writeFileSync("tokens.json", "[]"); process.exit(1); } });
-              req.write(data);
-              req.end();
-            }
-          '
-
+        env:
+          TOKEN_COUNT: "50"
+          TOKEN_MIN_SUCCESS: "40"
+          TOKEN_CONCURRENCY: "4"
+        run: node generate-preset-tokens.mjs
       - name: Warmup run (90s)
         working-directory: ChatApp.Server/tests/load
         run: |
           k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
             -e PROFILE=steady -e RATE=10 -e DURATION=90s \
-            tests/load/mixed-workload.k6.js > /tmp/warmup.log 2>&1 || true
+            mixed-workload.k6.js > /tmp/warmup.log 2>&1 || true
           echo "--- warmup 完成 ---"
           tail -n 5 /tmp/warmup.log || true
 
@@ -183,7 +152,7 @@ jobs:
           k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
             -e PROFILE=steady -e RATE=20 -e DURATION=3m \
             --out json=current.json \
-            tests/load/mixed-workload.k6.js
+            mixed-workload.k6.js
 
       - name: Stop API
         if: always()
@@ -203,7 +172,7 @@ jobs:
             echo "找到基线: $BASELINE"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::error::未找到基线 $BASELINE。Nightly workflow 负责生成基线；请先手动触发 Performance Nightly workflow_dispatch 生成基线后再提 PR。"
+            echo "::error::未找到基线 $BASELINE。请先手动运行 Performance Soak，审阅候选 artifact，并通过普通提交加入基线。"
             exit 1
           fi
 

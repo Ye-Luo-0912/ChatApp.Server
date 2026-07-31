@@ -31,18 +31,30 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
         db.Users.AddRange(
             new Core.Models.Identity.ApplicationUser
             {
-                Id = ownerId, UserName = $"owner-{suffix}", NormalizedUserName = $"OWNER-{suffix}".ToUpperInvariant(),
-                Email = $"owner-{suffix}@ex.com", NormalizedEmail = $"OWNER-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = ownerId,
+                UserName = $"owner-{suffix}",
+                NormalizedUserName = $"OWNER-{suffix}".ToUpperInvariant(),
+                Email = $"owner-{suffix}@ex.com",
+                NormalizedEmail = $"OWNER-{suffix}@EX.COM",
+                EmailConfirmed = true,
             },
             new Core.Models.Identity.ApplicationUser
             {
-                Id = otherId, UserName = $"other-{suffix}", NormalizedUserName = $"OTHER-{suffix}".ToUpperInvariant(),
-                Email = $"other-{suffix}@ex.com", NormalizedEmail = $"OTHER-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = otherId,
+                UserName = $"other-{suffix}",
+                NormalizedUserName = $"OTHER-{suffix}".ToUpperInvariant(),
+                Email = $"other-{suffix}@ex.com",
+                NormalizedEmail = $"OTHER-{suffix}@EX.COM",
+                EmailConfirmed = true,
             },
             new Core.Models.Identity.ApplicationUser
             {
-                Id = friendId, UserName = $"buddy-{suffix}", NormalizedUserName = $"BUDDY-{suffix}".ToUpperInvariant(),
-                Email = $"buddy-{suffix}@ex.com", NormalizedEmail = $"BUDDY-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = friendId,
+                UserName = $"buddy-{suffix}",
+                NormalizedUserName = $"BUDDY-{suffix}".ToUpperInvariant(),
+                Email = $"buddy-{suffix}@ex.com",
+                NormalizedEmail = $"BUDDY-{suffix}@EX.COM",
+                EmailConfirmed = true,
             });
         await db.SaveChangesAsync();
 
@@ -75,6 +87,136 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
             .SingleAsync(f => f.UserId == ownerId && f.FriendId == friendId);
         Assert.Null(friendshipRow.GroupId);
         Assert.False(await db.FriendGroups.AnyAsync(g => g.GroupId == groupId));
+    }
+
+    [SkippableFact]
+    public async Task PairAdvisoryLock_ConcurrentBlock_ProducesOneRecordAndTwoSuccessfulResults()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var generator = new TsidGeneratorService();
+        var userA = generator.GenerateTsid();
+        var userB = generator.GenerateTsid();
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.Users.AddRange(
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = userA,
+                    UserName = $"lock-a-{suffix}",
+                    NormalizedUserName = $"LOCK-A-{suffix}".ToUpperInvariant(),
+                    Email = $"lock-a-{suffix}@example.com",
+                    NormalizedEmail = $"LOCK-A-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                },
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = userB,
+                    UserName = $"lock-b-{suffix}",
+                    NormalizedUserName = $"LOCK-B-{suffix}".ToUpperInvariant(),
+                    Email = $"lock-b-{suffix}@example.com",
+                    NormalizedEmail = $"LOCK-B-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                });
+            await seed.SaveChangesAsync();
+        }
+
+        await using var dbA = postgres.CreateContext();
+        await using var dbB = postgres.CreateContext();
+        var serviceA = new FriendshipService(dbA, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+        var serviceB = new FriendshipService(dbB, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+
+        var results = await Task.WhenAll(
+            serviceA.BlockUserAsync(userA, userB),
+            serviceB.BlockUserAsync(userA, userB));
+
+        Assert.All(results, result => Assert.True(result.IsSuccess));
+        await using var check = postgres.CreateContext();
+        Assert.Equal(1, await check.BlockRecords.CountAsync(
+            b => b.BlockerId == userA && b.BlockedUserId == userB));
+    }
+
+    [SkippableFact]
+    public async Task RelationshipBatch_BlockRecordOverridesStaleMutualCache()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var generator = new TsidGeneratorService();
+        var watcher = generator.GenerateTsid();
+        var target = generator.GenerateTsid();
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.Users.AddRange(
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = watcher,
+                    UserName = $"presence-a-{suffix}",
+                    NormalizedUserName = $"PRESENCE-A-{suffix}".ToUpperInvariant(),
+                    Email = $"presence-a-{suffix}@example.com",
+                    NormalizedEmail = $"PRESENCE-A-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                },
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = target,
+                    UserName = $"presence-b-{suffix}",
+                    NormalizedUserName = $"PRESENCE-B-{suffix}".ToUpperInvariant(),
+                    Email = $"presence-b-{suffix}@example.com",
+                    NormalizedEmail = $"PRESENCE-B-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                });
+            seed.Friendships.AddRange(
+                new UserFriendEntry { UserId = watcher, FriendId = target, CreatedAt = DateTime.UtcNow },
+                new UserFriendEntry { UserId = target, FriendId = watcher, CreatedAt = DateTime.UtcNow });
+            await seed.SaveChangesAsync();
+        }
+
+        await using var query = postgres.CreateContext();
+        var service = new FriendshipService(query, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+        var initially = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(initially[target].IsMutual);
+
+        await using (var block = postgres.CreateContext())
+        {
+            block.BlockRecords.Add(new BlockRecord
+            {
+                BlockerId = target,
+                BlockedUserId = watcher,
+                BlockedAt = DateTime.UtcNow,
+            });
+            await block.SaveChangesAsync();
+        }
+
+        var afterBlock = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(afterBlock[target].IsBlocked);
+        Assert.False(afterBlock[target].IsMutual);
+
+        await using (var revoke = postgres.CreateContext())
+        {
+            await revoke.BlockRecords
+                .Where(b => b.BlockerId == target && b.BlockedUserId == watcher)
+                .ExecuteDeleteAsync();
+            await revoke.Friendships
+                .Where(f => (f.UserId == watcher && f.FriendId == target)
+                            || (f.UserId == target && f.FriendId == watcher))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(f => f.IsDeleted, true)
+                    .SetProperty(f => f.DeletedAt, DateTime.UtcNow));
+        }
+
+        // The ordinary derived cache may still contain IsMutual=true. Authorization must not.
+        var staleCached = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(staleCached[target].IsMutual);
+
+        var authoritative = await service.CheckRelationshipsAuthoritativeAsync(watcher, [target]);
+        Assert.False(authoritative[target].IsBlocked);
+        Assert.False(authoritative[target].IsMutual);
     }
 
     [SkippableFact]

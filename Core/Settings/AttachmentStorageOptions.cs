@@ -63,11 +63,27 @@ public sealed class AttachmentStorageOptions
     /// <summary>内容扫描最大重试次数（瞬时失败）；耗尽后 Rejected。</summary>
     public int MaxScanAttempts { get; set; } = 10;
 
+    /// <summary>DenyList（开发兜底）或 ClamAV（生产推荐）。</summary>
+    public string ScannerProvider { get; set; } = "DenyList";
+    public string? ClamAvHost { get; set; }
+    public int ClamAvPort { get; set; } = 3310;
+    public int ClamAvTimeoutMilliseconds { get; set; } = 30_000;
+    public string ClamAvEngineVersion { get; set; } = "configured-at-runtime";
+
     /// <summary>扫描重试基础退避秒数（指数：base * 2^attempt，上限 1h）。</summary>
     public int ScanBackoffSeconds { get; set; } = 15;
 
     /// <summary>扫描 Worker 每轮处理条数。</summary>
     public int ScanBatchSize { get; set; } = 20;
+
+    /// <summary>扫描审计保留天数；独立于短期扫描作业清理周期。</summary>
+    public int ScanAuditRetentionDays { get; set; } = 90;
+
+    /// <summary>压缩归档最多允许的条目数/声明解压大小，防止 zip bomb。</summary>
+    public int ArchiveMaxEntries { get; set; } = 10_000;
+    public long ArchiveMaxUncompressedBytes { get; set; } = 250 * 1024 * 1024;
+    public int ArchiveMaxPathDepth { get; set; } = 8;
+    public int ArchiveMaxNestingDepth { get; set; } = 3;
 
     /// <summary>
     /// 运维：Scanning 超过该分钟数视为卡住（元数据或扫描作业）。
@@ -95,9 +111,15 @@ public sealed class AttachmentStorageOptions
     /// <summary>年龄清扫每轮最多放弃条数。</summary>
     public int AbandonedUnboundBatchSize { get; set; } = 50;
 
-    // S3 兼容（可选）
+    /// <summary>SSE-S3 或 SSE-KMS；Provider=S3 时必须启用。</summary>
+    public string S3SseMode { get; set; } = "SSE-S3";
+
+    /// <summary>Provider=S3 且 S3SseMode=SSE-KMS 时的 KMS key id/ARN。</summary>
+    public string? S3KmsKeyId { get; set; }
     public string? S3Bucket { get; set; }
     public string? S3Endpoint { get; set; }
+    public bool S3ForcePathStyle { get; set; }
+    // 旧字段保留用于兼容已有配置，但不再被实现读取。
     public string? S3AccessKey { get; set; }
     public string? S3SecretKey { get; set; }
     public string? S3Region { get; set; } = "us-east-1";

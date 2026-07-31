@@ -212,6 +212,7 @@ public sealed class ModerationService(
                 {
                     user.BanUntil = banUntil;
                     user.SecurityStamp = Guid.NewGuid().ToString();
+                    user.AdvanceSecurityVersion();
                     await sessionStore.RevokeAllSessionsAsync(targetId.ToString(), cancellationToken: cancellationToken);
                 }
             }

@@ -137,8 +137,6 @@ public sealed class GarnetRestartRecoveryTests
         => string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase)
            || string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase);
 
-    private static bool ShouldRunDockerRestartTest() => IsContinuousIntegration();
-
     private static async Task WaitForGarnetAsync(ConfigurationOptions options, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

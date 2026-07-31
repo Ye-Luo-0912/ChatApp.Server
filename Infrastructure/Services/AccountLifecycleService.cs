@@ -43,6 +43,7 @@ public sealed class AccountLifecycleService(
         user.DeletionLeaseUntil = null;
         user.DeletionLeaseOwner = null;
         user.SecurityStamp = Guid.NewGuid().ToString();
+        user.AdvanceSecurityVersion();
         await db.SaveChangesAsync(cancellationToken);
         await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
         await securityEventStore.RecordAsync(

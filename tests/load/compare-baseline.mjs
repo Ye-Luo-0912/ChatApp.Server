@@ -17,7 +17,8 @@
 //   redis/req  不得增加
 //   db/req     不得增加
 //
-// --strict 模式下，宿主侧指标（allocations/redis/db）不可用也视为回归。
+// --strict 模式下，所有门禁指标必须具备完整 schema；业务指标还必须满足
+// --min-samples（默认 30）最小样本数。宿主侧汇总指标缺失也视为回归。
 //
 // 基线文件支持两种格式：
 //   1. extract-summary.mjs 生成的 summary JSON（含 version/metrics 字段）
@@ -26,20 +27,25 @@
 import fs from 'node:fs';
 
 function parseArgs(argv) {
-    const args = { strict: false, baseline: null, current: null, absolute: null };
+    const args = { strict: false, baseline: null, current: null, absolute: null, minSamples: 30 };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--strict') args.strict = true;
         else if (a === '--baseline') args.baseline = argv[++i];
         else if (a === '--current') args.current = argv[++i];
         else if (a === '--absolute') args.absolute = argv[++i];
+        else if (a === '--min-samples') args.minSamples = Number(argv[++i]);
         else if (a === '--help' || a === '-h') {
-            console.log('用法: compare-baseline.mjs --baseline <path> --current <path> [--absolute <path>] [--strict]');
+            console.log('用法: compare-baseline.mjs --baseline <path> --current <path> [--absolute <path>] [--strict] [--min-samples <n>]');
             process.exit(0);
         }
     }
     if (!args.baseline || !args.current) {
         console.error('错误：必须提供 --baseline 和 --current');
+        process.exit(2);
+    }
+    if (!Number.isSafeInteger(args.minSamples) || args.minSamples < 1) {
+        console.error('错误：--min-samples 必须是大于 0 的整数');
         process.exit(2);
     }
     return args;
@@ -59,7 +65,9 @@ function loadMetrics(filePath) {
         try {
             const obj = JSON.parse(trimmed);
             if (obj.version && obj.metrics) {
-                return obj.metrics;
+                const metrics = obj.metrics;
+                if (obj.rates) metrics.__rates = obj.rates;
+                return metrics;
             }
         } catch { /* 不是单行 JSON，按原始事件流处理 */ }
     }
@@ -67,6 +75,8 @@ function loadMetrics(filePath) {
     // k6 原始事件流：每行一个 JSON 事件
     const lines = raw.split(/\r?\n/).filter(Boolean);
     const metrics = {};
+    let firstTs = null;
+    let lastTs = null;
     for (const line of lines) {
         let evt;
         try { evt = JSON.parse(line); } catch { continue; }
@@ -76,6 +86,11 @@ function loadMetrics(filePath) {
         m.count++;
         m.sum += v;
         m.values.push(v);
+        const t = evt.data.time;
+        if (t) {
+            if (firstTs === null || t < firstTs) firstTs = t;
+            if (lastTs === null || t > lastTs) lastTs = t;
+        }
     }
     for (const m of Object.values(metrics)) {
         const sorted = [...m.values].sort((a, b) => a - b);
@@ -84,6 +99,16 @@ function loadMetrics(filePath) {
         m.p99 = percentile(sorted, 99);
         m.avg = m.count > 0 ? m.sum / m.count : 0;
         delete m.values;
+    }
+    const durationSeconds = firstTs && lastTs
+        ? Math.max(0, (new Date(lastTs).getTime() - new Date(firstTs).getTime()) / 1000)
+        : 0;
+    if (durationSeconds > 0) {
+        metrics.__rates = {
+            duration_seconds: durationSeconds,
+            iterations_per_second: metrics.iterations ? metrics.iterations.sum / durationSeconds : 0,
+            http_requests_per_second: metrics.http_reqs ? metrics.http_reqs.sum / durationSeconds : 0,
+        };
     }
     return metrics;
 }
@@ -161,6 +186,45 @@ function main() {
 
     const regressions = [];
     const RECENT_THRESHOLDS = { p95: 0.08, p99: 0.12 };
+    // login_duration 来自独立 login-capacity 脚本，不能要求 steady 基线包含它。
+    const strictTrendMetrics = Object.keys(TREND_MAP).filter((name) => name !== 'login_duration');
+
+    function requireMetric(source, name, metric, requiredStats, minimumSamples) {
+        if (!metric || typeof metric !== 'object') {
+            regressions.push(source + ' 缺少必需指标 ' + name);
+            return;
+        }
+
+        const count = Number(metric.count);
+        if (!Number.isFinite(count) || count < minimumSamples) {
+            regressions.push(source + ' 指标 ' + name + ' 样本不足：' +
+                (Number.isFinite(count) ? count : 'n/a') + ' < ' + minimumSamples);
+        }
+
+        for (const stat of requiredStats) {
+            if (!Number.isFinite(Number(metric[stat]))) {
+                regressions.push(source + ' 指标 ' + name + ' 缺少数值字段 ' + stat);
+            }
+        }
+    }
+
+    if (args.strict) {
+        for (const metric of strictTrendMetrics) {
+            requireMetric('基线', metric, baseMetrics[metric], ['p95', 'p99'], args.minSamples);
+            requireMetric('当前', metric, curMetrics[metric], ['p95', 'p99'], args.minSamples);
+        }
+
+        for (const pair of [['基线', baseMetrics], ['当前', curMetrics]]) {
+            const source = pair[0];
+            const metrics = pair[1];
+            requireMetric(source, 'errors', metrics.errors, ['avg'], args.minSamples);
+            requireMetric(source, 'http_reqs', metrics.http_reqs, ['sum'], args.minSamples);
+            // setup/teardown 只各写入一次宿主总量差值，因而要求至少一条即可。
+            requireMetric(source, 'allocations_delta_bytes', metrics.allocations_delta_bytes, ['avg'], 1);
+            requireMetric(source, 'redis_cmds_delta', metrics.redis_cmds_delta, ['avg'], 1);
+            requireMetric(source, 'db_queries_delta', metrics.db_queries_delta, ['avg'], 1);
+        }
+    }
 
     // 1. Trend 指标 p95/p99 回归检查
     console.log('指标                  基准 p95    当前 p95    Δ          基准 p99    当前 p99    Δ          结果');
@@ -192,6 +256,13 @@ function main() {
         regressions.push(`错误率 ${(curErr * 100).toFixed(3)}% 超过绝对目标 0.1%`);
     }
 
+    // 业务迭代和 HTTP 请求不是同一个单位：一个 steady 迭代会发出多个请求。
+    console.log('\n=== 负载速率（单位明确） ===');
+    const baseRates = baseMetrics.__rates;
+    const curRates = curMetrics.__rates;
+    console.log(`iterations/s          基准 ${baseRates?.iterations_per_second?.toFixed?.(2) ?? 'n/a'}  当前 ${curRates?.iterations_per_second?.toFixed?.(2) ?? 'n/a'}`);
+    console.log(`HTTP requests/s       基准 ${baseRates?.http_requests_per_second?.toFixed?.(2) ?? 'n/a'}  当前 ${curRates?.http_requests_per_second?.toFixed?.(2) ?? 'n/a'}`);
+
     // 3. 绝对目标检查（可选）
     let absGoals = null;
     if (args.absolute) {
@@ -207,8 +278,9 @@ function main() {
             const mapping = ABSOLUTE_MAP[goalName];
             if (!mapping) continue;
             const actual = curMetrics[mapping.metric]?.[mapping.stat];
-            if (actual == null) {
-                console.log(`${mapping.label.padEnd(28)} n/a（无数据）`);
+            if (!Number.isFinite(Number(actual))) {
+                console.log(mapping.label.padEnd(28) + ' n/a（无数据）');
+                if (args.strict) regressions.push(mapping.label + ' 缺少当前绝对目标指标');
                 continue;
             }
             const ok = actual <= target;
@@ -229,7 +301,11 @@ function main() {
     const dbDeltaBase = baseMetrics.db_queries_delta?.avg ?? null;
     const dbDeltaCur = curMetrics.db_queries_delta?.avg ?? null;
 
-    const hostAvailable = httpReqsCur != null && httpReqsCur > 0;
+    const hostAvailable = httpReqsBase != null && httpReqsBase > 0
+        && httpReqsCur != null && httpReqsCur > 0
+        && allocDeltaBase != null && allocDeltaCur != null
+        && redisDeltaBase != null && redisDeltaCur != null
+        && dbDeltaBase != null && dbDeltaCur != null;
     const allocPerReqKbBase = (allocDeltaBase != null && httpReqsBase > 0) ? (allocDeltaBase / 1024) / httpReqsBase : null;
     const allocPerReqKbCur = (allocDeltaCur != null && httpReqsCur > 0) ? (allocDeltaCur / 1024) / httpReqsCur : null;
     const redisPerReqBase = (redisDeltaBase != null && httpReqsBase > 0) ? redisDeltaBase / httpReqsBase : null;
@@ -250,9 +326,16 @@ function main() {
         ['db queries/req', dbPerReqBase, dbPerReqCur, HOST_THRESHOLDS.db, '+0%'],
     ]) {
         const d = pctDelta(baseVal, curVal);
-        const ok = d == null || d <= threshold;
-        console.log(`${label.padEnd(28)} 基准 ${fmtHost(baseVal)}  当前 ${fmtHost(curVal)}  ${d != null ? formatPct(d) : 'n/a'}  ${ok ? '✓' : '❌'}`);
-        if (!ok) regressions.push(`${label} 退化 ${formatPct(d)}（阈值 ${thresholdLabel}）`);
+        const comparable = baseVal != null && curVal != null;
+        const increasedFromZero = comparable && baseVal === 0 && curVal > 0;
+        const ok = !comparable ? !args.strict : (!increasedFromZero && d != null && d <= threshold);
+        console.log(label.padEnd(28) + ' 基准 ' + fmtHost(baseVal) +
+            '  当前 ' + fmtHost(curVal) + '  ' + (d != null ? formatPct(d) : 'n/a') +
+            '  ' + (ok ? '✓' : '❌'));
+        if (!ok) {
+            const detail = increasedFromZero ? ('从 0 增至 ' + fmtHost(curVal)) : formatPct(d);
+            regressions.push(label + ' 退化 ' + detail + '（阈值 ' + thresholdLabel + '）');
+        }
     }
 
     if (!hostAvailable) {

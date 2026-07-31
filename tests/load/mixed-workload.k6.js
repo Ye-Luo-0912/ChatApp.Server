@@ -7,7 +7,7 @@ import { Rate, Trend, Counter, Gauge } from 'k6/metrics';
  * 混合负载场景（按 PROFILE 拆分）：
  *   steady       — 固定设备，≥90% 已认证业务流量（默认）
  *   auth_capacity — 登录/BCrypt 容量（薄封装，建议优先用 login-capacity.k6.js）
- *   device_churn — 每轮新 X-Device-Id，压会话/新设备/通知增长
+ *   device_churn — 每轮新 X-Installation-Id，压会话/新设备/通知增长
  *   soak         — 同 steady 流量形态，默认 DURATION=2h，观察内存/积压/池
  *   mixed        — 兼容旧名，等同 device_churn（历史行为：每轮登录+换设备）
  *   dual_ratelimit — 双实例共享限流
@@ -178,14 +178,22 @@ const profiles = {
 
 export const options = profiles[PROFILE] || profiles.steady;
 
-function deviceHeaders(vu, churn) {
-  return {
+function buildInstallationId(vu, churn) {
+  const vuPart = String(vu).padStart(6, '0');
+  const iterPart = String(__ITER).padStart(10, '0');
+  return churn
+    ? `k6-churn-installation-${vuPart}-${iterPart}`
+    : `k6-steady-installation-${vuPart}`;
+}
+
+function deviceHeaders(vu, churn, deviceCredential = '', installationId = '') {
+  const headers = {
     'Content-Type': 'application/json',
-    'X-Device-Id': churn
-      ? `k6-churn-${vu}-${__ITER}`
-      : `k6-steady-${vu}`,
+    'X-Installation-Id': installationId || buildInstallationId(vu, churn),
     'X-Correlation-Id': `k6-${vu}-${Date.now()}`,
   };
+  if (deviceCredential) headers['X-Device-Credential'] = deviceCredential;
+  return headers;
 }
 
 function pickUser() {
@@ -210,23 +218,28 @@ function doLogin(headers) {
     'login 200/400/503': (r) => r.status === 200 || r.status === 400 || r.status === 503,
   });
   errorRate.add(!ok || res.status >= 500);
-  if (res.status !== 200) return { accessToken: '', refreshToken: '', userId: '' };
+  if (res.status !== 200) {
+    return { accessToken: '', refreshToken: '', deviceCredential: '', userId: '', installationId: headers['X-Installation-Id'] || '' };
+  }
   const body = res.json();
   // Snowflake userIds exceed Number.MAX_SAFE_INTEGER; keep digits as string for refresh.
   const idMatch = String(res.body || '').match(/"userId"\s*:\s*(\d+)/i);
   return {
     accessToken: body.accessToken || body.AccessToken || '',
     refreshToken: body.refreshToken || body.RefreshToken || '',
+    deviceCredential: body.deviceCredential || body.DeviceCredential || '',
     userId: (idMatch && idMatch[1]) || String(body.userId || body.UserId || user.userId || ''),
+    installationId: headers['X-Installation-Id'] || '',
   };
 }
 
 // 执行已认证读取 + 可选 refresh。
 // refresh 成功时返回新令牌，调用方据此更新 VU 级会话状态。
-function authedReads(headers, accessToken, refreshToken, userId, doRefresh) {
+function authedReads(headers, accessToken, refreshToken, deviceCredential, userId, installationId, doRefresh) {
   const auth = Object.assign({}, headers, { Authorization: `Bearer ${accessToken}` });
   let newAccessToken = accessToken;
   let newRefreshToken = refreshToken;
+  let newDeviceCredential = deviceCredential;
 
   group('me', () => {
     const res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
@@ -284,7 +297,7 @@ function authedReads(headers, accessToken, refreshToken, userId, doRefresh) {
       const res = http.post(
         `${BASE_URL}/api/auth/refresh-token`,
         `{"userId":${userId},"refreshToken":${JSON.stringify(refreshToken)}}`,
-        { headers, tags: { endpoint: 'refresh' } },
+      { headers: deviceHeaders(__VU, false, deviceCredential, installationId), tags: { endpoint: 'refresh' } },
       );
       refreshTrend.add(res.timings.duration);
       const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
@@ -295,12 +308,13 @@ function authedReads(headers, accessToken, refreshToken, userId, doRefresh) {
           const body = res.json();
           if (body.accessToken) newAccessToken = body.accessToken;
           if (body.refreshToken) newRefreshToken = body.refreshToken;
+          if (body.deviceCredential) newDeviceCredential = body.deviceCredential;
         } catch (e) { /* 解析失败保留旧令牌 */ }
       }
     });
   }
 
-  return { accessToken: newAccessToken, refreshToken: newRefreshToken, userId };
+  return { accessToken: newAccessToken, refreshToken: newRefreshToken, deviceCredential: newDeviceCredential, userId, installationId };
 }
 
 export default function () {
@@ -321,12 +335,12 @@ export default function () {
 
   if (isChurn) {
     // 每轮登录 + 换设备：压新设备/会话/通知增长
-    let session = { accessToken: '', refreshToken: '', userId: '' };
+    let session = { accessToken: '', refreshToken: '', deviceCredential: '', userId: '', installationId: headers['X-Installation-Id'] || '' };
     group('login', () => {
       session = doLogin(headers);
     });
     if (session.accessToken) {
-      authedReads(headers, session.accessToken, session.refreshToken, session.userId, false);
+      authedReads(headers, session.accessToken, session.refreshToken, session.deviceCredential, session.userId, session.installationId, false);
     }
     sleep(Number(__ENV.THINK || 0.2));
     return;
@@ -341,10 +355,16 @@ export default function () {
     if (!forceLogin) {
       const preset = pickToken();
       if (preset && preset.accessToken) {
+        const installationId = String(preset.deviceId || preset.installationId || preset.device || '');
+        if (!installationId) {
+          throw new Error('TOKENS_FILE entry is missing deviceId/installationId; preset tokens must reuse the login installation ID');
+        }
         vuSessions[__VU] = {
           accessToken: preset.accessToken,
           refreshToken: preset.refreshToken || '',
-          userId: preset.userId || '',
+          deviceCredential: preset.deviceCredential || preset.DeviceCredential || '',
+          userId: String(preset.userId || ''),
+          installationId,
         };
       }
     }
@@ -362,7 +382,8 @@ export default function () {
   }
 
   const s = vuSessions[__VU];
-  const updated = authedReads(headers, s.accessToken, s.refreshToken, s.userId, doRefresh);
+  const sessionHeaders = deviceHeaders(__VU, false, '', s.installationId);
+  const updated = authedReads(sessionHeaders, s.accessToken, s.refreshToken, s.deviceCredential, s.userId, s.installationId, doRefresh);
 
   // 写回更新后的令牌（refresh 成功时为新令牌，me 401 时为空触发重新登录）
   vuSessions[__VU] = updated;
@@ -389,21 +410,37 @@ function dualRateLimit() {
 // /debug/metrics 端点需在 API 侧启用（见 Program.cs）。
 // ─────────────────────────────────────────────────────────────
 export function setup() {
-  try {
-    const res = http.get(`${BASE_URL}/debug/metrics`);
-    if (res.status === 200) return JSON.parse(res.body);
-  } catch (e) { /* 端点不可用时跳过宿主指标 */ }
-  return null;
+  if (PROFILE === 'dual_ratelimit') return null;
+  const res = http.get(`${BASE_URL}/debug/metrics`, { tags: { endpoint: 'host_metrics_setup' } });
+  if (res.status !== 200)
+    throw new Error(`host metrics endpoint unavailable during setup: HTTP ${res.status}`);
+
+  let data;
+  try { data = JSON.parse(res.body); } catch (e) {
+    throw new Error(`host metrics setup response is not JSON: ${e}`);
+  }
+  for (const key of ['allocated_bytes', 'redis_total_commands', 'db_total_commands']) {
+    if (!Number.isFinite(Number(data[key])))
+      throw new Error(`host metrics setup missing numeric field: ${key}`);
+  }
+  return data;
 }
 
 export function teardown(data) {
   if (!data) return;
-  try {
-    const res = http.get(`${BASE_URL}/debug/metrics`);
-    if (res.status !== 200) return;
-    const end = JSON.parse(res.body);
-    allocationsDelta.add(Math.max(0, (end.allocated_bytes || 0) - (data.allocated_bytes || 0)));
-    redisCmdsDelta.add(Math.max(0, (end.redis_total_commands || 0) - (data.redis_total_commands || 0)));
-    dbQueriesDelta.add(Math.max(0, (end.db_total_commands || 0) - (data.db_total_commands || 0)));
-  } catch (e) { /* best-effort */ }
+  const res = http.get(`${BASE_URL}/debug/metrics`, { tags: { endpoint: 'host_metrics_teardown' } });
+  if (res.status !== 200)
+    throw new Error(`host metrics endpoint unavailable during teardown: HTTP ${res.status}`);
+
+  let end;
+  try { end = JSON.parse(res.body); } catch (e) {
+    throw new Error(`host metrics teardown response is not JSON: ${e}`);
+  }
+  for (const key of ['allocated_bytes', 'redis_total_commands', 'db_total_commands']) {
+    if (!Number.isFinite(Number(end[key])))
+      throw new Error(`host metrics teardown missing numeric field: ${key}`);
+  }
+  allocationsDelta.add(Math.max(0, end.allocated_bytes - data.allocated_bytes));
+  redisCmdsDelta.add(Math.max(0, end.redis_total_commands - data.redis_total_commands));
+  dbQueriesDelta.add(Math.max(0, end.db_total_commands - data.db_total_commands));
 }

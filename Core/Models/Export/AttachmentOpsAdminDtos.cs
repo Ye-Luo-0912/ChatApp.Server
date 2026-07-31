@@ -1,5 +1,10 @@
 namespace Core.Models.Export;
 
+public sealed class AttachmentOpsActionRequest
+{
+    public string? Reason { get; set; }
+}
+
 /// <summary>附件运维只读汇总（Admin / curl）。</summary>
 public sealed record AttachmentOpsOrphansDto(
     bool MetadataAvailable,
@@ -77,6 +82,23 @@ public sealed record AttachmentOpsScanJobRowDto(
     DateTimeOffset CreatedAt,
     DateTimeOffset? LeaseExpiresAt,
     string? LastError);
+
+public sealed record AttachmentScanAuditDto(
+    long Id,
+    long ScanJobId,
+    string AttachmentId,
+    string ObjectKey,
+    long UserId,
+    int AttemptCount,
+    string? ContentType,
+    long SizeBytes,
+    string EngineName,
+    string EngineVersion,
+    string Verdict,
+    bool Allowed,
+    bool IsTransient,
+    string? Reason,
+    DateTimeOffset CreatedAt);
 
 /// <summary>廉价提示：元数据 size 汇总 + 配置；不做 Redis KEYS / 全盘扫描。</summary>
 public sealed record AttachmentOpsHintsDto(

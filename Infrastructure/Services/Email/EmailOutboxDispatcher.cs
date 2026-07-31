@@ -68,12 +68,17 @@ public sealed class EmailOutboxDispatcher(
     }
 
     public async Task<IReadOnlyList<EmailOutboxItem>> ClaimDueItemsAsync(CancellationToken cancellationToken)
+        => await ClaimDueItemsAsync(_batchSize, cancellationToken).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<EmailOutboxItem>> ClaimDueItemsAsync(
+        int maxItems, CancellationToken cancellationToken)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
         var now = DateTime.UtcNow;
         // P0-4：每次领取生成唯一 LeaseToken 作为 fencing token。
         var leaseToken = Guid.NewGuid().ToString("N");
+        var claimLimit = Math.Clamp(maxItems, 1, _batchSize);
 
         List<long> dueIds;
         await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false))
@@ -92,7 +97,7 @@ public sealed class EmailOutboxDispatcher(
                           AND i."NextAttemptAt" <= {now}
                         ORDER BY i."NextAttemptAt"
                         FOR UPDATE SKIP LOCKED
-                        LIMIT {_batchSize}
+                        LIMIT {claimLimit}
                     )
                     RETURNING o."Id"
                     """)

@@ -76,7 +76,7 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 | 双实例限流 | 两实例 + 共享 Redis，默认限流 | `mixed-workload.k6.js` `PROFILE=dual_ratelimit` |
 | 登录容量 | Performance | `login-capacity.k6.js` 或 `PROFILE=auth_capacity` |
 | 稳态业务 | Performance | `PROFILE=steady`（固定设备，≥90% 已认证） |
-| 设备抖动 | Performance | `PROFILE=device_churn`（每轮新 `X-Device-Id`） |
+| 设备抖动 | Performance | `PROFILE=device_churn`（每轮新 `X-Installation-Id`） |
 | 浸泡 | Performance | `PROFILE=soak`（默认 **2h**，同 steady 流量形态） |
 | 在线用户 | Performance + 预置 Token | `online-users.k6.js`，`-e TOKENS_FILE=./tokens.json` |
 
@@ -84,14 +84,14 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 
 ## 推荐场景
 
-### 两层性能门禁
+### 阶段性性能门禁
 
-| 门禁 | workflow | 触发 | 场景 | 阻塞 PR |
-|------|----------|------|------|---------|
-| PR 回归 | `.github/workflows/performance-regression.yml` | `pull_request` to master | steady 3m + 比对基线 | 是（回归超阈值或绝对目标未达） |
-| Nightly | `.github/workflows/performance-nightly.yml` | `schedule` 每日 / 手动 | steady 15m、auth capacity、device churn、双实例限流、重启恢复、2h soak | 否（仅归档 + 刷新基线） |
+| 门禁 | workflow | 触发 | 场景 | 用途 |
+|------|----------|------|------|------|
+| 快速阶段门禁 | `.github/workflows/performance-regression.yml` | 手动 `workflow_dispatch` | steady 3m + 比对已审核基线 | 一组热路径改造完成后执行 |
+| 完整阶段门禁 | `.github/workflows/performance-nightly.yml` | 手动 `workflow_dispatch` | steady 15m、auth capacity、device churn、双实例限流、重启恢复、可选 2h soak | 里程碑验收并生成候选基线 artifact |
 
-PR 回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
+阶段回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
 
 | 维度 | 阈值 |
 |------|------|
@@ -115,15 +115,15 @@ PR 回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) �
 | Worker | backlog 和 oldest age 不持续增长 |
 
 基线文件存放于 [baselines/](baselines/) 目录，命名 `baseline-<PROFILE>-rate<RATE>.json`。
-Nightly 每日跑完 steady 15m 后自动 commit/push 刷新基线；PR 拉取该基线与当前分支 3m run 比对。
-首次运行（基线不存在）仅校验绝对目标与错误率，不阻塞。
+完整阶段门禁跑完 steady 15m 后上传候选 summary 和原始事件流，不直接写入 master。
+审阅候选结果并通过普通提交更新基线后，快速阶段门禁才执行 3m 比对；缺少基线会明确失败。
 
-Nightly 重启恢复：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
+完整阶段门禁的重启恢复场景：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
 断言重启后错误率 ≤ 5%。覆盖 AGENTS.md 的恢复语义。
 
 ### steady（固定设备基线）
 
-固定 `X-Device-Id`（`k6-steady-{vu}`），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。优先配合预置 Token，避免登录限流污染业务基线：
+固定 `X-Installation-Id`（`k6-steady-installation-{vu-padded}`，符合服务端长度校验），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
 
 ```bash
 k6 run -e BASE_URL=http://localhost:8080 -e TOKENS_FILE=./tokens.json -e PROFILE=steady \
@@ -148,7 +148,7 @@ k6 run -e CREDS_FILE=./creds.json tests/load/login-capacity.k6.js
 
 ### device_churn（新设备 / 会话 / 通知增长）
 
-每轮 `X-Device-Id=k6-churn-{vu}-{iter}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
+每轮 `X-Installation-Id=k6-churn-installation-{vu-padded}-{iter-padded}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
 
 ```bash
 k6 run -e CREDS_FILE=./creds.json -e PROFILE=device_churn -e RATE=10 -e DURATION=10m \
@@ -195,6 +195,8 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 
 ### 基线记录表（每次跑完填一行；未跑勿填造数据）
 
+`extract-summary.mjs` 同时输出 `iterations_per_second` 和 `http_requests_per_second`。前者是业务迭代速率，后者是 HTTP 请求速率；steady 的一次迭代包含多个请求，不能混用。
+
 | 日期 | 硬件 | PROFILE | RATE | 时长 | login p95/p99 | refresh p95 | errors | 503 overload | 备注 |
 |------|------|--------|------|------|---------------|-------------|--------|--------------|------|
 | 2026-07-21 | local (Win11 + Docker Desktop) | steady | 5 | 1m | 82ms / 92ms | 20ms | 0% | 0 | **HTTP smoke 实测**：301 iters / 2107 HTTP reqs，~34.9 req/s，checks 100%；login p95/p99=82/92ms，refresh p95=20ms；Garnet 需 --lua；k6 脚本已修 /api/auth/refresh-token + snowflake userId 精度；原始输出 `tests/load/k6-smoke-2026-07-21.txt` |
@@ -227,11 +229,17 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 
 ```json
 [
-  { "accessToken": "...", "userId": 1, "refreshToken": "..." }
+  {
+    "accessToken": "...",
+    "refreshToken": "...",
+    "deviceCredential": "...",
+    "userId": "9223372036854775807",
+    "deviceId": "perf-installation-00000001"
+  }
 ]
 ```
 
-避免 setup 阶段被登录限流截断后多个 VU 共享少量会话。
+`userId` 必须是十进制字符串，避免 Snowflake ID 经 JavaScript `Number` 丢失精度；`deviceId` 必须复用登录时的 InstallationId，refresh 才能通过设备绑定校验。避免 setup 阶段被登录限流截断后多个 VU 共享少量会话。
 
 ## 解读建议
 

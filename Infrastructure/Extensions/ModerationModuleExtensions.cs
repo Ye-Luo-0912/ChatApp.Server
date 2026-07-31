@@ -18,7 +18,8 @@ public static class ModerationModuleExtensions
     /// <summary>注册内容审核模块。</summary>
     public static IServiceCollection AddModerationModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<MessageEvidenceOptions>(config.GetSection(MessageEvidenceOptions.SectionName));
+        services.AddValidatedOptions<MessageEvidenceOptions, MessageEvidenceOptionsValidator>(
+            config, MessageEvidenceOptions.SectionName);
 
         services.AddSingleton<IMessageEvidenceProvider>(sp =>
         {
@@ -35,8 +36,6 @@ public static class ModerationModuleExtensions
             return ActivatorUtilities.CreateInstance<UnavailableMessageEvidenceProvider>(sp);
         });
         services.AddScoped<IModerationService, ModerationService>();
-
-        services.AddSingleton<IValidateOptions<MessageEvidenceOptions>, MessageEvidenceOptionsValidator>();
 
         return services;
     }

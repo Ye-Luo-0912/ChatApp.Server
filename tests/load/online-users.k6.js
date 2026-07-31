@@ -55,9 +55,28 @@ export const options = {
   },
 };
 
+function onlineInstallationId(index) {
+  return `k6-online-installation-${String(index).padStart(6, '0')}`;
+}
+
+function rawUserId(body, fallback) {
+  const match = String(body || '').match(/"userId"\s*:\s*(\d+)/i);
+  return (match && match[1]) || String(fallback || '');
+}
+
 export function setup() {
   if (__ENV.TOKENS_FILE) {
-    return { sessions: JSON.parse(open(__ENV.TOKENS_FILE)) };
+    const sessions = JSON.parse(open(__ENV.TOKENS_FILE));
+    return {
+      sessions: sessions.map((s) => {
+        const device = String(s.deviceId || s.installationId || s.device || '');
+        if (!device) throw new Error('TOKENS_FILE entry is missing deviceId/installationId');
+        if (typeof s.userId !== 'string' || !/^\d+$/.test(s.userId)) {
+          throw new Error('TOKENS_FILE userId must be an exact decimal string');
+        }
+        return { ...s, device, deviceCredential: s.deviceCredential || s.DeviceCredential || '' };
+      }),
+    };
   }
 
   const sessions = [];
@@ -70,7 +89,7 @@ export function setup() {
       {
         headers: {
           'Content-Type': 'application/json',
-          'X-Device-Id': `k6-online-${i + 1}`,
+          'X-Installation-Id': onlineInstallationId(i + 1),
         },
       },
     );
@@ -79,8 +98,9 @@ export function setup() {
     sessions.push({
       accessToken: body.accessToken || body.AccessToken,
       refreshToken: body.refreshToken || body.RefreshToken,
-      userId: body.userId || body.UserId || u.userId,
-      device: `k6-online-${i + 1}`,
+      deviceCredential: body.deviceCredential || body.DeviceCredential || '',
+      userId: rawUserId(res.body, u.userId),
+      device: onlineInstallationId(i + 1),
     });
   }
   if (sessions.length === 0) {
@@ -93,7 +113,7 @@ export default function (data) {
   const session = data.sessions[(__VU - 1) % data.sessions.length];
   const headers = {
     Authorization: `Bearer ${session.accessToken}`,
-    'X-Device-Id': session.device,
+    'X-Installation-Id': session.device,
     'X-Correlation-Id': `online-${__VU}-${__ITER}`,
   };
 
@@ -131,13 +151,18 @@ export default function (data) {
       const res = http.post(
         `${BASE_URL}/api/auth/refresh-token`,
         JSON.stringify({ userId: session.userId, refreshToken: session.refreshToken }),
-        { headers: { 'Content-Type': 'application/json', 'X-Device-Id': session.device } },
+        { headers: {
+          'Content-Type': 'application/json',
+          'X-Installation-Id': session.device,
+          ...(session.deviceCredential ? { 'X-Device-Credential': session.deviceCredential } : {}),
+        } },
       );
       refreshDuration.add(Date.now() - start);
       if (res.status === 200) {
         const body = res.json();
         session.accessToken = body.accessToken || body.AccessToken || session.accessToken;
         session.refreshToken = body.refreshToken || body.RefreshToken || session.refreshToken;
+        session.deviceCredential = body.deviceCredential || body.DeviceCredential || session.deviceCredential;
       }
     });
   }

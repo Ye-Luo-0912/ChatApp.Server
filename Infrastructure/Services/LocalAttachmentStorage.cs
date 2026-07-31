@@ -15,7 +15,7 @@ public sealed class LocalAttachmentStorage(
     IOptions<AttachmentStorageOptions> options,
     ICacheValueStore cache,
     IAtomicCacheStore atomicCache,
-    ILogger<LocalAttachmentStorage> logger) : IAttachmentStorage
+    ILogger<LocalAttachmentStorage> logger) : IAttachmentStorage, IObjectStoreHealthProbe
 {
     private readonly AttachmentStorageOptions _options = options.Value;
 
@@ -30,6 +30,14 @@ public sealed class LocalAttachmentStorage(
         long ExpiresAtUnixMs);
 
     public long MaxBytes => _options.MaxBytes;
+
+    public Task ProbeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(_options.LocalRootPath))
+            throw new DirectoryNotFoundException(_options.LocalRootPath);
+        return Task.CompletedTask;
+    }
 
     public bool IsAllowedContentType(string contentType) =>
         _options.AllowedContentTypes.Any(t =>
@@ -50,8 +58,9 @@ public sealed class LocalAttachmentStorage(
             throw new ArgumentException($"附件大小须在 1~{MaxBytes} 字节之间");
 
         var attachmentId = Guid.NewGuid().ToString("N");
-        var ext = GuessExtension(contentType, originalName);
-        var objectKey = $"{userId}/{DateTime.UtcNow:yyyyMMddHHmmss}-{attachmentId}{ext}";
+        // Keep the final key stable from presign through confirm. The MIME type
+        // lives in the attachment metadata row, not in the file name.
+        var objectKey = $"{userId}/{attachmentId}";
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
         // PublicUrl 仅作内部/遗留字段；聊天 API 使用 DownloadPath，不暴露永久静态 URL。
@@ -284,7 +293,9 @@ public sealed class LocalAttachmentStorage(
         var stream = new FileStream(
             fullPath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var contentType = GuessContentType(objectKey);
+        // MIME comes from the realtime attachment metadata row. The object key
+        // intentionally has no extension; use a safe fallback for direct probes.
+        const string contentType = "application/octet-stream";
         return Task.FromResult<AttachmentReadResult?>(
             new AttachmentReadResult(stream, contentType, stream.Length, Path.GetFileName(fullPath)));
     }
@@ -343,22 +354,6 @@ public sealed class LocalAttachmentStorage(
         return key;
     }
 
-    private static string GuessContentType(string objectKey)
-    {
-        var ext = Path.GetExtension(objectKey).ToLowerInvariant();
-        return ext switch
-        {
-            ".jpg" or ".jpeg" => "image/jpeg",
-            ".png" => "image/png",
-            ".webp" => "image/webp",
-            ".gif" => "image/gif",
-            ".pdf" => "application/pdf",
-            ".mp3" => "audio/mpeg",
-            ".ogg" => "audio/ogg",
-            ".mp4" => "video/mp4",
-            _ => "application/octet-stream",
-        };
-    }
     private async Task RestoreTicketAsync(
         string ticketKey, AttachmentTicketInfo info, CancellationToken cancellationToken)
     {
@@ -384,29 +379,6 @@ public sealed class LocalAttachmentStorage(
         {
             logger.LogWarning(ex, "附件上传失败后写回上传票失败");
         }
-    }
-
-    private static string GuessExtension(string contentType, string? originalName)
-    {
-        if (!string.IsNullOrWhiteSpace(originalName))
-        {
-            var ext = Path.GetExtension(originalName);
-            if (!string.IsNullOrWhiteSpace(ext) && ext.Length <= 16 && ext.All(c => char.IsLetterOrDigit(c) || c == '.'))
-                return ext.ToLowerInvariant();
-        }
-
-        return contentType.ToLowerInvariant() switch
-        {
-            "image/jpeg" => ".jpg",
-            "image/png" => ".png",
-            "image/webp" => ".webp",
-            "image/gif" => ".gif",
-            "application/pdf" => ".pdf",
-            "audio/mpeg" => ".mp3",
-            "audio/ogg" => ".ogg",
-            "video/mp4" => ".mp4",
-            _ => ".bin",
-        };
     }
 
     private static string EnsureDirectoryBoundary(string rootPath)

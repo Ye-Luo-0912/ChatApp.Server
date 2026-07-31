@@ -10,6 +10,7 @@ using Infrastructure.Diagnostics;
 using Infrastructure.Services;
 using Infrastructure.Services.Auth;
 using Infrastructure.Services.Utilities;
+using Infrastructure.Validation;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -21,6 +22,28 @@ namespace ChatApp.Server.IntegrationTests.Auth;
 [Collection(nameof(RedisPostgresCollection))]
 public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, RedisTestFixture redis)
 {
+    [Fact]
+    public void StorageOptions_RejectLocalInProduction_AndAcceptSharedS3()
+    {
+        var environment = new DummyHost { EnvironmentName = "Production" };
+        var validator = new DataExportStorageOptionsValidator(environment);
+
+        var local = validator.Validate(null, new DataExportStorageOptions());
+        Assert.True(local.Failed);
+        Assert.Contains(
+            local.Failures,
+            failure => failure.Contains("Provider 必须为 S3", StringComparison.Ordinal));
+
+        var s3 = validator.Validate(null, new DataExportStorageOptions
+        {
+            Provider = "S3",
+            EncryptAtRest = false,
+            S3Bucket = "chatapp-exports",
+            S3SseMode = "SSE-S3",
+        });
+        Assert.True(s3.Succeeded);
+    }
+
     [SkippableFact]
     public async Task Export_RequiresStepUp_Persists_AndOneShotDownload()
     {
@@ -97,7 +120,9 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             Assert.Contains("receipts", json, StringComparison.Ordinal);
             Assert.Contains("attachments", json, StringComparison.Ordinal);
             Assert.Contains("https://cdn.example/a.png", json, StringComparison.Ordinal);
-            Assert.Contains("\"status\": \"ok\"", json, StringComparison.Ordinal);
+            using var exportDocument = System.Text.Json.JsonDocument.Parse(json);
+            Assert.Equal("ok", exportDocument.RootElement.GetProperty("chatExport")
+                .GetProperty("status").GetString());
         }
 
         var (again, _, err2) = await export.OpenDownloadAsync(user.Id, jobId!, CancellationToken.None);
@@ -105,6 +130,63 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         Assert.Equal(DataExportDownloadErrors.DownloadConsumed, err2);
     }
 
+
+    [SkippableFact]
+    public async Task ClaimOneNpgsql_ConcurrentClaimers_ReturnDistinctPendingJobs()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        const int claimCount = 4;
+        var now = DateTimeOffset.UtcNow.AddYears(-20);
+        var ids = Enumerable.Range(0, claimCount)
+            .Select(_ => Guid.NewGuid().ToString("N"))
+            .ToArray();
+
+        await using (var seed = postgres.CreateContext())
+        {
+            for (var i = 0; i < claimCount; i++)
+            {
+                seed.DataExportJobs.Add(new DataExportJob
+                {
+                    Id = ids[i],
+                    UserId = new TsidGeneratorService().GenerateTsid(),
+                    Status = DataExportJobStatus.Pending,
+                    CreatedAt = now.AddMilliseconds(i),
+                });
+            }
+            await seed.SaveChangesAsync();
+        }
+
+        var contexts = Enumerable.Range(0, claimCount)
+            .Select(_ => postgres.CreateContext())
+            .ToArray();
+        try
+        {
+            var claims = await Task.WhenAll(contexts.Select((db, i) =>
+                DataExportWorker.ClaimOneNpgsqlAsync(
+                    db,
+                    $"claim-test-{i}",
+                    Guid.NewGuid().ToString("N"),
+                    now.AddSeconds(1),
+                    now.AddMinutes(2),
+                    CancellationToken.None)));
+
+            Assert.All(claims, claim => Assert.NotNull(claim));
+            var claimedIds = claims.Select(claim => claim!.Value.Job.Id).Order().ToArray();
+            Assert.Equal(claimCount, claimedIds.Distinct().Count());
+            Assert.Equal(ids.Order().ToArray(), claimedIds);
+        }
+        finally
+        {
+            foreach (var db in contexts)
+                await db.DisposeAsync();
+
+            await using var cleanup = postgres.CreateContext();
+            await cleanup.DataExportJobs
+                .Where(job => ids.Contains(job.Id))
+                .ExecuteDeleteAsync();
+        }
+    }
     [SkippableFact]
     public async Task Export_OpenDownload_AllowsRetry_WhenBlobMissing()
     {

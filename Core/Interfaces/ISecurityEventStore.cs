@@ -16,7 +16,8 @@ public interface ISecurityEventStore
         string? location = null,
         string? detail = null,
         string? actorUserId = null,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? sessionId = null);
 
     /// <summary>批量写入；失败抛出。</summary>
     Task RecordManyAsync(IReadOnlyList<SecurityEvent> events, CancellationToken cancellationToken = default);

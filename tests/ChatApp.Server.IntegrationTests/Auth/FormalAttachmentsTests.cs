@@ -7,6 +7,7 @@ using Core.Interfaces;
 using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Services;
+using Infrastructure.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
@@ -148,13 +149,11 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         };
 
         await using var ms = new MemoryStream();
-        await using (var writer = new Utf8JsonWriter(ms))
-        {
-            writer.WriteStartObject();
-            await DataExportWorker.WriteChatExportAsync(
-                writer, reader, meta, 9, opts, CancellationToken.None);
-            writer.WriteEndObject();
-        }
+        var writer = new SequentialJsonObjectWriter(ms);
+        await writer.StartAsync();
+        await DataExportWorker.WriteChatExportAsync(
+            writer, reader, meta, 9, opts, CancellationToken.None);
+        await writer.CompleteAsync();
 
         using var doc = JsonDocument.Parse(ms.ToArray());
         var attachments = doc.RootElement.GetProperty("attachments").EnumerateArray().ToList();

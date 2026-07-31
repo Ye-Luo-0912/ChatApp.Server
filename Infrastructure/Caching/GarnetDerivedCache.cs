@@ -36,6 +36,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         string key,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(key))
             return CacheLookup<T>.Miss;
 
@@ -44,6 +45,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         {
             var value = await _redis.GetDatabase()
                 .StringGetAsync(fullKey)
+                .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
             if (!value.HasValue)
@@ -61,7 +63,9 @@ public sealed class GarnetDerivedCache : IDerivedCache
             {
                 _logger.LogWarning(ex, "派生缓存数据损坏，删除键 Key={Key}", key);
                 // 删除损坏键，下次回源重建
-                await _redis.GetDatabase().KeyDeleteAsync(fullKey).ConfigureAwait(false);
+                await _redis.GetDatabase().KeyDeleteAsync(fullKey)
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
                 return CacheLookup<T>.Miss;
             }
         }
@@ -82,6 +86,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(keys);
+        cancellationToken.ThrowIfCancellationRequested();
         if (keys.Count == 0)
             return [];
 
@@ -94,6 +99,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         {
             values = await _redis.GetDatabase()
                 .StringGetAsync(redisKeys)
+                .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (RedisConnectionException ex)
@@ -136,9 +142,11 @@ public sealed class GarnetDerivedCache : IDerivedCache
                 _logger.LogWarning(ex, "派生缓存批量读取数据损坏，删除键 Key={Key}", keys[i]);
                 try
                 {
-                    await _redis.GetDatabase().KeyDeleteAsync(redisKeys[i]).ConfigureAwait(false);
+                    await _redis.GetDatabase().KeyDeleteAsync(redisKeys[i])
+                        .WaitAsync(cancellationToken)
+                        .ConfigureAwait(false);
                 }
-                catch
+                catch (RedisException)
                 {
                     // 删除损坏键失败不影响未命中结果
                 }
@@ -154,6 +162,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         TimeSpan ttl,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(key) || ttl <= TimeSpan.Zero)
             return;
 
@@ -164,6 +173,7 @@ public sealed class GarnetDerivedCache : IDerivedCache
         {
             await _redis.GetDatabase()
                 .StringSetAsync(fullKey, payload, ttl)
+                .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (RedisConnectionException ex)
@@ -176,34 +186,92 @@ public sealed class GarnetDerivedCache : IDerivedCache
         }
     }
 
+    public async Task SetManyAsync<T>(
+        IReadOnlyList<KeyValuePair<string, T>> values,
+        TimeSpan ttl,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        if (values.Count == 0 || ttl <= TimeSpan.Zero)
+            return;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var validCount = 0;
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (!string.IsNullOrEmpty(values[i].Key))
+                validCount++;
+        }
+
+        if (validCount == 0)
+            return;
+
+        try
+        {
+            var batch = _redis.GetDatabase().CreateBatch();
+            var pending = new Task[validCount];
+            var pendingIndex = 0;
+            for (var i = 0; i < values.Count; i++)
+            {
+                var item = values[i];
+                if (string.IsNullOrEmpty(item.Key))
+                    continue;
+
+                var fullKey = CacheKeyBuilder.WithPrefix(_keyPrefix, item.Key);
+                pending[pendingIndex++] = batch.StringSetAsync(
+                    fullKey,
+                    _serializer.Serialize(item.Value),
+                    ttl);
+            }
+
+            batch.Execute();
+            await Task.WhenAll(pending)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (RedisConnectionException ex)
+        {
+            _logger.LogDebug(ex, "派生缓存批量写入失败（连接），忽略 Keys={Count}", validCount);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            _logger.LogDebug(ex, "派生缓存批量写入失败（超时），忽略 Keys={Count}", validCount);
+        }
+    }
+
     public async Task RemoveManyAsync(
         IReadOnlyList<string> keys,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(keys);
+        cancellationToken.ThrowIfCancellationRequested();
         if (keys.Count == 0)
             return;
 
-        var redisKeys = new RedisKey[keys.Count];
+        var redisKeys = new List<RedisKey>(keys.Count);
         for (var i = 0; i < keys.Count; i++)
         {
             if (!string.IsNullOrEmpty(keys[i]))
-                redisKeys[i] = CacheKeyBuilder.WithPrefix(_keyPrefix, keys[i]);
+                redisKeys.Add(CacheKeyBuilder.WithPrefix(_keyPrefix, keys[i]));
         }
+
+        if (redisKeys.Count == 0)
+            return;
 
         try
         {
             await _redis.GetDatabase()
-                .KeyDeleteAsync(redisKeys)
+                .KeyDeleteAsync(redisKeys.ToArray())
+                .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (RedisConnectionException ex)
         {
-            _logger.LogDebug(ex, "派生缓存批量删除失败（连接），忽略 Keys={Count}", keys.Count);
+            _logger.LogDebug(ex, "派生缓存批量删除失败（连接），忽略 Keys={Count}", redisKeys.Count);
         }
         catch (RedisTimeoutException ex)
         {
-            _logger.LogDebug(ex, "派生缓存批量删除失败（超时），忽略 Keys={Count}", keys.Count);
+            _logger.LogDebug(ex, "派生缓存批量删除失败（超时），忽略 Keys={Count}", redisKeys.Count);
         }
     }
 }

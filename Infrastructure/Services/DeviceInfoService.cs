@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Core.Interfaces;
 using Core.Models.Device;
+using Core.Models.Token;
 using Microsoft.AspNetCore.Http;
 using UAParser;
 using UAParser.Objects;
@@ -20,7 +21,7 @@ namespace Infrastructure.Services;
 /// <see cref="HttpContext.Items"/> 缓存，避免多次调用重复解析。
 /// </para>
 /// </summary>
-public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) : IDeviceInfo
+public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) : IDeviceInfo, IDeviceCredentialContext
 {
     // 盐值防止彩虹表碰撞；修改会使所有历史 DeviceId 失效，请谨慎变更
     private const string FingerprintSalt = "ChatApp#DeviceFingerprint#2024";
@@ -60,7 +61,7 @@ public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) 
 
         var info = new DeviceInfo
         {
-            // 优先使用客户端生成的稳定设备 ID（X-Device-Id），缺失时回退 UA/语言指纹。
+            // 优先使用客户端生成的稳定安装实例 ID，缺失时回退 UA/语言指纹。
             DeviceId        = ResolveDeviceId(context, userAgent, acceptLanguage),
             DeviceName      = BuildDeviceName(clientInfo),
             DeviceType      = DetectDeviceType(userAgent, clientInfo),
@@ -87,14 +88,42 @@ public sealed class DeviceInfoService(IHttpContextAccessor httpContextAccessor) 
         return ResolveDeviceId(context, userAgent, acceptLanguage);
     }
 
+    /// <inheritdoc />
+    public string? GetPresentedDeviceCredentialHash()
+    {
+        var context = httpContextAccessor.HttpContext;
+        if (context is null || !context.Request.Headers.TryGetValue("X-Device-Credential", out var header))
+            return null;
+
+        var credential = header.ToString().Trim();
+        return DeviceCredentialHelper.IsValid(credential)
+            ? DeviceCredentialHelper.ComputeHash(credential)
+            : null;
+    }
+
+    /// <inheritdoc />
+    public string IssueDeviceCredential() => DeviceCredentialHelper.Create();
+
     /// <summary>
-    /// 读取客户端提供的稳定设备 ID；需为 URL 安全、长度 16～128 的随机串。
+    /// 读取客户端提供的安装实例 ID；需为 URL 安全、长度 16～128 的随机串。
+    /// <para>
+    /// X-Installation-Id 是新协议名称，X-Device-Id 仅作为旧客户端兼容别名。
+    /// 该值只用于会话分区和风险关联，不承担认证职责；认证由 DeviceCredential 完成。
+    /// </para>
     /// </summary>
     private static string ResolveDeviceId(HttpContext? context, string userAgent, string acceptLanguage)
     {
-        if (context?.Request.Headers.TryGetValue("X-Device-Id", out var header) == true)
+        if (context?.Request.Headers.TryGetValue("X-Installation-Id", out var installationHeader) == true)
         {
-            var clientId = header.ToString().Trim();
+            var clientId = installationHeader.ToString().Trim();
+            if (IsValidClientDeviceId(clientId))
+                return clientId;
+        }
+
+        // 兼容已发布客户端；新客户端应迁移到 X-Installation-Id。
+        if (context?.Request.Headers.TryGetValue("X-Device-Id", out var legacyHeader) == true)
+        {
+            var clientId = legacyHeader.ToString().Trim();
             if (IsValidClientDeviceId(clientId))
                 return clientId;
         }

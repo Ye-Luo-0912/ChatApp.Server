@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Core.Models.Attachment;
 
 public sealed class AttachmentPresignRequest
@@ -21,6 +23,13 @@ public sealed class AttachmentPresignResponse
 
     public string Ticket { get; init; } = string.Empty;
     public DateTimeOffset ExpiresAt { get; init; }
+
+    /// <summary>
+    /// S3 presigned PUT headers (Content-Type, SSE and initial quarantine tag).
+    /// Clients must send these headers unchanged with the PUT request.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyDictionary<string, string>? UploadHeaders { get; init; }
 
     /// <summary>已废弃：永久公开 URL 会泄漏未鉴权读。保留属性仅为旧客户端兼容，始终为空。</summary>
     [Obsolete("Use DownloadPath. Permanent PublicUrl is no longer returned.")]

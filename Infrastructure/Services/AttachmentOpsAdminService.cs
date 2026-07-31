@@ -1,8 +1,10 @@
 using Core.Interfaces;
 using Core.Models.Export;
+using Core.Models.Security;
 using Core.Settings;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
@@ -15,13 +17,39 @@ public interface IAttachmentOpsAdminService
 
     Task<AttachmentOpsScanBacklogDto> GetScanBacklogAsync(CancellationToken cancellationToken = default);
 
+    Task<IReadOnlyList<AttachmentScanAuditDto>> GetScanAuditsAsync(
+        string attachmentId,
+        int limit = 50,
+        CancellationToken cancellationToken = default);
+
     Task<AttachmentOpsHintsDto> GetHintsAsync(CancellationToken cancellationToken = default);
+
+    Task<bool> RescanAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> DeleteAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> ReleaseAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed class AttachmentOpsAdminService(
     UserDbContext db,
     IAttachmentMetadataStore metadata,
-    IOptions<AttachmentStorageOptions> options) : IAttachmentOpsAdminService
+    IOptions<AttachmentStorageOptions> options,
+    IAttachmentBlobDeleteService? blobDeletes = null,
+    IAttachmentStorage? storage = null,
+    ILogger<AttachmentOpsAdminService>? logger = null) : IAttachmentOpsAdminService
 {
     private static readonly string[] RelatedMetricNames =
     [
@@ -199,6 +227,39 @@ public sealed class AttachmentOpsAdminService(
             GeneratedAtMs: nowMs);
     }
 
+    public async Task<IReadOnlyList<AttachmentScanAuditDto>> GetScanAuditsAsync(
+        string attachmentId,
+        int limit = 50,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(attachmentId))
+            return [];
+
+        var take = Math.Clamp(limit, 1, 200);
+        return await db.AttachmentScanAudits.AsNoTracking()
+            .Where(x => x.AttachmentId == attachmentId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(take)
+            .Select(x => new AttachmentScanAuditDto(
+                x.Id,
+                x.ScanJobId,
+                x.AttachmentId,
+                x.ObjectKey,
+                x.UserId,
+                x.AttemptCount,
+                x.ContentType,
+                x.SizeBytes,
+                x.EngineName,
+                x.EngineVersion,
+                x.Verdict,
+                x.Allowed,
+                x.IsTransient,
+                x.Reason,
+                x.CreatedAt))
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public async Task<AttachmentOpsHintsDto> GetHintsAsync(CancellationToken cancellationToken = default)
     {
         var opts = options.Value;
@@ -222,6 +283,141 @@ public sealed class AttachmentOpsAdminService(
             "Ephemeral Redis keys (attachment:download:*); not enumerated — avoid KEYS/SCAN in ops path.",
             RelatedMetricNames: RelatedMetricNames,
             GeneratedAtMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+    }
+
+    public async Task<bool> RescanAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default)
+    {
+        var job = await FindJobAsync(attachmentId, cancellationToken).ConfigureAwait(false);
+        if (job is null
+            || !metadata.IsAvailable
+            || job.Status is AttachmentScanJobStatus.Processing or AttachmentScanJobStatus.Finalizing)
+            return false;
+
+        await metadata.MarkUploadedScanningAsync(
+                attachmentId, job.UserId, job.SizeBytes, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+
+        job.Status = AttachmentScanJobStatus.Pending;
+        job.AttemptCount = 0;
+        job.NextAttemptAt = DateTimeOffset.UtcNow;
+        job.CompletedAt = null;
+        job.LastError = null;
+        job.LeaseOwner = null;
+        job.LeaseToken = null;
+        job.LeaseExpiresAt = null;
+        await WriteAuditAsync(
+                adminUserId, job, "AttachmentRescan", reason, cancellationToken)
+            .ConfigureAwait(false);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        logger?.LogInformation(
+            "管理员触发附件重扫 AdminUserId={AdminUserId} AttachmentId={AttachmentId}",
+            adminUserId,
+            attachmentId);
+        return true;
+    }
+
+    public async Task<bool> DeleteAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default)
+    {
+        var job = await FindJobAsync(attachmentId, cancellationToken).ConfigureAwait(false);
+        if (job is null || blobDeletes is null)
+            return false;
+
+        await blobDeletes.EnqueueAsync(
+                [(job.ObjectKey, job.AttachmentId)], job.UserId, cancellationToken)
+            .ConfigureAwait(false);
+        if (metadata.IsAvailable)
+        {
+            await metadata.MarkRejectedAsync(
+                    job.AttachmentId, job.UserId, "admin_deleted", cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        job.Status = AttachmentScanJobStatus.DeadLetter;
+        job.CompletedAt = DateTimeOffset.UtcNow;
+        job.LastError = "admin_deleted";
+        job.LeaseOwner = null;
+        job.LeaseToken = null;
+        job.LeaseExpiresAt = null;
+        await WriteAuditAsync(
+                adminUserId, job, "AttachmentDelete", reason, cancellationToken)
+            .ConfigureAwait(false);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    public async Task<bool> ReleaseAsync(
+        long adminUserId,
+        string attachmentId,
+        string? reason,
+        CancellationToken cancellationToken = default)
+    {
+        var job = await FindJobAsync(attachmentId, cancellationToken).ConfigureAwait(false);
+        if (job is null || !metadata.IsAvailable || storage is not IAttachmentScanStateMarker marker)
+            return false;
+
+        await marker.MarkScanStateAsync(
+                job.ObjectKey, "confirmed", cancellationToken)
+            .ConfigureAwait(false);
+
+        await metadata.ConfirmAsync(
+                job.AttachmentId,
+                job.UserId,
+                job.ObjectKey,
+                publicUrl: null,
+                contentType: string.IsNullOrWhiteSpace(job.ContentType)
+                    ? "application/octet-stream"
+                    : job.ContentType,
+                sizeBytes: job.SizeBytes,
+                originalName: job.OriginalName,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        job.Status = AttachmentScanJobStatus.Done;
+        job.CompletedAt = DateTimeOffset.UtcNow;
+        job.LastError = "admin_released";
+        job.LeaseOwner = null;
+        job.LeaseToken = null;
+        job.LeaseExpiresAt = null;
+        await WriteAuditAsync(
+                adminUserId, job, "AttachmentRelease", reason, cancellationToken)
+            .ConfigureAwait(false);
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    private Task<AttachmentScanJob?> FindJobAsync(
+        string attachmentId,
+        CancellationToken cancellationToken)
+        => db.AttachmentScanJobs
+            .Where(x => x.AttachmentId == attachmentId)
+            .OrderByDescending(x => x.CreatedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+
+    private async Task WriteAuditAsync(
+        long adminUserId,
+        AttachmentScanJob job,
+        string action,
+        string? reason,
+        CancellationToken cancellationToken)
+    {
+        db.AdminAuditLogs.Add(new AdminAuditLog
+        {
+            AdminUserId = adminUserId,
+            TargetUserId = job.UserId,
+            Action = action,
+            Reason = string.IsNullOrWhiteSpace(reason) ? "manual_attachment_ops" : reason.Trim(),
+            Detail = $"AttachmentId={job.AttachmentId};ObjectKey={job.ObjectKey}",
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 
     private static long AgeMs(long nowMs, long? atMs) =>

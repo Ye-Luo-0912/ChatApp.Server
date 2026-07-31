@@ -3,6 +3,7 @@ using System.Text.Json;
 using Core.Interfaces;
 using Core.Settings;
 using Infrastructure.Services;
+using Infrastructure.Serialization;
 using Xunit;
 
 namespace ChatApp.Server.IntegrationTests.Auth;
@@ -20,15 +21,8 @@ public sealed class ChatExportWriteTests
             ChatExportMaxMessages = 100,
         };
 
-        await using var ms = new MemoryStream();
-        await using (var writer = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = false }))
-        {
-            writer.WriteStartObject();
-            await DataExportWorker.WriteChatExportAsync(writer, reader, 9, opts, CancellationToken.None);
-            writer.WriteEndObject();
-        }
-
-        var json = Encoding.UTF8.GetString(ms.ToArray());
+        var payload = await WriteExportAsync(reader, opts);
+        var json = Encoding.UTF8.GetString(payload);
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
         Assert.Equal(3, root.GetProperty("messages").GetArrayLength());
@@ -57,15 +51,8 @@ public sealed class ChatExportWriteTests
             ChatExportMaxMessages = 2,
         };
 
-        await using var ms = new MemoryStream();
-        await using (var writer = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = false }))
-        {
-            writer.WriteStartObject();
-            await DataExportWorker.WriteChatExportAsync(writer, reader, 9, opts, CancellationToken.None);
-            writer.WriteEndObject();
-        }
-
-        using var doc = JsonDocument.Parse(ms.ToArray());
+        var payload = await WriteExportAsync(reader, opts);
+        using var doc = JsonDocument.Parse(payload);
         Assert.Equal(2, doc.RootElement.GetProperty("messages").GetArrayLength());
         Assert.True(doc.RootElement.GetProperty("chatExport").GetProperty("truncated").GetBoolean());
     }
@@ -88,15 +75,8 @@ public sealed class ChatExportWriteTests
             ChatExportMaxMessages = 100,
         };
 
-        await using var ms = new MemoryStream();
-        await using (var writer = new Utf8JsonWriter(ms))
-        {
-            writer.WriteStartObject();
-            await DataExportWorker.WriteChatExportAsync(writer, reader, 9, opts, CancellationToken.None);
-            writer.WriteEndObject();
-        }
-
-        using var doc = JsonDocument.Parse(ms.ToArray());
+        var payload = await WriteExportAsync(reader, opts);
+        using var doc = JsonDocument.Parse(payload);
         var msg = doc.RootElement.GetProperty("messages")[0];
         Assert.Equal("m-edited", GetProp(msg, "MessageId", "messageId"));
         Assert.Equal("after-edit body", GetProp(msg, "Content", "content"));
@@ -126,15 +106,8 @@ public sealed class ChatExportWriteTests
             ChatExportMaxMessages = 100,
         };
 
-        await using var ms = new MemoryStream();
-        await using (var writer = new Utf8JsonWriter(ms))
-        {
-            writer.WriteStartObject();
-            await DataExportWorker.WriteChatExportAsync(writer, reader, 9, opts, CancellationToken.None);
-            writer.WriteEndObject();
-        }
-
-        var json = Encoding.UTF8.GetString(ms.ToArray());
+        var payload = await WriteExportAsync(reader, opts);
+        var json = Encoding.UTF8.GetString(payload);
         Assert.DoesNotContain("SECRET_ORIGINAL_BODY", json, StringComparison.Ordinal);
         Assert.DoesNotContain("leak.jpg", json, StringComparison.Ordinal);
 
@@ -146,6 +119,19 @@ public sealed class ChatExportWriteTests
         Assert.Equal(1_700_000_000_400L, GetLong(msg, "RecalledAtMs", "recalledAtMs"));
         Assert.Equal(2, GetInt(msg, "EditVersion", "editVersion"));
         Assert.Equal(0, doc.RootElement.GetProperty("attachments").GetArrayLength());
+    }
+
+    private static async Task<byte[]> WriteExportAsync(
+        IRealtimeChatExportReader reader,
+        DataExportStorageOptions options)
+    {
+        await using var stream = new MemoryStream();
+        var writer = new SequentialJsonObjectWriter(stream);
+        await writer.StartAsync();
+        await DataExportWorker.WriteChatExportAsync(
+            writer, reader, 9, options, CancellationToken.None);
+        await writer.CompleteAsync();
+        return stream.ToArray();
     }
 
     private static string? GetProp(JsonElement el, params string[] names)

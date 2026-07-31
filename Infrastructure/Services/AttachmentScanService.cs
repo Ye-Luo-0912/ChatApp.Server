@@ -14,10 +14,10 @@ namespace Infrastructure.Services;
 public sealed class AttachmentScanService(
     UserDbContext db,
     IAttachmentStorage storage,
-    IAttachmentMetadataStore metadata,
     IAttachmentContentScanner contentScanner,
     IOptions<AttachmentStorageOptions> options,
-    ILogger<AttachmentScanService> logger) : IAttachmentScanService
+    ILogger<AttachmentScanService> logger,
+    IAttachmentScanProjectionService projections) : IAttachmentScanService
 {
     private static readonly string ProcessOwner =
         $"{Environment.MachineName}:{Environment.ProcessId}";
@@ -88,21 +88,14 @@ public sealed class AttachmentScanService(
     {
         var batchSize = Math.Clamp(options.Value.ScanBatchSize, 1, 200);
         var claimed = await ClaimDueJobsAsync(batchSize, cancellationToken).ConfigureAwait(false);
-        if (claimed.Count == 0)
-        {
-            await PurgeOldDoneAsync(cancellationToken).ConfigureAwait(false);
-            return 0;
-        }
-
-        var completed = 0;
         foreach (var job in claimed)
-        {
-            if (await ProcessClaimedJobAsync(job, cancellationToken).ConfigureAwait(false))
-                completed++;
-        }
+            await ProcessClaimedJobAsync(job, cancellationToken).ConfigureAwait(false);
 
+        // The projection path is also drained here so single-scope test/admin calls
+        // observe the same terminal behavior as the dedicated production worker.
+        var projected = await projections.ProcessDueAsync(cancellationToken).ConfigureAwait(false);
         await PurgeOldDoneAsync(cancellationToken).ConfigureAwait(false);
-        return completed;
+        return projected;
     }
 
     public async Task<IReadOnlyList<AttachmentScanJob>> ClaimDueJobsAsync(
@@ -160,39 +153,79 @@ public sealed class AttachmentScanService(
     }
 
     /// <summary>
-    /// 处理单个已领取作业。执行内容扫描与元数据写入，随后以 LeaseToken fencing 落终态。
-    /// 租约已易主（被重新领取）时终态更新命中 0 行，返回 false 且不重复写元数据终态。
+    /// 处理单个已领取作业。执行内容扫描后，先以 LeaseToken fencing 将结论和审计
+    /// 原子写入本地投递表；外部元数据写入由独立 projector 完成。
     /// </summary>
-    public async Task<bool> ProcessClaimedJobAsync(
+    public async Task<AttachmentScanProcessResult> ProcessClaimedJobAsync(
         AttachmentScanJob claimed, CancellationToken cancellationToken = default)
     {
         var maxAttempts = Math.Max(1, options.Value.MaxScanAttempts);
 
-        ScanOutcome outcome;
-        string? lastError;
         try
         {
-            (outcome, lastError) = await ExecuteScanAsync(claimed, cancellationToken).ConfigureAwait(false);
+            var scanResult = await ExecuteScanAsync(claimed, cancellationToken).ConfigureAwait(false);
+            if (scanResult.Transient)
+            {
+                await WriteScanAuditAsync(claimed, scanResult, cancellationToken).ConfigureAwait(false);
+                return await ApplyTerminalAsync(
+                        claimed,
+                        ScanOutcome.Transient,
+                        Truncate(scanResult.Error ?? "transient_scan_failure", 500),
+                        maxAttempts,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            var outcome = scanResult.Ok
+                ? AttachmentScanProjectionOutcome.Confirmed
+                : AttachmentScanProjectionOutcome.Rejected;
+            var staged = await PersistFinalResultAsync(
+                    claimed,
+                    scanResult,
+                    outcome,
+                    claimed.AttemptCount,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (staged)
+                AuthSecurityMetrics.AttachmentScan("result_staged");
+            return staged
+                ? AttachmentScanProcessResult.ResultStaged
+                : AttachmentScanProcessResult.LeaseLost;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            // 扫描本身异常：按瞬时失败走 fenced 重试路径，避免旧租约覆盖。
             logger.LogWarning(
                 ex,
                 "附件扫描瞬时失败，保留可重试 JobId={Id} AttachmentId={Aid} Attempt={Attempt}",
                 claimed.Id,
                 claimed.AttachmentId,
                 claimed.AttemptCount);
+            var transient = new ContentScanResult(
+                false, null, ex.Message, true, "unknown", "unknown");
+            try
+            {
+                await WriteScanAuditAsync(claimed, transient, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception auditEx)
+            {
+                logger.LogWarning(auditEx, "附件扫描异常审计写入失败 JobId={Id}", claimed.Id);
+            }
+
             return await ApplyTerminalAsync(
-                claimed, ScanOutcome.Transient, Truncate(ex.Message, 500), maxAttempts, cancellationToken)
+                    claimed,
+                    ScanOutcome.Transient,
+                    Truncate(ex.Message, 500),
+                    maxAttempts,
+                    cancellationToken)
                 .ConfigureAwait(false);
         }
-
-        return await ApplyTerminalAsync(claimed, outcome, lastError, maxAttempts, cancellationToken)
-            .ConfigureAwait(false);
     }
 
-    public Task RenewLeaseAsync(
+    public Task<int> RenewLeaseAsync(
         long jobId, string leaseOwner, string leaseToken, CancellationToken cancellationToken = default)
     {
         var until = DateTimeOffset.UtcNow.Add(Lease);
@@ -278,138 +311,173 @@ public sealed class AttachmentScanService(
     }
 
     /// <summary>
-    /// 以 LeaseToken fencing 落终态。构建 target 快照后调用 <see cref="ApplyFencedUpdateAsync"/>：
-    /// Npgsql 走 ExecuteUpdateAsync（匹配 Id+Status(Processing/Finalizing)+LeaseOwner+LeaseToken）；
-    /// InMemory（单测）走 tracked 重载 + lease 校验 + SaveChanges。
-    /// 返回 true 表示进入终态（Done/DeadLetter），false 表示已重试为 Pending 或租约丢失。
+    /// 瞬时扫描失败沿 lease-fenced 路径回到 Pending；重试耗尽时同样先写入
+    /// durable Rejected projection，禁止由扫描 worker 直接修改 Realtime 元数据。
     /// </summary>
-    private async Task<bool> ApplyTerminalAsync(
+    private async Task<AttachmentScanProcessResult> ApplyTerminalAsync(
         AttachmentScanJob claimed,
         ScanOutcome outcome,
         string? lastError,
         int maxAttempts,
         CancellationToken cancellationToken)
     {
+        if (outcome != ScanOutcome.Transient)
+            return AttachmentScanProcessResult.LeaseLost;
+
         var now = DateTimeOffset.UtcNow;
-        var truncatedError = lastError is null ? null : Truncate(lastError, 500);
-
-        if (outcome is ScanOutcome.Confirmed or ScanOutcome.Rejected)
-        {
-            var done = await ApplyFencedUpdateAsync(claimed, new TargetFields
-            {
-                Status = AttachmentScanJobStatus.Done,
-                CompletedAt = now,
-                AttemptCount = claimed.AttemptCount,
-                LastError = outcome == ScanOutcome.Rejected ? truncatedError : null,
-                NextAttemptAt = claimed.NextAttemptAt,
-                LeaseOwner = null,
-                LeaseToken = null,
-                LeaseExpiresAt = null,
-            }, cancellationToken).ConfigureAwait(false);
-            if (done)
-                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
-            return done;
-        }
-
-        // Transient：重试或耗尽。
+        var truncatedError = Truncate(lastError ?? "transient_scan_failure", 500);
         var attemptCount = Math.Max(1, claimed.AttemptCount + 1);
         AuthSecurityMetrics.AttachmentScan("retry");
 
         if (attemptCount < maxAttempts)
         {
             var nextAttemptAt = now.Add(ComputeBackoff(options.Value, attemptCount));
-            await ApplyFencedUpdateAsync(claimed, new TargetFields
+            var requeued = await ApplyFencedUpdateAsync(claimed, new TargetFields
             {
                 Status = AttachmentScanJobStatus.Pending,
                 CompletedAt = claimed.CompletedAt,
                 AttemptCount = attemptCount,
-                LastError = truncatedError ?? "transient_scan_failure",
+                LastError = truncatedError,
                 NextAttemptAt = nextAttemptAt,
                 LeaseOwner = null,
                 LeaseToken = null,
                 LeaseExpiresAt = null,
             }, cancellationToken).ConfigureAwait(false);
-            return false;
+            return requeued
+                ? AttachmentScanProcessResult.RetryScheduled
+                : AttachmentScanProcessResult.LeaseLost;
         }
 
-        // 重试耗尽：先让 Realtime 进入 Rejected，作业才 Done；元数据不可用则 DeadLetter。
         logger.LogError(
-            "附件扫描重试已耗尽 JobId={Id} AttachmentId={Aid} Attempts={Attempt}",
+            "附件扫描重试已耗尽，写入拒绝投递记录 JobId={Id} AttachmentId={AttachmentId} Attempts={AttemptCount}",
             claimed.Id,
             claimed.AttachmentId,
             attemptCount);
 
-        if (!metadata.IsAvailable)
-        {
-            var dead = await ApplyFencedUpdateAsync(claimed, new TargetFields
-            {
-                Status = AttachmentScanJobStatus.DeadLetter,
-                CompletedAt = now,
-                AttemptCount = attemptCount,
-                LastError = Truncate(truncatedError ?? "扫描重试已耗尽且元数据不可用", 500),
-                NextAttemptAt = claimed.NextAttemptAt,
-                LeaseOwner = null,
-                LeaseToken = null,
-                LeaseExpiresAt = null,
-            }, cancellationToken).ConfigureAwait(false);
-            if (dead)
-            {
-                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
-                AuthSecurityMetrics.AttachmentScan("dead_letter");
-            }
-            return dead;
-        }
-
-        try
-        {
-            await metadata.MarkRejectedAsync(
-                    claimed.AttachmentId,
-                    claimed.UserId,
-                    truncatedError ?? "扫描重试已耗尽",
-                    cancellationToken)
-                .ConfigureAwait(false);
-            AuthSecurityMetrics.AttachmentScan("rejected");
-            AuthSecurityMetrics.AttachmentScan("exhausted");
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "扫描耗尽后 MarkRejected 失败 AttachmentId={Id}", claimed.AttachmentId);
-            var dead = await ApplyFencedUpdateAsync(claimed, new TargetFields
-            {
-                Status = AttachmentScanJobStatus.DeadLetter,
-                CompletedAt = now,
-                AttemptCount = attemptCount,
-                LastError = Truncate($"exhausted_reject_failed:{ex.Message}", 500),
-                NextAttemptAt = claimed.NextAttemptAt,
-                LeaseOwner = null,
-                LeaseToken = null,
-                LeaseExpiresAt = null,
-            }, cancellationToken).ConfigureAwait(false);
-            if (dead)
-            {
-                AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
-                AuthSecurityMetrics.AttachmentScan("dead_letter");
-            }
-            return dead;
-        }
-
-        var doneExhausted = await ApplyFencedUpdateAsync(claimed, new TargetFields
-        {
-            Status = AttachmentScanJobStatus.Done,
-            CompletedAt = now,
-            AttemptCount = attemptCount,
-            LastError = truncatedError,
-            NextAttemptAt = claimed.NextAttemptAt,
-            LeaseOwner = null,
-            LeaseToken = null,
-            LeaseExpiresAt = null,
-        }, cancellationToken).ConfigureAwait(false);
-        if (doneExhausted)
-            AuthSecurityMetrics.AttachmentPendingScanDelta(-1);
-        return doneExhausted;
+        var exhausted = new ContentScanResult(
+            false,
+            null,
+            truncatedError,
+            false,
+            "ChatApp.ContentPipeline",
+            "exhausted");
+        var staged = await PersistFinalResultAsync(
+                claimed,
+                exhausted,
+                AttachmentScanProjectionOutcome.Rejected,
+                attemptCount,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (staged)
+            AuthSecurityMetrics.AttachmentScan("exhausted_staged");
+        return staged
+            ? AttachmentScanProcessResult.ResultStaged
+            : AttachmentScanProcessResult.LeaseLost;
     }
 
-    /// <summary>终态字段快照（仅 AttachmentScanJob 的可变字段）。</summary>
+    /// <summary>
+    /// Atomically changes the leased scan job to Finalizing and creates both the
+    /// immutable audit row and the metadata projection. No external call occurs
+    /// before this lease fence succeeds.
+    /// </summary>
+    private async Task<bool> PersistFinalResultAsync(
+        AttachmentScanJob claimed,
+        ContentScanResult result,
+        string outcome,
+        int attemptCount,
+        CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var finalContentType = result.ContentType
+                               ?? (string.IsNullOrWhiteSpace(claimed.ContentType)
+                                   ? "application/octet-stream"
+                                   : claimed.ContentType);
+        var rejectionReason = outcome == AttachmentScanProjectionOutcome.Rejected
+            ? Truncate(result.Error ?? "rejected", 500)
+            : null;
+        var projection = new AttachmentScanProjection
+        {
+            ScanJobId = claimed.Id,
+            AttachmentId = claimed.AttachmentId,
+            ObjectKey = claimed.ObjectKey,
+            UserId = claimed.UserId,
+            ContentType = finalContentType,
+            OriginalName = claimed.OriginalName,
+            SizeBytes = claimed.SizeBytes,
+            ContentHash = result.ContentHash,
+            Outcome = outcome,
+            RejectionReason = rejectionReason,
+            AttemptCount = 0,
+            NextAttemptAt = now,
+            CreatedAt = now,
+            Status = AttachmentScanProjectionStatus.Pending,
+        };
+        var audit = CreateScanAudit(claimed, result, attemptCount);
+
+        if (!IsNpgsql())
+        {
+            var tracked = await db.AttachmentScanJobs
+                .FirstOrDefaultAsync(j => j.Id == claimed.Id, cancellationToken)
+                .ConfigureAwait(false);
+            if (tracked is null
+                || tracked.Status != AttachmentScanJobStatus.Processing
+                || tracked.LeaseOwner != claimed.LeaseOwner
+                || tracked.LeaseToken != claimed.LeaseToken)
+                return false;
+
+            tracked.Status = AttachmentScanJobStatus.Finalizing;
+            tracked.CompletedAt = null;
+            tracked.AttemptCount = attemptCount;
+            tracked.LastError = rejectionReason;
+            tracked.NextAttemptAt = now;
+            tracked.LeaseOwner = null;
+            tracked.LeaseToken = null;
+            tracked.LeaseExpiresAt = null;
+            db.AttachmentScanProjections.Add(projection);
+            db.AttachmentScanAudits.Add(audit);
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            var updated = await db.AttachmentScanJobs
+                .Where(j => j.Id == claimed.Id
+                            && j.Status == AttachmentScanJobStatus.Processing
+                            && j.LeaseOwner == claimed.LeaseOwner
+                            && j.LeaseToken == claimed.LeaseToken)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(j => j.Status, AttachmentScanJobStatus.Finalizing)
+                    .SetProperty(j => j.CompletedAt, (DateTimeOffset?)null)
+                    .SetProperty(j => j.AttemptCount, attemptCount)
+                    .SetProperty(j => j.LastError, rejectionReason)
+                    .SetProperty(j => j.NextAttemptAt, now)
+                    .SetProperty(j => j.LeaseOwner, (string?)null)
+                    .SetProperty(j => j.LeaseToken, (string?)null)
+                    .SetProperty(j => j.LeaseExpiresAt, (DateTimeOffset?)null),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (updated != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
+
+            db.AttachmentScanProjections.Add(projection);
+            db.AttachmentScanAudits.Add(audit);
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     private sealed class TargetFields
     {
         public string Status { get; set; } = string.Empty;
@@ -473,77 +541,15 @@ public sealed class AttachmentScanService(
         return n == 1;
     }
 
-    private async Task<(ScanOutcome Outcome, string? LastError)> ExecuteScanAsync(
+    private Task<ContentScanResult> ExecuteScanAsync(
         AttachmentScanJob claimed,
-        CancellationToken cancellationToken)
-    {
-        var (ok, sniffedType, error, transient) = await ScanContentAsync(
-                claimed.ObjectKey,
-                claimed.ContentType,
-                claimed.OriginalName,
-                claimed.SizeBytes,
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        if (transient)
-        {
-            return (ScanOutcome.Transient, Truncate(error ?? "transient", 500));
-        }
-
-        if (!ok)
-        {
-            var rejectError = Truncate(error ?? "rejected", 500);
-            if (!metadata.IsAvailable)
-            {
-                return (ScanOutcome.Transient, Truncate("rejected_but_metadata_unavailable", 500));
-            }
-
-            try
-            {
-                await metadata.MarkRejectedAsync(
-                        claimed.AttachmentId, claimed.UserId, rejectError, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                return (ScanOutcome.Transient, Truncate($"reject_metadata_failed:{ex.Message}", 500));
-            }
-
-            AuthSecurityMetrics.AttachmentScan("rejected");
-            return (ScanOutcome.Rejected, rejectError);
-        }
-
-        if (!metadata.IsAvailable)
-        {
-            return (ScanOutcome.Transient, "metadata_unavailable");
-        }
-
-        var finalContentType = sniffedType
-                               ?? (string.IsNullOrWhiteSpace(claimed.ContentType)
-                                   ? "application/octet-stream"
-                                   : claimed.ContentType);
-
-        try
-        {
-            await metadata.ConfirmAsync(
-                    claimed.AttachmentId,
-                    claimed.UserId,
-                    claimed.ObjectKey,
-                    publicUrl: null,
-                    contentType: finalContentType,
-                    sizeBytes: claimed.SizeBytes,
-                    originalName: claimed.OriginalName,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            return (ScanOutcome.Transient, Truncate($"confirm_metadata_failed:{ex.Message}", 500));
-        }
-
-        AuthSecurityMetrics.AttachmentScan("confirmed");
-        return (ScanOutcome.Confirmed, null);
-    }
+        CancellationToken cancellationToken) =>
+        ScanContentAsync(
+            claimed.ObjectKey,
+            claimed.ContentType,
+            claimed.OriginalName,
+            claimed.SizeBytes,
+            cancellationToken);
 
     private async Task PurgeOldDoneAsync(CancellationToken cancellationToken)
     {
@@ -556,14 +562,35 @@ public sealed class AttachmentScanService(
             .Take(200)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        if (old.Count == 0)
-            return;
+        if (old.Count > 0)
+            db.AttachmentScanJobs.RemoveRange(old);
 
-        db.AttachmentScanJobs.RemoveRange(old);
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        var auditCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.Value.ScanAuditRetentionDays));
+        var oldAudits = await db.AttachmentScanAudits
+            .Where(x => x.CreatedAt < auditCutoff)
+            .OrderBy(x => x.CreatedAt)
+            .Take(1000)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (oldAudits.Count > 0)
+            db.AttachmentScanAudits.RemoveRange(oldAudits);
+
+        var oldProjections = await db.AttachmentScanProjections
+            .Where(x => x.Status == AttachmentScanProjectionStatus.Done
+                        && x.CompletedAt != null
+                        && x.CompletedAt < cutoff)
+            .OrderBy(x => x.CompletedAt)
+            .Take(200)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (oldProjections.Count > 0)
+            db.AttachmentScanProjections.RemoveRange(oldProjections);
+
+        if (old.Count > 0 || oldAudits.Count > 0 || oldProjections.Count > 0)
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<(bool Ok, string? ContentType, string? Error, bool Transient)> ScanContentAsync(
+    private async Task<ContentScanResult> ScanContentAsync(
         string objectKey,
         string? claimedContentType,
         string? originalName,
@@ -577,21 +604,36 @@ public sealed class AttachmentScanService(
         }
         catch (Exception ex)
         {
-            return (false, null, ex.Message, Transient: true);
+            return new ContentScanResult(
+                false, null, ex.Message, true, "unknown", "unknown");
         }
 
         if (read is null)
         {
             // 对象不可读（含 S3 NotFound）：保持 Scanning，瞬时重试；禁止扩展名-only 放行。
-            return (false, null, "附件对象不可读，无法完成内容扫描", Transient: true);
+            return new ContentScanResult(
+                false, null, "附件对象不可读，无法完成内容扫描", true,
+                "ChatApp.ContentPipeline", "1");
         }
 
         string finalType;
+        var auditEngine = "ChatApp.ContentPipeline";
+        var auditVersion = "1";
         string? contentHash = null;
+        var scanPath = Path.Combine(
+            Path.GetTempPath(),
+            $"chatapp-attachment-scan-{Guid.NewGuid():N}.blob");
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
             await using (read.Content)
+            await using (var scanFile = new FileStream(
+                             scanPath,
+                             FileMode.CreateNew,
+                             FileAccess.ReadWrite,
+                             FileShare.None,
+                             64 * 1024,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
                 var headerLen = 0;
                 var headerBuf = new byte[16];
@@ -608,9 +650,16 @@ public sealed class AttachmentScanService(
                 finalType = AttachmentMagicSniffer.Sniff(headerBuf.AsSpan(0, headerLen))
                             ?? "application/octet-stream";
                 if (!storage.IsAllowedContentType(finalType))
-                    return (false, null, "无法识别或不支持的附件内容类型", Transient: false);
+                    return new ContentScanResult(
+                        false, null, "无法识别或不支持的附件内容类型", false,
+                        auditEngine, auditVersion);
 
-                // 单次流式管线：魔数 → SHA-256 → 大小校验 → AV（可 Seek 则回绕；否则用已读头）。
+                // 单次流式管线：魔数 → SHA-256/大小校验 → 受控临时文件 →
+                // policy/AV。S3 response streams are commonly non-seekable; the
+                // temporary file keeps scanning full-content without a large byte[].
+                await scanFile.WriteAsync(
+                        headerBuf.AsMemory(0, headerLen), cancellationToken)
+                    .ConfigureAwait(false);
                 using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 hasher.AppendData(headerBuf.AsSpan(0, headerLen));
                 long total = headerLen;
@@ -621,54 +670,102 @@ public sealed class AttachmentScanService(
                     if (n == 0) break;
                     total += n;
                     if (total > max)
-                        return (false, null, "附件大小超限", Transient: false);
+                        return new ContentScanResult(
+                            false, null, "附件大小超限", false, auditEngine, auditVersion);
                     hasher.AppendData(buffer.AsSpan(0, n));
+                    await scanFile.WriteAsync(
+                            buffer.AsMemory(0, n), cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
-                Span<byte> hashBytes = stackalloc byte[32];
+                var hashBytes = new byte[32];
                 if (!hasher.TryGetHashAndReset(hashBytes, out var written) || written != 32)
-                    return (false, null, "附件哈希计算失败", Transient: true);
+                    return new ContentScanResult(
+                        false, null, "附件哈希计算失败", true, auditEngine, auditVersion);
                 contentHash = Convert.ToHexStringLower(hashBytes);
 
                 if (claimedSize > 0 && Math.Abs(total - claimedSize) > Math.Max(1024, claimedSize / 10))
-                    return (false, null, "附件大小与元数据不一致", Transient: false);
+                    return new ContentScanResult(
+                        false, null, "附件大小与元数据不一致", false, auditEngine, auditVersion);
 
-                AttachmentContentScanResult scan;
-                if (read.Content.CanSeek)
-                {
-                    read.Content.Position = 0;
-                    scan = await contentScanner.ScanAsync(
-                            read.Content, finalType, originalName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    // 非 Seek 流（如部分对象存储）：DenyList 仅需头 + 文件名，避免二次 OpenRead。
-                    await using var headerStream = new MemoryStream(headerBuf, 0, headerLen, writable: false);
-                    scan = await contentScanner.ScanAsync(
-                            headerStream, finalType, originalName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
+                await scanFile.FlushAsync(cancellationToken).ConfigureAwait(false);
+                scanFile.Position = 0;
+                var scan = await contentScanner.ScanAsync(
+                        scanFile, finalType, originalName, cancellationToken)
+                    .ConfigureAwait(false);
+                auditEngine = scan.EngineName ?? auditEngine;
+                auditVersion = scan.EngineVersion ?? auditVersion;
+                logger.LogInformation(
+                    "附件扫描审计 ObjectKey={ObjectKey} Engine={Engine} Version={Version} Allowed={Allowed} Reason={Reason}",
+                    objectKey,
+                    scan.EngineName ?? "unknown",
+                    scan.EngineVersion ?? "unknown",
+                    scan.Allowed,
+                    scan.Reason);
 
                 if (!scan.Allowed)
                 {
                     if (scan.IsTransient)
-                        return (false, null, scan.Reason, Transient: true);
-                    return (false, null, scan.Reason ?? "附件内容扫描未通过", Transient: false);
+                        return new ContentScanResult(
+                            false, null, scan.Reason, true, auditEngine, auditVersion);
+                    return new ContentScanResult(
+                        false, null, scan.Reason ?? "附件内容扫描未通过", false,
+                        auditEngine, auditVersion);
                 }
             }
         }
         catch (Exception ex)
         {
-            return (false, null, ex.Message, Transient: true);
+            return new ContentScanResult(
+                false, null, ex.Message, true, auditEngine, auditVersion);
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+            try
+            {
+                if (File.Exists(scanPath))
+                    File.Delete(scanPath);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "删除附件扫描临时文件失败 Path={Path}", scanPath);
+            }
         }
 
-        _ = contentHash; // 哈希已在单次读取中计算；content_hash 由上传路径写入元数据。
-        return (true, finalType, null, Transient: false);
+        return new ContentScanResult(
+            true, finalType, null, false, auditEngine, auditVersion, contentHash);
+    }
+
+    private AttachmentScanAudit CreateScanAudit(
+        AttachmentScanJob job,
+        ContentScanResult result,
+        int? attemptCount = null) =>
+        new()
+        {
+            ScanJobId = job.Id,
+            AttachmentId = job.AttachmentId,
+            ObjectKey = job.ObjectKey,
+            UserId = job.UserId,
+            AttemptCount = attemptCount ?? Math.Max(1, job.AttemptCount),
+            ContentType = result.ContentType ?? job.ContentType,
+            SizeBytes = job.SizeBytes,
+            EngineName = Truncate(result.EngineName ?? "unknown", 128),
+            EngineVersion = Truncate(result.EngineVersion ?? "unknown", 128),
+            Verdict = result.Transient ? "transient" : result.Ok ? "allowed" : "rejected",
+            Allowed = result.Ok,
+            IsTransient = result.Transient,
+            Reason = result.Error is null ? null : Truncate(result.Error, 500),
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+
+    private async Task WriteScanAuditAsync(
+        AttachmentScanJob job,
+        ContentScanResult result,
+        CancellationToken cancellationToken)
+    {
+        db.AttachmentScanAudits.Add(CreateScanAudit(job, result));
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static TimeSpan ComputeBackoff(AttachmentStorageOptions opts, int attemptCount)
@@ -688,6 +785,15 @@ public sealed class AttachmentScanService(
         Rejected,
         Transient,
     }
+
+    private sealed record ContentScanResult(
+        bool Ok,
+        string? ContentType,
+        string? Error,
+        bool Transient,
+        string? EngineName,
+        string? EngineVersion,
+        string? ContentHash = null);
 }
 
 /// <summary>DI 作用域工厂封装，供 BackgroundService / Confirm 路径入队。</summary>

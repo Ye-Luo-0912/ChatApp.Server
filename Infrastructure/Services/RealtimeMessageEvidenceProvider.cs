@@ -15,7 +15,7 @@ namespace Infrastructure.Services;
 /// <summary>
 /// 从 Realtime 消息表（优先）或 NATS 总线获取证据；带超时、短时缓存与简易熔断。
 /// </summary>
-public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
+public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, IDisposable
 {
     private static readonly Meter Meter = new("Infrastructure.Moderation.Evidence");
     private readonly Counter<long> _hits;
@@ -26,6 +26,7 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
     private readonly MessageEvidenceOptions _options;
     private readonly IRealtimeMessageBus? _bus;
     private readonly ILogger<RealtimeMessageEvidenceProvider> _logger;
+    private readonly NpgsqlDataSource? _dataSource;
     private readonly MemoryCache _cache = new(new MemoryCacheOptions
     {
         SizeLimit = 4096,
@@ -41,6 +42,9 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
         IRealtimeMessageBus? bus = null)
     {
         _options = options.Value;
+        if (!string.IsNullOrWhiteSpace(_options.RealtimeConnectionString))
+            _dataSource = NpgsqlDataSource.Create(_options.RealtimeConnectionString);
+
         _logger = logger;
         _bus = bus;
         _hits = Meter.CreateCounter<long>("moderation.evidence.hits");
@@ -79,7 +83,7 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
             timeout.CancelAfter(Math.Max(200, _options.TimeoutMilliseconds));
 
             MessageEvidenceSnapshot? snapshot = null;
-            if (!string.IsNullOrWhiteSpace(_options.RealtimeConnectionString))
+            if (_dataSource is not null)
                 snapshot = await LoadFromPostgresAsync(key, timeout.Token).ConfigureAwait(false);
             else if (_bus is not null && requestingUserId is > 0)
                 snapshot = await LoadFromBusAsync(requestingUserId.Value, key, timeout.Token).ConfigureAwait(false);
@@ -132,8 +136,8 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
         string messageId, CancellationToken cancellationToken)
     {
         var schema = string.IsNullOrWhiteSpace(_options.Schema) ? "realtime" : _options.Schema.Trim();
-        await using var conn = new NpgsqlConnection(_options.RealtimeConnectionString);
-        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var conn = await _dataSource!.OpenConnectionAsync(cancellationToken)
+            .ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
              SELECT message_id, sender_user_id, receiver_user_id, content, received_at_ms,
@@ -208,5 +212,11 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider
             editVersion,
             editedAtMs,
             recalledAtMs);
+    }
+
+    public void Dispose()
+    {
+        _cache.Dispose();
+        _dataSource?.Dispose();
     }
 }

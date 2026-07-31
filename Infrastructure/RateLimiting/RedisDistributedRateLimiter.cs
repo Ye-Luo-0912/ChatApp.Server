@@ -44,15 +44,18 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
 
     private readonly IConnectionMultiplexer _redis;
     private readonly string _keyPrefix;
+    private readonly int _clusterShardCount;
     private readonly ILogger<RedisDistributedRateLimiter> _logger;
 
     public RedisDistributedRateLimiter(
         IConnectionMultiplexer redis,
         IOptions<RedisCacheOptions> options,
-        ILogger<RedisDistributedRateLimiter> logger)
+        ILogger<RedisDistributedRateLimiter> logger,
+        IOptions<Core.Settings.RateLimitingOptions>? rateOptions = null)
     {
         _redis = redis;
         _keyPrefix = options.Value.KeyPrefix;
+        _clusterShardCount = Math.Max(1, rateOptions?.Value.ClusterShardCount ?? 1);
         _logger = logger;
     }
 
@@ -70,7 +73,10 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
         cancellationToken.ThrowIfCancellationRequested();
 
         var keys = new RedisKey[partitionKeys.Count];
-        var clusterTag = "{" + policyName + "}:";
+        var shard = SelectShard(policyName, partitionKeys);
+        var clusterTag = _clusterShardCount <= 1
+            ? "{" + policyName + "}:"
+            : "{" + policyName + ":shard-" + shard.ToString("D3") + "}:";
         for (var i = 0; i < keys.Length; i++)
             keys[i] = _keyPrefix + "rl:fw:" + clusterTag + partitionKeys[i];
 
@@ -123,6 +129,35 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
             return failOpen
                 ? new RateLimitAcquireResult(true, null)
                 : new RateLimitAcquireResult(false, TimeSpan.FromSeconds(1));
+        }
+    }
+
+    private int SelectShard(string policyName, IReadOnlyList<string> partitionKeys)
+    {
+        if (_clusterShardCount <= 1)
+            return 0;
+
+        unchecked
+        {
+            uint hash = 2166136261;
+            foreach (var c in policyName)
+            {
+                hash ^= c;
+                hash *= 16777619;
+            }
+
+            foreach (var key in partitionKeys)
+            {
+                hash ^= 0x1f;
+                hash *= 16777619;
+                foreach (var c in key)
+                {
+                    hash ^= c;
+                    hash *= 16777619;
+                }
+            }
+
+            return (int)(hash % (uint)_clusterShardCount);
         }
     }
 }

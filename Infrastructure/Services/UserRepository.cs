@@ -242,6 +242,7 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
             }
 
             user.SecurityStamp = Guid.NewGuid().ToString();
+            user.AdvanceSecurityVersion();
 
             db.AdminAuditLogs.Add(new AdminAuditLog
             {
@@ -294,6 +295,7 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
                 Id = e.Id,
                 EventType = e.EventType,
                 DeviceId = e.DeviceId,
+                SessionId = e.SessionId,
                 ClientIp = e.ClientIp,
                 Location = e.Location,
                 Detail = e.Detail,
@@ -311,4 +313,22 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
             NextCursor = hasMore && rows.Count > 0 ? rows[^1].Id.ToString() : null,
         };
     }
+
+    public Task<SecurityEventDto?> GetSecurityEventAsync(
+        long userId, long eventId, CancellationToken cancellationToken = default)
+        => db.SecurityEvents
+            .AsNoTracking()
+            .Where(e => e.UserId == userId && e.Id == eventId)
+            .Select(e => new SecurityEventDto
+            {
+                Id = e.Id,
+                EventType = e.EventType,
+                DeviceId = e.DeviceId,
+                SessionId = e.SessionId,
+                ClientIp = e.ClientIp,
+                Location = e.Location,
+                Detail = e.Detail,
+                CreatedAt = e.CreatedAt,
+            })
+            .SingleOrDefaultAsync(cancellationToken);
 }

@@ -19,8 +19,10 @@ public static class AccountLifecycleModuleExtensions
     /// <summary>注册账号生命周期模块。</summary>
     public static IServiceCollection AddAccountLifecycleModule(this IServiceCollection services, IConfiguration config)
     {
-        services.Configure<AccountCleanupSagaOptions>(config.GetSection(AccountCleanupSagaOptions.SectionName));
-        services.Configure<DataExportStorageOptions>(config.GetSection(DataExportStorageOptions.SectionName));
+        services.AddValidatedOptions<AccountCleanupSagaOptions, AccountCleanupSagaOptionsValidator>(
+            config, AccountCleanupSagaOptions.SectionName);
+        services.AddValidatedOptions<DataExportStorageOptions, DataExportStorageOptionsValidator>(
+            config, DataExportStorageOptions.SectionName);
 
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
         services.AddScoped<AccountCleanupSagaService>();
@@ -34,7 +36,13 @@ public static class AccountLifecycleModuleExtensions
             sp.GetRequiredService<ILogger<AccountCleanupSagaWorker>>()));
         services.AddHostedService<AccountDeletionWorker>();
         services.AddHostedService<SecurityEventArchiveWorker>();
-        services.AddSingleton<IDataExportBlobStore, LocalDataExportBlobStore>();
+        services.AddSingleton<IDataExportBlobStore>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<DataExportStorageOptions>>().Value;
+            return string.Equals(options.Provider, "S3", StringComparison.OrdinalIgnoreCase)
+                ? ActivatorUtilities.CreateInstance<S3DataExportBlobStore>(sp)
+                : ActivatorUtilities.CreateInstance<LocalDataExportBlobStore>(sp);
+        });
         services.AddSingleton<IRealtimeChatExportReader>(sp =>
         {
             var evidence = sp.GetRequiredService<IOptions<MessageEvidenceOptions>>().Value;
@@ -55,9 +63,6 @@ public static class AccountLifecycleModuleExtensions
         });
         services.AddScoped<IDataExportService, DataExportService>();
         services.AddHostedService<DataExportWorker>();
-
-        services.AddSingleton<IValidateOptions<AccountCleanupSagaOptions>, AccountCleanupSagaOptionsValidator>();
-        services.AddSingleton<IValidateOptions<DataExportStorageOptions>, DataExportStorageOptionsValidator>();
 
         return services;
     }

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using Core.Interfaces;
 using Core.Models.Export;
 using Core.Settings;
@@ -40,6 +41,86 @@ public sealed class AttachmentScanRetryTests
         Assert.Equal(AttachmentScanJobStatus.Done, done.Status);
         Assert.Contains("att1", meta.Confirmed);
         Assert.Empty(meta.Rejected);
+        Assert.Equal(
+            Convert.ToHexStringLower(SHA256.HashData("hello-scan"u8)),
+            Assert.Single(meta.UploadedHashes));
+    }
+
+    [Fact]
+    public async Task StaleScanLease_CannotStageProjectionOrWriteMetadata()
+    {
+        await using var db = CreateDb();
+        var storage = new MemoryAttachmentStorage();
+        storage.Put("u/1/stale.bin", "lease-fenced"u8.ToArray());
+        var meta = new RecordingMetadataStore();
+        var svc = CreateService(db, storage, meta, new DenyListAttachmentContentScanner());
+
+        var winner = new AttachmentScanJob
+        {
+            AttachmentId = "att-stale",
+            ObjectKey = "u/1/stale.bin",
+            UserId = 9,
+            ContentType = "application/octet-stream",
+            OriginalName = "stale.bin",
+            SizeBytes = 12,
+            Status = AttachmentScanJobStatus.Processing,
+            LeaseOwner = "winner",
+            LeaseToken = "winner-token",
+            LeaseExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+        };
+        db.AttachmentScanJobs.Add(winner);
+        await db.SaveChangesAsync();
+
+        var staleClaim = new AttachmentScanJob
+        {
+            Id = winner.Id,
+            AttachmentId = winner.AttachmentId,
+            ObjectKey = winner.ObjectKey,
+            UserId = winner.UserId,
+            ContentType = winner.ContentType,
+            OriginalName = winner.OriginalName,
+            SizeBytes = winner.SizeBytes,
+            Status = AttachmentScanJobStatus.Processing,
+            LeaseOwner = "stale",
+            LeaseToken = "stale-token",
+        };
+
+        Assert.Equal(
+            AttachmentScanProcessResult.LeaseLost,
+            await svc.ProcessClaimedJobAsync(staleClaim));
+        Assert.Empty(meta.Confirmed);
+        Assert.Empty(meta.Rejected);
+        Assert.Empty(await db.AttachmentScanProjections.ToListAsync());
+    }
+
+    [Fact]
+    public async Task ProjectionFailure_RetriesWithoutRescanning()
+    {
+        await using var db = CreateDb();
+        var storage = new MemoryAttachmentStorage();
+        storage.Put("u/1/projection.bin", "projection-retry"u8.ToArray());
+        var meta = new RecordingMetadataStore { RemainingConfirmFailures = 1 };
+        var scanner = new CountingAllowScanner();
+        var svc = CreateService(db, storage, meta, scanner);
+
+        await svc.EnqueueAsync("att-projection", 9, "u/1/projection.bin", "application/octet-stream", "projection.bin", 16);
+
+        Assert.Equal(0, await svc.ProcessDueAsync());
+        Assert.Equal(1, scanner.Calls);
+        var staged = await db.AttachmentScanJobs.SingleAsync();
+        Assert.Equal(AttachmentScanJobStatus.Finalizing, staged.Status);
+        var retry = await db.AttachmentScanProjections.SingleAsync();
+        Assert.Equal(AttachmentScanProjectionStatus.Pending, retry.Status);
+        Assert.Equal(1, retry.AttemptCount);
+
+        retry.NextAttemptAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(1, await svc.ProcessDueAsync());
+        Assert.Equal(1, scanner.Calls);
+        Assert.Equal(AttachmentScanJobStatus.Done, (await db.AttachmentScanJobs.SingleAsync()).Status);
+        Assert.Equal(AttachmentScanProjectionStatus.Done, (await db.AttachmentScanProjections.SingleAsync()).Status);
+        Assert.Contains("att-projection", meta.Confirmed);
     }
 
     [Fact]
@@ -66,20 +147,30 @@ public sealed class AttachmentScanRetryTests
         IAttachmentStorage storage,
         IAttachmentMetadataStore meta,
         IAttachmentContentScanner scanner)
-        => new(
+    {
+        var options = Options.Create(new AttachmentStorageOptions
+        {
+            MaxBytes = 1024 * 1024,
+            MaxScanAttempts = 10,
+            ScanBackoffSeconds = 1,
+            ScanBatchSize = 50,
+            AllowedContentTypes = ["application/octet-stream", "image/png"],
+        });
+        var projection = new AttachmentScanProjectionService(
+            db,
+            meta,
+            storage,
+            new RecordingBlobDeleteService(),
+            options,
+            NullLogger<AttachmentScanProjectionService>.Instance);
+        return new AttachmentScanService(
             db,
             storage,
-            meta,
             scanner,
-            Options.Create(new AttachmentStorageOptions
-            {
-                MaxBytes = 1024 * 1024,
-                MaxScanAttempts = 10,
-                ScanBackoffSeconds = 1,
-                ScanBatchSize = 50,
-                AllowedContentTypes = ["application/octet-stream", "image/png"],
-            }),
-            NullLogger<AttachmentScanService>.Instance);
+            options,
+            NullLogger<AttachmentScanService>.Instance,
+            projection);
+    }
 
     private static UserDbContext CreateDb()
     {
@@ -87,6 +178,21 @@ public sealed class AttachmentScanRetryTests
             .UseInMemoryDatabase(Guid.NewGuid().ToString("N"))
             .Options;
         return new UserDbContext(options);
+    }
+
+    private sealed class CountingAllowScanner : IAttachmentContentScanner
+    {
+        public int Calls { get; private set; }
+
+        public Task<AttachmentContentScanResult> ScanAsync(
+            Stream content,
+            string? sniffedContentType,
+            string? originalName,
+            CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            return Task.FromResult(AttachmentContentScanResult.Allow());
+        }
     }
 
     private sealed class FlakyScanner(int failTransientUntil) : IAttachmentContentScanner
@@ -152,10 +258,31 @@ public sealed class AttachmentScanRetryTests
             => Task.CompletedTask;
     }
 
+    private sealed class RecordingBlobDeleteService : IAttachmentBlobDeleteService
+    {
+        public Task EnqueueAsync(
+            IEnumerable<string> objectKeys,
+            long? userId = null,
+            string? attachmentId = null,
+            CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public Task EnqueueAsync(
+            IEnumerable<(string ObjectKey, string? AttachmentId)> items,
+            long? userId = null,
+            CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public Task<int> ProcessDueAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(0);
+    }
+
     private sealed class RecordingMetadataStore : IAttachmentMetadataStore
     {
         public List<string> Confirmed { get; } = [];
         public List<string> Rejected { get; } = [];
+        public List<string> UploadedHashes { get; } = [];
+        public int RemainingConfirmFailures { get; set; }
         public bool IsAvailable => true;
         public string UnavailableReason => "";
 
@@ -170,6 +297,12 @@ public sealed class AttachmentScanRetryTests
             string contentType, long sizeBytes, string? originalName = null,
             CancellationToken cancellationToken = default)
         {
+            if (RemainingConfirmFailures > 0)
+            {
+                RemainingConfirmFailures--;
+                throw new InvalidOperationException("realtime_unavailable");
+            }
+
             Confirmed.Add(attachmentId);
             return Task.CompletedTask;
         }
@@ -177,7 +310,11 @@ public sealed class AttachmentScanRetryTests
         public Task MarkUploadedScanningAsync(
             string attachmentId, long uploaderUserId, long sizeBytes, string? sha256Hex = null,
             CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+        {
+            if (!string.IsNullOrWhiteSpace(sha256Hex))
+                UploadedHashes.Add(sha256Hex);
+            return Task.CompletedTask;
+        }
 
         public Task MarkRejectedAsync(
             string attachmentId, long uploaderUserId, string? reason = null,

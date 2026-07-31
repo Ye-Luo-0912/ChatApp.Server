@@ -10,6 +10,7 @@ using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Data;
 using Infrastructure.Diagnostics;
+using Infrastructure.Serialization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -48,18 +49,11 @@ public sealed record DataExportStatusDto(
     /// <summary>公开稳定错误码（Failed 时）；不含异常原文。</summary>
     string? ErrorCode);
 
-public interface IDataExportBlobStore
-{
-    Task WriteAsync(string objectKey, Stream content, CancellationToken cancellationToken = default);
-    Task<Stream?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default);
-    Task DeleteAsync(string objectKey, CancellationToken cancellationToken = default);
-}
-
 /// <summary>
 /// 本地文件导出存储。默认 CAE3 分块 AES-GCM 信封加密落盘（Security:SecretEncryptionKey）。
 /// 仍可读遗留 CAE2（零长 EOF）、CAE1 整包密文与明文。生产切 S3 时见 <see cref="DataExportStorageOptions.S3SseMode"/>（SSE-S3/KMS）。
 /// </summary>
-public sealed class LocalDataExportBlobStore : IDataExportBlobStore
+public sealed class LocalDataExportBlobStore : IDataExportBlobStore, IObjectStoreHealthProbe
 {
     private static readonly byte[] MagicCae1 = "CAE1"u8.ToArray();
     private static readonly byte[] MagicCae2 = "CAE2"u8.ToArray();
@@ -200,6 +194,14 @@ public sealed class LocalDataExportBlobStore : IDataExportBlobStore
             ArrayPool<byte>.Shared.Return(plainBuf, clearArray: false);
             ArrayPool<byte>.Shared.Return(cipherBuf, clearArray: false);
         }
+    }
+
+    public Task ProbeAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(_root))
+            throw new DirectoryNotFoundException(_root);
+        return Task.CompletedTask;
     }
 
     public Task<Stream?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default)
@@ -902,15 +904,35 @@ public sealed class DataExportWorker(
                 // P0-5.2：只领取当前真正拥有执行槽的任务数量；每个作业独立作用域+独立 DbContext 并发处理。
                 inFlight.RemoveAll(static t => t.IsCompleted);
                 var available = Math.Max(0, workerConcurrency - inFlight.Count);
-                for (var i = 0; i < available; i++)
+                var reservations = new List<IAsyncDisposable>(available);
+                while (reservations.Count < available
+                       && concurrencyManager.TryAcquire(WorkerName, workerConcurrency, out var reservation))
                 {
-                    var claimed = await ClaimOneAsync(stoppingToken).ConfigureAwait(false);
-                    if (claimed is null) break;
+                    reservations.Add(reservation!);
+                }
 
-                    var concurrencyScope = await concurrencyManager.AcquireAsync(
-                        WorkerName, workerConcurrency, stoppingToken).ConfigureAwait(false);
+                for (var i = 0; i < reservations.Count; i++)
+                {
+                    (DataExportJob Job, string LeaseToken)? claimed;
+                    try
+                    {
+                        claimed = await ClaimOneAsync(stoppingToken).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        await reservations[i].DisposeAsync().ConfigureAwait(false);
+                        for (var j = i + 1; j < reservations.Count; j++)
+                            await reservations[j].DisposeAsync().ConfigureAwait(false);
+                        throw;
+                    }
+                    if (claimed is null)
+                    {
+                        await reservations[i].DisposeAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
                     inFlight.Add(ProcessOneAsync(
-                        claimed.Value.Job, claimed.Value.LeaseToken, concurrencyScope, stoppingToken));
+                        claimed.Value.Job, claimed.Value.LeaseToken, reservations[i], stoppingToken));
                 }
 
                 inFlight.RemoveAll(static t => t.IsCompleted);
@@ -1053,6 +1075,13 @@ public sealed class DataExportWorker(
         var leaseToken = Guid.NewGuid().ToString("N");
         var owner = $"{ProcessOwner}:{Guid.NewGuid():N}"[..32];
 
+        if (db.Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return await ClaimOneNpgsqlAsync(
+                    db, owner, leaseToken, now, leaseUntil, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         var job = await db.DataExportJobs
             .Where(j => j.Status == DataExportJobStatus.Pending
                         || (j.Status == DataExportJobStatus.Processing
@@ -1087,6 +1116,73 @@ public sealed class DataExportWorker(
         return (snapshot, leaseToken);
     }
 
+    internal static async Task<(DataExportJob Job, string LeaseToken)?> ClaimOneNpgsqlAsync(
+        UserDbContext db,
+        string owner,
+        string leaseToken,
+        DateTimeOffset now,
+        DateTimeOffset leaseUntil,
+        CancellationToken cancellationToken)
+    {
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE "T_DataExportJob" AS j
+            SET "Status" = 'Processing',
+                "LeaseOwner" = @owner,
+                "LeaseToken" = @lease_token,
+                "LeaseUntil" = @lease_until,
+                "AttemptCount" = j."AttemptCount" + 1
+            WHERE j."Id" = (
+                SELECT c."Id"
+                FROM "T_DataExportJob" AS c
+                WHERE c."Status" = 'Pending'
+                   OR (c."Status" = 'Processing'
+                       AND (c."LeaseUntil" IS NULL OR c."LeaseUntil" < @now))
+                ORDER BY c."CreatedAt", c."Id"
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING j."Id", j."UserId", j."AttemptCount";
+            """;
+
+        AddParameter(command, "owner", owner);
+        AddParameter(command, "lease_token", leaseToken);
+        AddParameter(command, "lease_until", leaseUntil);
+        AddParameter(command, "now", now);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        var job = new DataExportJob
+        {
+            Id = reader.GetString(0),
+            UserId = reader.GetInt64(1),
+            Status = DataExportJobStatus.Processing,
+            LeaseOwner = owner,
+            LeaseToken = leaseToken,
+            LeaseUntil = leaseUntil,
+            AttemptCount = reader.GetInt32(2),
+        };
+        return (job, leaseToken);
+    }
+
+    private static void AddParameter(
+        System.Data.Common.DbCommand command,
+        string name,
+        object value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
+    }
+
     /// <summary>
     /// 处理单个已领取作业：独立作用域 + 独立 DbContext + 独立心跳续租。
     /// 终态由 <see cref="ProcessJobAsync"/> 内部以 LeaseOwner+LeaseToken fencing 落库；租约已易主时抛 InvalidOperationException 由失败分支处理。
@@ -1118,6 +1214,8 @@ public sealed class DataExportWorker(
         {
             logger.LogError(ex, "导出作业失败 JobId={JobId}", job.Id);
             var publicCode = DataExportJobErrors.MapPublicCode(ex);
+            if (publicCode == DataExportJobErrors.LeaseLost)
+                concurrencyManager.RecordLeaseLost(WorkerName);
             try
             {
                 await using var scope = scopeFactory.CreateAsyncScope();
@@ -1168,19 +1266,35 @@ public sealed class DataExportWorker(
         CancellationToken cancellationToken)
     {
         // 独立心跳：不依赖阶段边界；长查询/大文件上传期间持续续约（独立 DbContext，避免并发争用）。
+        using var workCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var heartbeatFailure = new TaskCompletionSource<Exception>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
         var heartbeatInterval = TimeSpan.FromSeconds(Math.Max(5, leaseSeconds / 3.0));
         var heartbeat = Task.Run(async () =>
         {
-            while (!heartbeatCts.Token.IsCancellationRequested)
+            try
             {
-                await Task.Delay(heartbeatInterval, heartbeatCts.Token).ConfigureAwait(false);
-                await using var scope = scopeFactory.CreateAsyncScope();
-                var hbDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-                await RenewLeaseAsync(hbDb, jobId, leaseOwner, leaseToken, leaseSeconds, heartbeatCts.Token)
-                    .ConfigureAwait(false);
+                while (!heartbeatCts.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(heartbeatInterval, heartbeatCts.Token).ConfigureAwait(false);
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var hbDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+                    await RenewLeaseAsync(hbDb, jobId, leaseOwner, leaseToken, leaseSeconds, heartbeatCts.Token)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (heartbeatCts.IsCancellationRequested)
+            {
+                // Normal shutdown or caller cancellation.
+            }
+            catch (Exception ex)
+            {
+                heartbeatFailure.TrySetResult(ex);
+                workCts.Cancel();
             }
         }, CancellationToken.None);
+        cancellationToken = workCts.Token;
 
         try
         {
@@ -1194,7 +1308,7 @@ public sealed class DataExportWorker(
 
             var events = await db.SecurityEvents.AsNoTracking()
                 .Where(e => e.UserId == userId).OrderByDescending(e => e.Id).Take(2000)
-                .Select(e => new { e.Id, e.EventType, e.DeviceId, e.ClientIp, e.Location, e.Detail, e.CreatedAt })
+                .Select(e => new { e.Id, e.EventType, e.DeviceId, e.SessionId, e.ClientIp, e.Location, e.Detail, e.CreatedAt })
                 .ToListAsync(cancellationToken);
             var notifications = await db.InAppNotifications.AsNoTracking()
                 .Where(n => n.UserId == userId).OrderByDescending(n => n.Id).Take(2000)
@@ -1206,8 +1320,14 @@ public sealed class DataExportWorker(
                 .OrderByDescending(r => r.Id).Take(500)
                 .Select(r => new
                 {
-                    r.Id, r.ReporterId, r.TargetType, r.TargetUserId, r.TargetMessageId,
-                    r.Reason, r.Status, r.CreatedAt,
+                    r.Id,
+                    r.ReporterId,
+                    r.TargetType,
+                    r.TargetUserId,
+                    r.TargetMessageId,
+                    r.Reason,
+                    r.Status,
+                    r.CreatedAt,
                 })
                 .ToListAsync(cancellationToken);
             var devices = await db.TrustedDevices.AsNoTracking()
@@ -1220,38 +1340,44 @@ public sealed class DataExportWorker(
             var tempPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-{jobId}.json");
             try
             {
-                await using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                await using (var writer = new Utf8JsonWriter(fs, new JsonWriterOptions { Indented = true }))
+                await using (var fs = new FileStream(
+                                 tempPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                 bufferSize: 64 * 1024,
+                                 FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
-                    writer.WriteStartObject();
-                    writer.WriteString("exportedAt", DateTimeOffset.UtcNow);
-                    writer.WritePropertyName("profile");
-                    JsonSerializer.Serialize(writer, new
+                    var writer = new SequentialJsonObjectWriter(fs);
+                    await writer.StartAsync(cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("exportedAt", DateTimeOffset.UtcNow, cancellationToken)
+                        .ConfigureAwait(false);
+                    await writer.WritePropertyAsync("profile", new
                     {
-                        user.Id, user.UserName, user.Email, user.Signature, user.Region,
-                        user.CreatedDate, user.AvatarUrl, user.PhoneNumber,
-                    });
-                    writer.WritePropertyName("friendIds");
-                    JsonSerializer.Serialize(writer, friendIds);
-                    writer.WritePropertyName("securityEvents");
-                    JsonSerializer.Serialize(writer, events);
-                    writer.WritePropertyName("notifications");
-                    JsonSerializer.Serialize(writer, notifications);
-                    writer.WritePropertyName("reports");
-                    JsonSerializer.Serialize(writer, reports);
-                    writer.WritePropertyName("trustedDevices");
-                    JsonSerializer.Serialize(writer, devices);
-                    writer.WritePropertyName("sessions");
-                    JsonSerializer.Serialize(writer, sessionList.Select(s => new
+                        user.Id,
+                        user.UserName,
+                        user.Email,
+                        user.Signature,
+                        user.Region,
+                        user.CreatedDate,
+                        user.AvatarUrl,
+                        user.PhoneNumber,
+                    }, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("friendIds", friendIds, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("securityEvents", events, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("notifications", notifications, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("reports", reports, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("trustedDevices", devices, cancellationToken).ConfigureAwait(false);
+                    await writer.WritePropertyAsync("sessions", sessionList.Select(s => new
                     {
-                        s.DeviceId, s.ClientIp, s.LoginAt, s.LastActiveAt, s.DeviceName, s.SessionId,
-                    }));
+                        s.DeviceId,
+                        s.ClientIp,
+                        s.LoginAt,
+                        s.LastActiveAt,
+                        s.DeviceName,
+                        s.SessionId,
+                    }), cancellationToken).ConfigureAwait(false);
 
                     await WriteChatExportAsync(writer, chatExport, attachmentMeta, userId, opts, cancellationToken)
                         .ConfigureAwait(false);
-
-                    writer.WriteEndObject();
-                    await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    await writer.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 await using (var read = new FileStream(
@@ -1286,17 +1412,24 @@ public sealed class DataExportWorker(
             if (updated == 0)
                 throw new InvalidOperationException("导出完成但租约已易主，丢弃结果");
         }
+        catch (OperationCanceledException) when (heartbeatFailure.Task.IsCompletedSuccessfully)
+        {
+            var failure = await heartbeatFailure.Task.ConfigureAwait(false);
+            var message = failure is InvalidOperationException ioe
+                          && ioe.Message.Contains("租约", StringComparison.Ordinal)
+                ? "导出租约已丢失"
+                : "导出租约续租失败";
+            throw new InvalidOperationException(message, failure);
+        }
         finally
         {
             heartbeatCts.Cancel();
-            try { await heartbeat.ConfigureAwait(false); }
-            catch (OperationCanceledException) { /* expected */ }
-            catch (InvalidOperationException) { /* lease lost during cancel — surface via main path */ }
+            await heartbeat.ConfigureAwait(false);
         }
     }
 
     internal static async Task WriteChatExportAsync(
-        Utf8JsonWriter writer,
+        SequentialJsonObjectWriter writer,
         IRealtimeChatExportReader chatExport,
         long userId,
         DataExportStorageOptions opts,
@@ -1306,7 +1439,7 @@ public sealed class DataExportWorker(
             .ConfigureAwait(false);
 
     internal static async Task WriteChatExportAsync(
-        Utf8JsonWriter writer,
+        SequentialJsonObjectWriter writer,
         IRealtimeChatExportReader chatExport,
         IAttachmentMetadataStore attachmentMeta,
         long userId,
@@ -1315,25 +1448,23 @@ public sealed class DataExportWorker(
     {
         if (!opts.IncludeChatContent)
         {
-            writer.WritePropertyName("chatExport");
-            JsonSerializer.Serialize(writer, new
+            await writer.WritePropertyAsync("chatExport", new
             {
                 status = "skipped",
                 reason = "DataExport:IncludeChatContent=false",
-            });
-            WriteEmptyChatArrays(writer);
+            }, cancellationToken).ConfigureAwait(false);
+            await WriteEmptyChatArraysAsync(writer, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (!chatExport.IsAvailable)
         {
-            writer.WritePropertyName("chatExport");
-            JsonSerializer.Serialize(writer, new
+            await writer.WritePropertyAsync("chatExport", new
             {
                 status = "unavailable",
                 reason = chatExport.UnavailableReason,
-            });
-            WriteEmptyChatArrays(writer);
+            }, cancellationToken).ConfigureAwait(false);
+            await WriteEmptyChatArraysAsync(writer, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1351,9 +1482,13 @@ public sealed class DataExportWorker(
         var urlScanSkippedNote = false;
 
         var receiptsPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-rcpt-{Guid.NewGuid():N}.json");
+        var messagesPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-msg-{Guid.NewGuid():N}.json");
         var attachmentsPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-att-{Guid.NewGuid():N}.json");
         try
         {
+            await using (var messagesFs = new FileStream(
+                             messagesPath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                             bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var receiptsFs = new FileStream(
                              receiptsPath, FileMode.Create, FileAccess.Write, FileShare.Read,
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
@@ -1361,9 +1496,11 @@ public sealed class DataExportWorker(
                              attachmentsPath, FileMode.Create, FileAccess.Write, FileShare.Read,
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var receiptsWriter = new Utf8JsonWriter(receiptsFs))
+            await using (var messagesWriter = new Utf8JsonWriter(messagesFs))
             await using (var attachmentsWriter = new Utf8JsonWriter(attachmentsFs))
             {
                 receiptsWriter.WriteStartArray();
+                messagesWriter.WriteStartArray();
                 attachmentsWriter.WriteStartArray();
 
                 // Formal attachments first (DB rows), then legacy parser fallback de-duped by URL.
@@ -1402,14 +1539,15 @@ public sealed class DataExportWorker(
                             formalAttachmentCount++;
                         }
                     }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
                     catch
                     {
                         // Formal source optional; fall through to parser.
                     }
                 }
-
-                writer.WritePropertyName("messages");
-                writer.WriteStartArray();
 
                 await foreach (var msg in chatExport.ReadMessagesAsync(userId, maxMessages + 1, cancellationToken)
                                    .ConfigureAwait(false))
@@ -1422,7 +1560,7 @@ public sealed class DataExportWorker(
 
                     // 撤回 stub：正文置空；编辑/撤回字段加性导出，兼容旧客户端忽略未知字段。
                     var exportContent = msg.IsRecalled ? string.Empty : msg.Content;
-                    JsonSerializer.Serialize(writer, new
+                    JsonSerializer.Serialize(messagesWriter, new
                     {
                         msg.MessageId,
                         msg.ClientMessageId,
@@ -1481,26 +1619,28 @@ public sealed class DataExportWorker(
                     // 长导出期间周期性 flush，配合租约心跳避免缓冲过大。
                     if ((messageCount & 0x1FF) == 0)
                     {
-                        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        await messagesWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
                         await receiptsWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
                         await attachmentsWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
                     }
                 }
 
-                writer.WriteEndArray();
+                messagesWriter.WriteEndArray();
                 receiptsWriter.WriteEndArray();
                 attachmentsWriter.WriteEndArray();
                 await receiptsWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
                 await attachmentsWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await messagesWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await WriteJsonFilePropertyAsync(writer, "receipts", receiptsPath, cancellationToken)
+            await writer.WriteRawJsonFilePropertyAsync("messages", messagesPath, cancellationToken)
                 .ConfigureAwait(false);
-            await WriteJsonFilePropertyAsync(writer, "attachments", attachmentsPath, cancellationToken)
+            await writer.WriteRawJsonFilePropertyAsync("receipts", receiptsPath, cancellationToken)
+                .ConfigureAwait(false);
+            await writer.WriteRawJsonFilePropertyAsync("attachments", attachmentsPath, cancellationToken)
                 .ConfigureAwait(false);
 
-            writer.WritePropertyName("chatExport");
-            JsonSerializer.Serialize(writer, new
+            await writer.WritePropertyAsync("chatExport", new
             {
                 status = truncated || attachmentUrlsCapped ? "truncated" : "ok",
                 messageCount,
@@ -1517,42 +1657,23 @@ public sealed class DataExportWorker(
                     : urlScanSkippedNote
                         ? "some message bodies exceeded urlScanMaxContentChars; URL scan skipped for those"
                         : (string?)null,
-            });
+            }, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
+            try { if (File.Exists(messagesPath)) File.Delete(messagesPath); } catch { /* best effort */ }
             try { if (File.Exists(receiptsPath)) File.Delete(receiptsPath); } catch { /* best effort */ }
             try { if (File.Exists(attachmentsPath)) File.Delete(attachmentsPath); } catch { /* best effort */ }
         }
     }
 
-    private static void WriteEmptyChatArrays(Utf8JsonWriter writer)
-    {
-        writer.WritePropertyName("messages");
-        writer.WriteStartArray();
-        writer.WriteEndArray();
-        writer.WritePropertyName("receipts");
-        writer.WriteStartArray();
-        writer.WriteEndArray();
-        writer.WritePropertyName("attachments");
-        writer.WriteStartArray();
-        writer.WriteEndArray();
-    }
-
-    private static async Task WriteJsonFilePropertyAsync(
-        Utf8JsonWriter writer,
-        string propertyName,
-        string path,
+    private static async Task WriteEmptyChatArraysAsync(
+        SequentialJsonObjectWriter writer,
         CancellationToken cancellationToken)
     {
-        writer.WritePropertyName(propertyName);
-        await using var fs = new FileStream(
-            path, FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        // 侧流已是完整 JSON 值（数组）；WriteRawValue 避免再解析进 DOM。
-        using var ms = new MemoryStream((int)Math.Min(fs.Length, int.MaxValue));
-        await fs.CopyToAsync(ms, cancellationToken).ConfigureAwait(false);
-        writer.WriteRawValue(ms.GetBuffer().AsSpan(0, (int)ms.Length), skipInputValidation: true);
+        await writer.WritePropertyAsync("messages", Array.Empty<object>(), cancellationToken).ConfigureAwait(false);
+        await writer.WritePropertyAsync("receipts", Array.Empty<object>(), cancellationToken).ConfigureAwait(false);
+        await writer.WritePropertyAsync("attachments", Array.Empty<object>(), cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task RenewLeaseAsync(

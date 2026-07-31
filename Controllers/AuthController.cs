@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using ChatApp.Server.RateLimiting;
 
 namespace ChatApp.Server.Controllers;
 
@@ -30,6 +31,7 @@ public class AuthController(
     /// </summary>
     [AllowAnonymous]
     [EnableRateLimiting("auth-login")]
+    [ServiceFilter(typeof(AccountRateLimitActionFilter))]
     [RequestTimeout("auth")]
     [HttpPost("login")]
     public async Task<IActionResult> Login([FromBody] LoginRequest model, CancellationToken cancellationToken)
@@ -106,6 +108,7 @@ public class AuthController(
     /// </summary>
     [AllowAnonymous]
     [EnableRateLimiting("auth-register")]
+    [ServiceFilter(typeof(AccountRateLimitActionFilter))]
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterRequest model, CancellationToken ct)
     {

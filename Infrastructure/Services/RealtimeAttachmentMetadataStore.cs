@@ -160,11 +160,16 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        // Ticketed → Uploaded → Scanning（单语句落到 Scanning；size / content_hash 有则更新）
+        // Ticketed → Uploaded → Scanning for upload confirmation. A durable scan
+        // projection may retry after Realtime has already reached a terminal state;
+        // in that case retain the terminal status while still writing full-stream SHA-256.
         await using var cmd = new NpgsqlCommand(
             $"""
              UPDATE {table}
-             SET status = @scanning,
+             SET status = CASE
+                     WHEN status IN (@ticketed, @uploaded, @scanning) THEN @scanning
+                     ELSE status
+                 END,
                  size_bytes = CASE WHEN @size > 0 THEN @size ELSE size_bytes END,
                  content_hash = CASE
                      WHEN @hash IS NOT NULL AND length(@hash) > 0 THEN lower(@hash)
@@ -172,7 +177,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
                  END
              WHERE attachment_id = @id
                AND uploader_user_id = @uid
-               AND status IN (@ticketed, @uploaded, @scanning)
+               AND status IN (@ticketed, @uploaded, @scanning, @confirmed, @rejected, @bound)
              """, conn);
         cmd.Parameters.AddWithValue("id", attachmentId);
         cmd.Parameters.AddWithValue("uid", uploaderUserId);
@@ -182,6 +187,9 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
         cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
         cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+        cmd.Parameters.AddWithValue("rejected", (short)AttachmentStatus.Rejected);
+        cmd.Parameters.AddWithValue("bound", (short)AttachmentStatus.Bound);
 
         var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         if (rows == 0)

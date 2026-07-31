@@ -116,6 +116,7 @@ jobs:
       - name: Health ready gate
         working-directory: ChatApp.Server
         env:
+          ASPNETCORE_ENVIRONMENT: Testing
           ASPNETCORE_URLS: http://127.0.0.1:5088
           ConnectionStrings__DefaultConnection: ${{ env.CHATAPP_TEST_POSTGRES }}
           ConnectionStrings__Garnet: ${{ env.CHATAPP_TEST_GARNET }}
@@ -167,6 +168,7 @@ jobs:
           POSTGRES_USER=postgres
           POSTGRES_DB=ChatAppDatabase
           JwtSettings__Secret=ci-compose-secret-please-change-32chars
+          ASPNETCORE_ENVIRONMENT=Testing
           JwtSettings__Issuer=ChatApp
           JwtSettings__Audience=ChatApp
           Security__SecretEncryptionKey=ci-compose-encryption-key-32-chars!!
@@ -198,7 +200,112 @@ jobs:
       - name: Dependency vulnerability check
         working-directory: ChatApp.Server
         run: |
+          set -o pipefail
+          report="$RUNNER_TEMP/dependency-vulnerabilities.json"
           set +e
-          out=$(dotnet list ChatApp.Server.sln package --vulnerable --include-transitive 2>&1)
-          echo "$out"
-          echo "$out" | grep -qiE "Critical|High" && exit 1 || exit 0
+          dotnet list ChatApp.Server.sln package --vulnerable --include-transitive --format json >"$report"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "dotnet list package failed with exit code $status" >&2
+            cat "$report" >&2 || true
+            exit "$status"
+          fi
+
+          if ! jq empty "$report"; then
+            echo "dotnet list package returned invalid JSON" >&2
+            cat "$report" >&2
+            exit 1
+          fi
+          cat "$report"
+
+          vulnerability_query='[
+            .projects[]?.frameworks[]?
+            | ((.topLevelPackages // []) + (.transitivePackages // []))[]?
+            | .vulnerabilities[]?
+            | select(((.severity // "") | tostring | ascii_downcase) == "high"
+                     or ((.severity // "") | tostring | ascii_downcase) == "critical")
+          ]'
+          if jq -e "$vulnerability_query | length > 0" "$report" >/dev/null; then
+            echo "High/Critical dependency vulnerability found" >&2
+            jq "$vulnerability_query" "$report" >&2
+            exit 1
+          fi
+
+  garnet-compatibility:
+    name: Garnet compatibility contracts
+    runs-on: ubuntu-latest
+    needs: build-test
+    env:
+      CHATAPP_TEST_GARNET: "127.0.0.1:6379,abortConnect=false"
+      CHATAPP_TEST_POSTGRES: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+    steps:
+      - name: Checkout Server
+        uses: actions/checkout@v4
+        with:
+          path: ChatApp.Server
+
+      - name: Read pinned Realtime version
+        id: realtime-version
+        working-directory: ChatApp.Server
+        run: |
+          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
+          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
+          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned RealtimeServices
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.realtime-version.outputs.repo }}
+          path: ChatApp.RealtimeServices
+          ref: ${{ steps.realtime-version.outputs.commit }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Start Garnet with production Lua transaction mode
+        run: |
+          docker run -d --name chatapp_garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 \
+            --bind 0.0.0.0 --port 6379 --lua --lua-transaction-mode \
+            --checkpointdir /data/checkpoints --aof --aof-size-limit 64m --recover
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs chatapp_garnet || true
+          exit 1
+
+      - name: Start Postgres for cross-store contracts
+        run: |
+          docker run -d --name chatapp_postgres \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ChatAppDatabase \
+            -p 5432:5432 postgres:16.8
+          for i in $(seq 1 30); do
+            if docker exec chatapp_postgres pg_isready -U postgres -d ChatAppDatabase; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs chatapp_postgres || true
+          exit 1
+
+      - name: Run full integration suite against Garnet
+        working-directory: ChatApp.Server
+        run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
+
+      # This test deliberately restarts the shared Garnet container. Keep it in a
+      # separate test process so it cannot sever another contract's Redis transaction.
+      - name: Run Garnet restart recovery contract exclusively
+        working-directory: ChatApp.Server
+        env:
+          CHATAPP_TEST_GARNET_DOCKER_RESTART: "1"
+        run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release --no-build --filter "FullyQualifiedName=ChatApp.Server.IntegrationTests.Caching.GarnetRestartRecoveryTests.ValueSurvivesGarnetContainerRestart"

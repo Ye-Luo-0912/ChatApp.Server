@@ -16,6 +16,9 @@ public class ApplicationUserConfig : IEntityTypeConfiguration<ApplicationUser>
         builder.Property(u => u.NormalizedEmail).HasMaxLength(256);
         builder.Property(u => u.PendingEmail).HasMaxLength(256);
         builder.Property(u => u.NormalizedPendingEmail).HasMaxLength(256);
+        builder.Property(u => u.SecurityVersion)
+            .HasDefaultValue(1L)
+            .IsRequired();
 
         builder.HasIndex(u => u.NormalizedEmail)
             .IsUnique()

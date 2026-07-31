@@ -33,6 +33,10 @@ public static class AuthSecurityMetrics
 
     private static readonly Counter<long> RiskSignals =
         RiskMeter.CreateCounter<long>("login_risk.signals", "events", "异步登录风险信号");
+    private static readonly Counter<long> SessionChurnEvictions =
+        AuthMeter.CreateCounter<long>("auth.session_churn_evictions", "sessions", "因用户会话上限淘汰的旧会话");
+    private static readonly Counter<long> TokenL1Operations =
+        AuthMeter.CreateCounter<long>("auth.token_l1", "ops", "访问令牌 L1 命中、未命中和驱逐");
 
     private static readonly Meter CleanupMeter = new("Infrastructure.AccountCleanup");
     private static readonly Counter<long> CleanupOps =
@@ -116,6 +120,12 @@ public static class AuthSecurityMetrics
 
     public static void RecordRisk(string signal)
         => RiskSignals.Add(1, new KeyValuePair<string, object?>("signal", signal));
+
+    public static void RecordSessionChurnEviction()
+        => SessionChurnEvictions.Add(1);
+
+    public static void RecordTokenL1(string operation)
+        => TokenL1Operations.Add(1, new KeyValuePair<string, object?>("operation", operation));
 
     public static void RecordAccountCleanup(string outcome, int count = 1)
         => CleanupOps.Add(count, new KeyValuePair<string, object?>("outcome", outcome));

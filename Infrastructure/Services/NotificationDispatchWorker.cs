@@ -331,25 +331,59 @@ public sealed class NotificationDispatchWorker(
                 if (DateTimeOffset.UtcNow - lastBacklogSample >= backlogEvery)
                 {
                     metrics.SetBacklog(await dispatcher.CountBacklogAsync(stoppingToken));
-                    concurrencyManager.RecordOldestPendingJob(
+                    concurrencyManager.RecordOldestPendingJob(WorkerName,
                         await dispatcher.GetOldestPendingJobCreatedAtAsync(stoppingToken));
                     lastBacklogSample = DateTimeOffset.UtcNow;
                 }
 
-                var items = await dispatcher.ClaimDueItemsAsync(batchSize, stoppingToken);
+                var reservations = new List<IAsyncDisposable>(batchSize);
+                while (reservations.Count < batchSize
+                       && concurrencyManager.TryAcquire(WorkerName, workerConcurrency, out var reservation))
+                {
+                    reservations.Add(reservation!);
+                }
+
+                if (reservations.Count == 0)
+                    continue;
+
+                IReadOnlyList<NotificationOutboxItem> items;
+                try
+                {
+                    items = await dispatcher.ClaimDueItemsAsync(reservations.Count, stoppingToken);
+                }
+                catch
+                {
+                    foreach (var reservation in reservations)
+                        await reservation.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
                 if (items.Count > 0)
                 {
                     // 站内通知批量落库（同 scope），邮件/收尾用有界并发
-                    await dispatcher.DeliverInAppBatchAsync(items, stoppingToken);
-
-                    foreach (var item in items)
+                    try
                     {
-                        var concurrencyScope = await concurrencyManager.AcquireAsync(
-                            WorkerName, workerConcurrency, stoppingToken);
-                        inFlight.Add(ProcessOneAsync(item, concurrencyScope, stoppingToken));
+                        await dispatcher.DeliverInAppBatchAsync(items, stoppingToken);
+                    }
+                    catch
+                    {
+                        foreach (var reservation in reservations)
+                            await reservation.DisposeAsync().ConfigureAwait(false);
+                        throw;
                     }
 
+                    for (var i = 0; i < items.Count; i++)
+                    {
+                        inFlight.Add(ProcessOneAsync(items[i], reservations[i], stoppingToken));
+                    }
+                    for (var i = items.Count; i < reservations.Count; i++)
+                        await reservations[i].DisposeAsync().ConfigureAwait(false);
+
                     inFlight.RemoveAll(static t => t.IsCompleted);
+                }
+                else
+                {
+                    foreach (var reservation in reservations)
+                        await reservation.DisposeAsync().ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

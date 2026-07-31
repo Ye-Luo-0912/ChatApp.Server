@@ -29,4 +29,6 @@ public sealed class RateLimitingOptions
     /// <c>true</c> = 放行以保可用；<c>false</c>（默认）= 拒绝以保安全。
     /// </summary>
     public bool FailOpenWhenRedisUnavailable { get; set; }
+
+    public int ClusterShardCount { get; set; } = 16;
 }
