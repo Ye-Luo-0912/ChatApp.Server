@@ -19,12 +19,10 @@ public static class AccountLifecycleModuleExtensions
     /// <summary>注册账号生命周期模块。</summary>
     public static IServiceCollection AddAccountLifecycleModule(this IServiceCollection services, IConfiguration config)
     {
-        services.AddOptions<AccountCleanupSagaOptions>()
-            .Bind(config.GetSection(AccountCleanupSagaOptions.SectionName))
-            .ValidateOnStart();
-        services.AddOptions<DataExportStorageOptions>()
-            .Bind(config.GetSection(DataExportStorageOptions.SectionName))
-            .ValidateOnStart();
+        services.AddValidatedOptions<AccountCleanupSagaOptions, AccountCleanupSagaOptionsValidator>(
+            config, AccountCleanupSagaOptions.SectionName);
+        services.AddValidatedOptions<DataExportStorageOptions, DataExportStorageOptionsValidator>(
+            config, DataExportStorageOptions.SectionName);
 
         services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
         services.AddScoped<AccountCleanupSagaService>();
@@ -65,9 +63,6 @@ public static class AccountLifecycleModuleExtensions
         });
         services.AddScoped<IDataExportService, DataExportService>();
         services.AddHostedService<DataExportWorker>();
-
-        services.AddSingleton<IValidateOptions<AccountCleanupSagaOptions>, AccountCleanupSagaOptionsValidator>();
-        services.AddSingleton<IValidateOptions<DataExportStorageOptions>, DataExportStorageOptionsValidator>();
 
         return services;
     }

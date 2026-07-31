@@ -74,7 +74,7 @@ public sealed class PresenceAuthorizeWorker(
         try
         {
             relationships = await friendship
-                .CheckRelationshipsAsync(query.WatcherUserId, targets, ct)
+                .CheckRelationshipsAuthoritativeAsync(query.WatcherUserId, targets, ct)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

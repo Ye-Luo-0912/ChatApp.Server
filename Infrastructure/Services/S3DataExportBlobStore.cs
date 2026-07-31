@@ -1,5 +1,6 @@
 using Amazon.S3;
 using Amazon.S3.Model;
+using Core.Interfaces;
 using Core.Settings;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;

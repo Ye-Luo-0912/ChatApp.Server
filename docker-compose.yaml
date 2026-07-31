@@ -86,7 +86,6 @@ services:
     volumes:
       - avatar_data:/app/App_Data/avatars
       - attachment_data:/app/App_Data/attachments
-      - export_data:/app/App_Data/exports
     env_file:
       - .env
     environment:
@@ -151,7 +150,6 @@ volumes:
   garnet_data:
   avatar_data:
   attachment_data:
-  export_data:
 
 networks:
   chatapp_net:

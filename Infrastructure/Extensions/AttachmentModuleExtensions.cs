@@ -18,15 +18,12 @@ public static class AttachmentModuleExtensions
     /// <summary>注册附件与头像存储模块。</summary>
     public static IServiceCollection AddAttachmentModule(this IServiceCollection services, IConfiguration config)
     {
-        services.AddOptions<AttachmentStorageOptions>()
-            .Bind(config.GetSection(AttachmentStorageOptions.SectionName))
-            .ValidateOnStart();
-        services.AddOptions<AvatarStorageOptions>()
-            .Bind(config.GetSection(AvatarStorageOptions.SectionName))
-            .ValidateOnStart();
-        services.AddOptions<ProfileOptions>()
-            .Bind(config.GetSection(ProfileOptions.SectionName))
-            .ValidateOnStart();
+        services.AddValidatedOptions<AttachmentStorageOptions, AttachmentStorageOptionsValidator>(
+            config, AttachmentStorageOptions.SectionName);
+        services.AddValidatedOptions<AvatarStorageOptions, AvatarStorageOptionsValidator>(
+            config, AvatarStorageOptions.SectionName);
+        services.AddValidatedOptions<ProfileOptions, ProfileOptionsValidator>(
+            config, ProfileOptions.SectionName);
 
         services.AddSingleton<AvatarReencodeMetrics>();
         services.AddSingleton<AvatarReencodeQueue>();
@@ -83,10 +80,6 @@ public static class AttachmentModuleExtensions
         services.AddHostedService<AttachmentScanWorker>();
         services.AddHostedService<AttachmentScanProjectionWorker>();
         services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
-
-        services.AddSingleton<IValidateOptions<AttachmentStorageOptions>, AttachmentStorageOptionsValidator>();
-        services.AddSingleton<IValidateOptions<AvatarStorageOptions>, AvatarStorageOptionsValidator>();
-        services.AddSingleton<IValidateOptions<ProfileOptions>, ProfileOptionsValidator>();
 
         return services;
     }

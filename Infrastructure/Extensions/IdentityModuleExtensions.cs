@@ -46,12 +46,10 @@ public static class IdentityModuleExtensions
             .Validate(s => s.KeyVersion > 0, "Security:KeyVersion 必须 > 0")
             .ValidateOnStart();
 
-        services.AddOptions<PasswordHashingOptions>()
-            .Bind(config.GetSection(PasswordHashingOptions.SectionName))
-            .ValidateOnStart();
-        services.AddOptions<TrustedDeviceOptions>()
-            .Bind(config.GetSection(TrustedDeviceOptions.SectionName))
-            .ValidateOnStart();
+        services.AddValidatedOptions<PasswordHashingOptions, PasswordHashingOptionsValidator>(
+            config, PasswordHashingOptions.SectionName);
+        services.AddValidatedOptions<TrustedDeviceOptions, TrustedDeviceOptionsValidator>(
+            config, TrustedDeviceOptions.SectionName);
 
         services.AddSingleton<IDeviceInfo, DeviceInfoService>();
         services.AddSingleton<AccessTokenL1InvalidationBus>();
@@ -91,9 +89,6 @@ public static class IdentityModuleExtensions
             client.DefaultRequestHeaders.Add("Accept", "application/json");
         });
         services.AddSingleton<IGeoLocationService, GeoLocationService>();
-
-        services.AddSingleton<IValidateOptions<PasswordHashingOptions>, PasswordHashingOptionsValidator>();
-        services.AddSingleton<IValidateOptions<TrustedDeviceOptions>, TrustedDeviceOptionsValidator>();
 
         return services;
     }

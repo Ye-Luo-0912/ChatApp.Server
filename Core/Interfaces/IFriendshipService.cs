@@ -90,13 +90,22 @@ public interface IFriendshipService
     /// <summary>
     /// 检查两人关系状态
     /// </summary>
-    Task<FriendshipStatusInfo> CheckRelationshipAsync(long userId1, long userId2,CancellationToken ct = default);
+    Task<FriendshipStatusInfo> CheckRelationshipAsync(long userId1, long userId2, CancellationToken ct = default);
 
     /// <summary>
     /// 批量检查 watcher 与多个 target 的关系状态。
     /// 使用 MGET + 批量 SQL，替代逐个查询的 N+1 模式。
     /// </summary>
     Task<IReadOnlyDictionary<long, FriendshipStatusInfo>> CheckRelationshipsAsync(
+        long watcherUserId,
+        IReadOnlyList<long> targetUserIds,
+        CancellationToken ct = default);
+
+
+    /// <summary>
+    /// 批量读取数据库权威关系状态。授权路径必须使用此方法，不能依赖可陈旧的正向缓存。
+    /// </summary>
+    Task<IReadOnlyDictionary<long, FriendshipStatusInfo>> CheckRelationshipsAuthoritativeAsync(
         long watcherUserId,
         IReadOnlyList<long> targetUserIds,
         CancellationToken ct = default);
@@ -113,7 +122,7 @@ public interface IFriendshipService
     /// <summary>
     /// 设置好友分组
     /// </summary>
-    Task<FriendshipOperationResult> AssignFriendToGroupAsync(long userId, long friendId, int groupId,CancellationToken ct = default);
+    Task<FriendshipOperationResult> AssignFriendToGroupAsync(long userId, long friendId, int groupId, CancellationToken ct = default);
 
     Task<FriendshipOperationResult<FriendGroupDto>> CreateGroupAsync(long userId, string groupName, CancellationToken ct = default);
 

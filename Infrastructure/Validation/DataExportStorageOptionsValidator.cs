@@ -1,13 +1,15 @@
 using System.Collections.Generic;
 using Core.Settings;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Hosting;
 
 namespace Infrastructure.Validation;
 
 /// <summary>
 /// 校验 <see cref="DataExportStorageOptions"/>：作业生命周期、清理、加密分块与聊天导出参数。
 /// </summary>
-public sealed class DataExportStorageOptionsValidator : IValidateOptions<DataExportStorageOptions>
+public sealed class DataExportStorageOptionsValidator(IHostEnvironment environment)
+    : IValidateOptions<DataExportStorageOptions>
 {
     public string? Name { get; } = null;
 
@@ -25,6 +27,12 @@ public sealed class DataExportStorageOptionsValidator : IValidateOptions<DataExp
         {
             failures.Add("DataExport:Provider 必须为 Local 或 S3。");
         }
+        if (environment.IsProduction()
+            && !string.Equals(options.Provider, "S3", StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add("生产环境 DataExport:Provider 必须为 S3，以保证多实例共享和重启后可恢复。");
+        }
+
 
         if (options.JobTtlHours <= 0)
         {

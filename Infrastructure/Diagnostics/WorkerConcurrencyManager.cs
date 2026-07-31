@@ -33,7 +33,6 @@ public sealed class WorkerConcurrencyManager : IDisposable
 
     private long _totalWaitTicks;
     private long _waitCount;
-    private long _oldestPendingJobTicks;
     private readonly ConcurrentDictionary<string, long> _oldestPendingByWorker = new(StringComparer.Ordinal);
 
     /// <summary>平均等待获取并发槽的时间。</summary>
@@ -44,17 +43,6 @@ public sealed class WorkerConcurrencyManager : IDisposable
             var count = Interlocked.Read(ref _waitCount);
             if (count == 0) return TimeSpan.Zero;
             return TimeSpan.FromTicks(Interlocked.Read(ref _totalWaitTicks) / count);
-        }
-    }
-
-    /// <summary>最老待处理任务的年龄。</summary>
-    public TimeSpan OldestPendingJobAge
-    {
-        get
-        {
-            var ticks = Interlocked.Read(ref _oldestPendingJobTicks);
-            if (ticks == 0) return TimeSpan.Zero;
-            return TimeSpan.FromTicks(DateTimeOffset.UtcNow.Ticks - ticks);
         }
     }
 
@@ -84,7 +72,7 @@ public sealed class WorkerConcurrencyManager : IDisposable
                 Math.Max(1, workerMaxConcurrency),
                 Math.Max(1, workerMaxConcurrency)));
 
-        var sw = Stopwatch.StartNew();
+        var startedAt = Stopwatch.GetTimestamp();
         // 先专属：确保本类 Worker 已有执行权，避免占着全局槽空等专属槽。
         await workerSemaphore.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -96,11 +84,11 @@ public sealed class WorkerConcurrencyManager : IDisposable
             workerSemaphore.Release();
             throw;
         }
-        sw.Stop();
+        var elapsed = Stopwatch.GetElapsedTime(startedAt);
 
-        Interlocked.Add(ref _totalWaitTicks, sw.ElapsedTicks);
+        Interlocked.Add(ref _totalWaitTicks, elapsed.Ticks);
         Interlocked.Increment(ref _waitCount);
-        WaitHistogram.Record(sw.Elapsed.TotalMilliseconds,
+        WaitHistogram.Record(elapsed.TotalMilliseconds,
             new KeyValuePair<string, object?>("worker", workerName));
 
         return new ConcurrencyScope(_globalSemaphore, workerSemaphore, workerName);
@@ -146,12 +134,10 @@ public sealed class WorkerConcurrencyManager : IDisposable
     {
         if (oldestJobAt is { } at)
         {
-            Interlocked.Exchange(ref _oldestPendingJobTicks, at.UtcTicks);
             _oldestPendingByWorker[workerName] = at.UtcTicks;
         }
         else
         {
-            Interlocked.Exchange(ref _oldestPendingJobTicks, 0);
             _oldestPendingByWorker.TryRemove(workerName, out _);
         }
     }

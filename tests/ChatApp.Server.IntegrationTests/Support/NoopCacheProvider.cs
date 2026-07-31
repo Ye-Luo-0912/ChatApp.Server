@@ -139,6 +139,12 @@ internal sealed class NoopCacheProvider
     }
 
     // SetAsync<T> 与 RemoveManyAsync 由 ICacheValueStore 的同名实现满足，
+    public Task SetManyAsync<T>(
+        IReadOnlyList<KeyValuePair<string, T>> values,
+        TimeSpan ttl,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
     // 两接口签名一致，无需重复实现。
 
     // ─────────────────────────────────────────────────────────

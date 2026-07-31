@@ -20,9 +20,8 @@ public static class NotificationModuleExtensions
     /// <summary>注册通知与邮件模块。</summary>
     public static IServiceCollection AddNotificationModule(this IServiceCollection services, IConfiguration config)
     {
-        services.AddOptions<NotificationOutboxOptions>()
-            .Bind(config.GetSection(NotificationOutboxOptions.SectionName))
-            .ValidateOnStart();
+        services.AddValidatedOptions<NotificationOutboxOptions, NotificationOutboxOptionsValidator>(
+            config, NotificationOutboxOptions.SectionName);
 
         services.AddSingleton<NotificationOutboxMetrics>();
         services.AddScoped<INotificationQuery, NotificationQuery>();
@@ -46,8 +45,6 @@ public static class NotificationModuleExtensions
                 "生产环境必须完整配置 EmailSettings:Host、SenderEmail、Password")
             .Validate(s => s.Port is > 0 and <= 65535, "EmailSettings:Port 必须在 1-65535 之间")
             .ValidateOnStart();
-
-        services.AddSingleton<IValidateOptions<NotificationOutboxOptions>, NotificationOutboxOptionsValidator>();
 
         return services;
     }

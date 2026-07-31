@@ -167,6 +167,7 @@ jobs:
           POSTGRES_USER=postgres
           POSTGRES_DB=ChatAppDatabase
           JwtSettings__Secret=ci-compose-secret-please-change-32chars
+          ASPNETCORE_ENVIRONMENT=Testing
           JwtSettings__Issuer=ChatApp
           JwtSettings__Audience=ChatApp
           Security__SecretEncryptionKey=ci-compose-encryption-key-32-chars!!
@@ -199,17 +200,34 @@ jobs:
         working-directory: ChatApp.Server
         run: |
           set -o pipefail
+          report="$RUNNER_TEMP/dependency-vulnerabilities.json"
           set +e
-          out=$(dotnet list ChatApp.Server.sln package --vulnerable --include-transitive 2>&1)
+          dotnet list ChatApp.Server.sln package --vulnerable --include-transitive --format json >"$report"
           status=$?
           set -e
-          echo "$out"
           if [ "$status" -ne 0 ]; then
             echo "dotnet list package failed with exit code $status" >&2
+            cat "$report" >&2 || true
             exit "$status"
           fi
-          if echo "$out" | grep -qiE "Critical|High"; then
+
+          if ! jq empty "$report"; then
+            echo "dotnet list package returned invalid JSON" >&2
+            cat "$report" >&2
+            exit 1
+          fi
+          cat "$report"
+
+          vulnerability_query='[
+            .projects[]?.frameworks[]?
+            | ((.topLevelPackages // []) + (.transitivePackages // []))[]?
+            | .vulnerabilities[]?
+            | select(((.severity // "") | tostring | ascii_downcase) == "high"
+                     or ((.severity // "") | tostring | ascii_downcase) == "critical")
+          ]'
+          if jq -e "$vulnerability_query | length > 0" "$report" >/dev/null; then
             echo "High/Critical dependency vulnerability found" >&2
+            jq "$vulnerability_query" "$report" >&2
             exit 1
           fi
 
@@ -220,7 +238,6 @@ jobs:
     env:
       CHATAPP_TEST_GARNET: "127.0.0.1:6379,abortConnect=false"
       CHATAPP_TEST_POSTGRES: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres"
-      CHATAPP_TEST_GARNET_DOCKER_RESTART: "1"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
 
     steps:
@@ -283,3 +300,11 @@ jobs:
       - name: Run full integration suite against Garnet
         working-directory: ChatApp.Server
         run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
+
+      # This test deliberately restarts the shared Garnet container. Keep it in a
+      # separate test process so it cannot sever another contract's Redis transaction.
+      - name: Run Garnet restart recovery contract exclusively
+        working-directory: ChatApp.Server
+        env:
+          CHATAPP_TEST_GARNET_DOCKER_RESTART: "1"
+        run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release --no-build --filter "FullyQualifiedName=ChatApp.Server.IntegrationTests.Caching.GarnetRestartRecoveryTests.ValueSurvivesGarnetContainerRestart"

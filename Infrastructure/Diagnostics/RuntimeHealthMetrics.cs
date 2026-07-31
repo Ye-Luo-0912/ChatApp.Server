@@ -56,11 +56,6 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
             "ms",
             "后台 Worker 平均等待获取并发槽的时间");
         _ = Meter.CreateObservableGauge(
-            "worker.oldest_job_age_ms",
-            () => _concurrencyManager.OldestPendingJobAge.TotalMilliseconds,
-            "ms",
-            "最老待处理任务的年龄");
-        _ = Meter.CreateObservableGauge(
             "worker.oldest_job_age_ms.by_worker",
             () => _concurrencyManager.GetOldestPendingJobMeasurements(),
             "ms",

@@ -31,18 +31,30 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
         db.Users.AddRange(
             new Core.Models.Identity.ApplicationUser
             {
-                Id = ownerId, UserName = $"owner-{suffix}", NormalizedUserName = $"OWNER-{suffix}".ToUpperInvariant(),
-                Email = $"owner-{suffix}@ex.com", NormalizedEmail = $"OWNER-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = ownerId,
+                UserName = $"owner-{suffix}",
+                NormalizedUserName = $"OWNER-{suffix}".ToUpperInvariant(),
+                Email = $"owner-{suffix}@ex.com",
+                NormalizedEmail = $"OWNER-{suffix}@EX.COM",
+                EmailConfirmed = true,
             },
             new Core.Models.Identity.ApplicationUser
             {
-                Id = otherId, UserName = $"other-{suffix}", NormalizedUserName = $"OTHER-{suffix}".ToUpperInvariant(),
-                Email = $"other-{suffix}@ex.com", NormalizedEmail = $"OTHER-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = otherId,
+                UserName = $"other-{suffix}",
+                NormalizedUserName = $"OTHER-{suffix}".ToUpperInvariant(),
+                Email = $"other-{suffix}@ex.com",
+                NormalizedEmail = $"OTHER-{suffix}@EX.COM",
+                EmailConfirmed = true,
             },
             new Core.Models.Identity.ApplicationUser
             {
-                Id = friendId, UserName = $"buddy-{suffix}", NormalizedUserName = $"BUDDY-{suffix}".ToUpperInvariant(),
-                Email = $"buddy-{suffix}@ex.com", NormalizedEmail = $"BUDDY-{suffix}@EX.COM", EmailConfirmed = true,
+                Id = friendId,
+                UserName = $"buddy-{suffix}",
+                NormalizedUserName = $"BUDDY-{suffix}".ToUpperInvariant(),
+                Email = $"buddy-{suffix}@ex.com",
+                NormalizedEmail = $"BUDDY-{suffix}@EX.COM",
+                EmailConfirmed = true,
             });
         await db.SaveChangesAsync();
 
@@ -184,6 +196,27 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
         var afterBlock = await service.CheckRelationshipsAsync(watcher, [target]);
         Assert.True(afterBlock[target].IsBlocked);
         Assert.False(afterBlock[target].IsMutual);
+
+        await using (var revoke = postgres.CreateContext())
+        {
+            await revoke.BlockRecords
+                .Where(b => b.BlockerId == target && b.BlockedUserId == watcher)
+                .ExecuteDeleteAsync();
+            await revoke.Friendships
+                .Where(f => (f.UserId == watcher && f.FriendId == target)
+                            || (f.UserId == target && f.FriendId == watcher))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(f => f.IsDeleted, true)
+                    .SetProperty(f => f.DeletedAt, DateTime.UtcNow));
+        }
+
+        // The ordinary derived cache may still contain IsMutual=true. Authorization must not.
+        var staleCached = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(staleCached[target].IsMutual);
+
+        var authoritative = await service.CheckRelationshipsAuthoritativeAsync(watcher, [target]);
+        Assert.False(authoritative[target].IsBlocked);
+        Assert.False(authoritative[target].IsMutual);
     }
 
     [SkippableFact]

@@ -4,6 +4,7 @@ using Core.Interfaces;
 using Core.Settings;
 using Infrastructure.Auth;
 using Infrastructure.RateLimiting;
+using Infrastructure.Extensions;
 using Infrastructure.Validation;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http.Timeouts;
@@ -24,14 +25,12 @@ public static class ApiModuleExtensions
     public static IServiceCollection AddApiPolicies(this IServiceCollection services, IConfiguration config)
     {
         // P0-6：单例分布式限流器 + 策略提供者（不再为每个分区键创建本地 RateLimiter 对象）。
-        services.AddOptions<RateLimitingOptions>()
-            .Bind(config.GetSection(RateLimitingOptions.SectionName))
-            .ValidateOnStart();
+        services.AddValidatedOptions<RateLimitingOptions, RateLimitingOptionsValidator>(
+            config, RateLimitingOptions.SectionName);
         services.AddSingleton<IDistributedRateLimiter, RedisDistributedRateLimiter>();
         services.AddSingleton<IRateLimitPolicyProvider, RateLimitPolicyProvider>();
         services.AddSingleton<RateLimitDimensionKeyHasher>();
         services.AddScoped<AccountRateLimitActionFilter>();
-        services.AddSingleton<IValidateOptions<RateLimitingOptions>, RateLimitingOptionsValidator>();
 
         services.AddOptions<ForwardedHeadersSettings>()
             .Bind(config.GetSection(ForwardedHeadersSettings.SectionName))

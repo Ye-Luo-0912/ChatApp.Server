@@ -30,6 +30,13 @@ public interface IDerivedCache
         TimeSpan ttl,
         CancellationToken cancellationToken = default);
 
+    /// <summary>流水线批量写入同一 TTL 的派生值，避免冷缓存逐项网络往返。</summary>
+    Task SetManyAsync<T>(
+        IReadOnlyList<KeyValuePair<string, T>> values,
+        TimeSpan ttl,
+        CancellationToken cancellationToken = default);
+
+
     /// <summary>批量删除多个键。用于关系变更后双向失效。</summary>
     Task RemoveManyAsync(
         IReadOnlyList<string> keys,

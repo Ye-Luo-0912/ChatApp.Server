@@ -309,7 +309,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             }),
             NullLogger<TokenService>.Instance);
 
-    private sealed class NoopExportBlob : Infrastructure.Services.IDataExportBlobStore
+    private sealed class NoopExportBlob : IDataExportBlobStore
     {
         public Task WriteAsync(string objectKey, Stream content, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
