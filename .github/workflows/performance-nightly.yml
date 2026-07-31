@@ -157,6 +157,7 @@ jobs:
         env:
           TOKEN_COUNT: "100"
           TOKEN_MIN_SUCCESS: "80"
+          TOKEN_CONCURRENCY: "4"
         run: node generate-preset-tokens.mjs
       - name: Generate creds file (for auth_capacity / device_churn)
         working-directory: ChatApp.Server/tests/load

@@ -137,6 +137,7 @@ jobs:
         env:
           TOKEN_COUNT: "50"
           TOKEN_MIN_SUCCESS: "40"
+          TOKEN_CONCURRENCY: "4"
         run: node generate-preset-tokens.mjs
       - name: Warmup run (90s)
         working-directory: ChatApp.Server/tests/load
