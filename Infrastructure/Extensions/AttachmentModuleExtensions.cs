@@ -41,6 +41,7 @@ public static class AttachmentModuleExtensions
         services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
         services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
         services.AddScoped<AttachmentAbandonedAgeSweeper>();
+        services.AddScoped<IAttachmentScanProjectionService, AttachmentScanProjectionService>();
         services.AddScoped<IAttachmentScanService, AttachmentScanService>();
         services.AddSingleton<AttachmentScanEnqueuer>();
         services.AddSingleton<IAttachmentDownloadTicketService, AttachmentDownloadTicketService>();
@@ -80,6 +81,7 @@ public static class AttachmentModuleExtensions
         services.AddScoped<IAttachmentService, AttachmentService>();
         services.AddHostedService<AttachmentCleanupWorker>();
         services.AddHostedService<AttachmentScanWorker>();
+        services.AddHostedService<AttachmentScanProjectionWorker>();
         services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
 
         services.AddSingleton<IValidateOptions<AttachmentStorageOptions>, AttachmentStorageOptionsValidator>();

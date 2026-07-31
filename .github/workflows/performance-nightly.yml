@@ -154,41 +154,10 @@ jobs:
 
       - name: Generate preset tokens
         working-directory: ChatApp.Server/tests/load
-        run: |
-          node -e '
-            const http = require("http");
-            const tokens = [];
-            let done = 0;
-            const total = 100;
-            for (let i = 1; i <= total; i++) {
-              const data = JSON.stringify({ username: "loaduser" + i, password: "Passw0rd!" });
-              const req = http.request({
-                hostname: "127.0.0.1", port: 5088, path: "/api/auth/login", method: "POST",
-                headers: { "Content-Type": "application/json", "X-Device-Id": "seed-" + i, "Content-Length": Buffer.byteLength(data) }
-              }, (res) => {
-                let body = "";
-                res.on("data", (c) => body += c);
-                res.on("end", () => {
-                  try {
-                    const j = JSON.parse(body);
-                    if (res.statusCode === 200 && j.accessToken) {
-                      const idMatch = body.match(/"userId"\s*:\s*(\d+)/i);
-                      tokens.push({ accessToken: j.accessToken, refreshToken: j.refreshToken || "", userId: idMatch ? Number(idMatch[1]) : 0 });
-                    }
-                  } catch (e) {}
-                  if (++done === total) {
-                    require("fs").writeFileSync("tokens.json", JSON.stringify(tokens));
-                    console.log("Generated " + tokens.length + " tokens");
-                    process.exit(tokens.length >= 80 ? 0 : 1);
-                  }
-                });
-              });
-              req.on("error", () => { if (++done === total) { require("fs").writeFileSync("tokens.json", "[]"); process.exit(1); } });
-              req.write(data);
-              req.end();
-            }
-          '
-
+        env:
+          TOKEN_COUNT: "100"
+          TOKEN_MIN_SUCCESS: "80"
+        run: node generate-preset-tokens.mjs
       - name: Generate creds file (for auth_capacity / device_churn)
         working-directory: ChatApp.Server/tests/load
         run: |

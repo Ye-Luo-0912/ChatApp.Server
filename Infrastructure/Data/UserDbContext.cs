@@ -34,6 +34,7 @@ namespace Infrastructure.Data
         public DbSet<AttachmentBlobDeleteJob> AttachmentBlobDeleteJobs { get; set; }
         public DbSet<AttachmentScanJob> AttachmentScanJobs { get; set; }
         public DbSet<AttachmentScanAudit> AttachmentScanAudits { get; set; }
+        public DbSet<AttachmentScanProjection> AttachmentScanProjections { get; set; }
         public DbSet<AccountCleanupSaga> AccountCleanupSagas { get; set; }
         public DbSet<AccountCleanupInboxEntry> AccountCleanupInbox { get; set; }
         public DbSet<AccountCleanupDeadLetter> AccountCleanupDeadLetters { get; set; }
@@ -228,6 +229,34 @@ namespace Infrastructure.Data
                     .HasDatabaseName("IX_AttachmentScanAudit_Attachment_Created");
                 e.HasIndex(x => new { x.ScanJobId, x.CreatedAt })
                     .HasDatabaseName("IX_AttachmentScanAudit_Job_Created");
+            });
+
+            builder.Entity<AttachmentScanProjection>(e =>
+            {
+                e.ToTable("T_AttachmentScanProjection");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Id).UseIdentityByDefaultColumn();
+                e.Property(x => x.AttachmentId).HasMaxLength(64).IsRequired();
+                e.Property(x => x.ObjectKey).HasMaxLength(512).IsRequired();
+                e.Property(x => x.ContentType).HasMaxLength(128);
+                e.Property(x => x.OriginalName).HasMaxLength(256);
+                e.Property(x => x.ContentHash).HasMaxLength(64);
+                e.Property(x => x.Outcome).HasMaxLength(32).IsRequired();
+                e.Property(x => x.RejectionReason).HasMaxLength(500);
+                e.Property(x => x.Status).HasMaxLength(32).IsRequired();
+                e.Property(x => x.LastError).HasMaxLength(500);
+                e.Property(x => x.LeaseOwner).HasMaxLength(128);
+                e.Property(x => x.LeaseToken).HasMaxLength(64);
+                e.HasIndex(x => new { x.Status, x.NextAttemptAt })
+                    .HasDatabaseName("IX_AttachmentScanProjection_Due");
+                e.HasIndex(x => x.ScanJobId)
+                    .HasDatabaseName("IX_AttachmentScanProjection_ScanJob");
+                e.HasIndex(x => x.ScanJobId)
+                    .IsUnique()
+                    .HasFilter("\"Status\" IN ('Pending', 'Processing')")
+                    .HasDatabaseName("UX_AttachmentScanProjection_ActiveScanJob");
+                e.HasIndex(x => new { x.Status, x.LeaseExpiresAt })
+                    .HasDatabaseName("IX_AttachmentScanProjection_LeaseDue");
             });
 
             builder.Entity<AccountCleanupSaga>(e =>

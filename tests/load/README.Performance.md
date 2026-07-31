@@ -123,7 +123,7 @@ Nightly 重启恢复：在 steady 压测中段 `docker restart` Postgres + Garne
 
 ### steady（固定设备基线）
 
-固定 `X-Installation-Id`（`k6-steady-{vu}`），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
+固定 `X-Installation-Id`（`k6-steady-installation-{vu-padded}`，符合服务端长度校验），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
 
 ```bash
 k6 run -e BASE_URL=http://localhost:8080 -e TOKENS_FILE=./tokens.json -e PROFILE=steady \
@@ -148,7 +148,7 @@ k6 run -e CREDS_FILE=./creds.json tests/load/login-capacity.k6.js
 
 ### device_churn（新设备 / 会话 / 通知增长）
 
-每轮 `X-Installation-Id=k6-churn-{vu}-{iter}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
+每轮 `X-Installation-Id=k6-churn-installation-{vu-padded}-{iter-padded}` 并登录，观察会话索引、新设备通知、可信设备相关压力：
 
 ```bash
 k6 run -e CREDS_FILE=./creds.json -e PROFILE=device_churn -e RATE=10 -e DURATION=10m \
@@ -229,11 +229,17 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 
 ```json
 [
-  { "accessToken": "...", "userId": 1, "refreshToken": "..." }
+  {
+    "accessToken": "...",
+    "refreshToken": "...",
+    "deviceCredential": "...",
+    "userId": "9223372036854775807",
+    "deviceId": "perf-installation-00000001"
+  }
 ]
 ```
 
-避免 setup 阶段被登录限流截断后多个 VU 共享少量会话。
+`userId` 必须是十进制字符串，避免 Snowflake ID 经 JavaScript `Number` 丢失精度；`deviceId` 必须复用登录时的 InstallationId，refresh 才能通过设备绑定校验。避免 setup 阶段被登录限流截断后多个 VU 共享少量会话。
 
 ## 解读建议
 

@@ -78,6 +78,115 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
     }
 
     [SkippableFact]
+    public async Task PairAdvisoryLock_ConcurrentBlock_ProducesOneRecordAndTwoSuccessfulResults()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var generator = new TsidGeneratorService();
+        var userA = generator.GenerateTsid();
+        var userB = generator.GenerateTsid();
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.Users.AddRange(
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = userA,
+                    UserName = $"lock-a-{suffix}",
+                    NormalizedUserName = $"LOCK-A-{suffix}".ToUpperInvariant(),
+                    Email = $"lock-a-{suffix}@example.com",
+                    NormalizedEmail = $"LOCK-A-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                },
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = userB,
+                    UserName = $"lock-b-{suffix}",
+                    NormalizedUserName = $"LOCK-B-{suffix}".ToUpperInvariant(),
+                    Email = $"lock-b-{suffix}@example.com",
+                    NormalizedEmail = $"LOCK-B-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                });
+            await seed.SaveChangesAsync();
+        }
+
+        await using var dbA = postgres.CreateContext();
+        await using var dbB = postgres.CreateContext();
+        var serviceA = new FriendshipService(dbA, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+        var serviceB = new FriendshipService(dbB, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+
+        var results = await Task.WhenAll(
+            serviceA.BlockUserAsync(userA, userB),
+            serviceB.BlockUserAsync(userA, userB));
+
+        Assert.All(results, result => Assert.True(result.IsSuccess));
+        await using var check = postgres.CreateContext();
+        Assert.Equal(1, await check.BlockRecords.CountAsync(
+            b => b.BlockerId == userA && b.BlockedUserId == userB));
+    }
+
+    [SkippableFact]
+    public async Task RelationshipBatch_BlockRecordOverridesStaleMutualCache()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var generator = new TsidGeneratorService();
+        var watcher = generator.GenerateTsid();
+        var target = generator.GenerateTsid();
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.Users.AddRange(
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = watcher,
+                    UserName = $"presence-a-{suffix}",
+                    NormalizedUserName = $"PRESENCE-A-{suffix}".ToUpperInvariant(),
+                    Email = $"presence-a-{suffix}@example.com",
+                    NormalizedEmail = $"PRESENCE-A-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                },
+                new Core.Models.Identity.ApplicationUser
+                {
+                    Id = target,
+                    UserName = $"presence-b-{suffix}",
+                    NormalizedUserName = $"PRESENCE-B-{suffix}".ToUpperInvariant(),
+                    Email = $"presence-b-{suffix}@example.com",
+                    NormalizedEmail = $"PRESENCE-B-{suffix}@EXAMPLE.COM",
+                    EmailConfirmed = true,
+                });
+            seed.Friendships.AddRange(
+                new UserFriendEntry { UserId = watcher, FriendId = target, CreatedAt = DateTime.UtcNow },
+                new UserFriendEntry { UserId = target, FriendId = watcher, CreatedAt = DateTime.UtcNow });
+            await seed.SaveChangesAsync();
+        }
+
+        await using var query = postgres.CreateContext();
+        var service = new FriendshipService(query, redis.DerivedCache, NullLogger<FriendshipService>.Instance);
+        var initially = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(initially[target].IsMutual);
+
+        await using (var block = postgres.CreateContext())
+        {
+            block.BlockRecords.Add(new BlockRecord
+            {
+                BlockerId = target,
+                BlockedUserId = watcher,
+                BlockedAt = DateTime.UtcNow,
+            });
+            await block.SaveChangesAsync();
+        }
+
+        var afterBlock = await service.CheckRelationshipsAsync(watcher, [target]);
+        Assert.True(afterBlock[target].IsBlocked);
+        Assert.False(afterBlock[target].IsMutual);
+    }
+
+    [SkippableFact]
     public async Task Outbox_IdempotencyKey_OnlyCountsMatchingConstraint()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);

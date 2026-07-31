@@ -2,6 +2,7 @@ using System.Security.Claims;
 using System.Text.Encodings.Web;
 using Core.Exceptions;
 using Core.Interfaces.Auth;
+using Core.Models.Token;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -51,6 +52,11 @@ public sealed class OpaqueTokenAuthHandler(
         var tokenSpan = headerSpan[bearerPrefix.Length..].Trim();
         if (tokenSpan.IsEmpty)
             return AuthenticateResult.NoResult();
+
+        // access token 始终由 Generate(16) 产生。先校验长度和 Base64url 字符集，
+        // 避免任意长 Authorization header 进入 Redis key 哈希路径。
+        if (!OpaqueTokenFormat.IsAccessToken(tokenSpan))
+            return AuthenticateResult.Fail("令牌格式无效");
 
         var token = tokenSpan.ToString();
 

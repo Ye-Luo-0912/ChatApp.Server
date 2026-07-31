@@ -79,8 +79,10 @@ public sealed class PresenceAuthorizeWorker(
         }
         catch (Exception ex)
         {
-            logger.LogDebug(ex, "批量关系查询失败，全部降级到成员检查");
-            relationships = new Dictionary<long, FriendshipStatusInfo>();
+            // 关系/拉黑查询失败时 fail closed。降级到 shared-members 查询会绕过
+            // BlockRecord 的硬拒绝，不能用于 Presence 授权。
+            logger.LogWarning(ex, "批量关系或拉黑查询失败，Presence 授权拒绝");
+            return new PresenceAuthorizeResponse { AllowedUserIds = [] };
         }
 
         foreach (var targetId in targets)
@@ -88,7 +90,10 @@ public sealed class PresenceAuthorizeWorker(
             if (targetId == query.WatcherUserId)
                 continue;
 
-            if (relationships.TryGetValue(targetId, out var status) && status.IsMutual)
+            if (relationships.TryGetValue(targetId, out var status) && status.IsBlocked)
+                continue;
+
+            if (relationships.TryGetValue(targetId, out status) && status.IsMutual)
                 allowed.Add(targetId);
             else
                 (needMembership ??= []).Add(targetId);

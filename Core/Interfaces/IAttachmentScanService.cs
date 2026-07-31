@@ -26,10 +26,11 @@ public interface IAttachmentScanService
         int batchSize, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 处理单个已领取作业。终态更新匹配 Id+Status+LeaseOwner+LeaseToken；租约已易主时返回 false 且不改动。
+    /// 处理单个已领取作业。扫描结论先以 Id+Status+LeaseOwner+LeaseToken 围栏写入耐久投递；
+    /// 租约已易主时不产生新的投递。
     /// </summary>
-    /// <returns>是否进入终态（Confirmed/Rejected/Done）；瞬时失败重试或租约丢失返回 false。</returns>
-    Task<bool> ProcessClaimedJobAsync(
+    /// <returns>区分结果暂存、正常退避重试和租约丢失，供 Worker 记录准确指标。</returns>
+    Task<AttachmentScanProcessResult> ProcessClaimedJobAsync(
         AttachmentScanJob claimed, CancellationToken cancellationToken = default);
 
     /// <summary>

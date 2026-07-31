@@ -55,14 +55,27 @@ export const options = {
   },
 };
 
+function onlineInstallationId(index) {
+  return `k6-online-installation-${String(index).padStart(6, '0')}`;
+}
+
+function rawUserId(body, fallback) {
+  const match = String(body || '').match(/"userId"\s*:\s*(\d+)/i);
+  return (match && match[1]) || String(fallback || '');
+}
+
 export function setup() {
   if (__ENV.TOKENS_FILE) {
     const sessions = JSON.parse(open(__ENV.TOKENS_FILE));
     return {
-      sessions: sessions.map((s) => ({
-        ...s,
-        deviceCredential: s.deviceCredential || s.DeviceCredential || '',
-      })),
+      sessions: sessions.map((s) => {
+        const device = String(s.deviceId || s.installationId || s.device || '');
+        if (!device) throw new Error('TOKENS_FILE entry is missing deviceId/installationId');
+        if (typeof s.userId !== 'string' || !/^\d+$/.test(s.userId)) {
+          throw new Error('TOKENS_FILE userId must be an exact decimal string');
+        }
+        return { ...s, device, deviceCredential: s.deviceCredential || s.DeviceCredential || '' };
+      }),
     };
   }
 
@@ -76,7 +89,7 @@ export function setup() {
       {
         headers: {
           'Content-Type': 'application/json',
-          'X-Installation-Id': `k6-online-${i + 1}`,
+          'X-Installation-Id': onlineInstallationId(i + 1),
         },
       },
     );
@@ -86,8 +99,8 @@ export function setup() {
       accessToken: body.accessToken || body.AccessToken,
       refreshToken: body.refreshToken || body.RefreshToken,
       deviceCredential: body.deviceCredential || body.DeviceCredential || '',
-      userId: body.userId || body.UserId || u.userId,
-      device: `k6-online-${i + 1}`,
+      userId: rawUserId(res.body, u.userId),
+      device: onlineInstallationId(i + 1),
     });
   }
   if (sessions.length === 0) {

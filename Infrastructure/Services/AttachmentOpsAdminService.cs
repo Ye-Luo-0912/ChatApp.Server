@@ -292,7 +292,9 @@ public sealed class AttachmentOpsAdminService(
         CancellationToken cancellationToken = default)
     {
         var job = await FindJobAsync(attachmentId, cancellationToken).ConfigureAwait(false);
-        if (job is null || !metadata.IsAvailable)
+        if (job is null
+            || !metadata.IsAvailable
+            || job.Status is AttachmentScanJobStatus.Processing or AttachmentScanJobStatus.Finalizing)
             return false;
 
         await metadata.MarkUploadedScanningAsync(

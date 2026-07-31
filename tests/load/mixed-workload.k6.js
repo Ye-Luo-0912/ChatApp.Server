@@ -178,12 +178,18 @@ const profiles = {
 
 export const options = profiles[PROFILE] || profiles.steady;
 
-function deviceHeaders(vu, churn, deviceCredential = '') {
+function buildInstallationId(vu, churn) {
+  const vuPart = String(vu).padStart(6, '0');
+  const iterPart = String(__ITER).padStart(10, '0');
+  return churn
+    ? `k6-churn-installation-${vuPart}-${iterPart}`
+    : `k6-steady-installation-${vuPart}`;
+}
+
+function deviceHeaders(vu, churn, deviceCredential = '', installationId = '') {
   const headers = {
     'Content-Type': 'application/json',
-    'X-Installation-Id': churn
-      ? `k6-churn-${vu}-${__ITER}`
-      : `k6-steady-${vu}`,
+    'X-Installation-Id': installationId || buildInstallationId(vu, churn),
     'X-Correlation-Id': `k6-${vu}-${Date.now()}`,
   };
   if (deviceCredential) headers['X-Device-Credential'] = deviceCredential;
@@ -212,7 +218,9 @@ function doLogin(headers) {
     'login 200/400/503': (r) => r.status === 200 || r.status === 400 || r.status === 503,
   });
   errorRate.add(!ok || res.status >= 500);
-  if (res.status !== 200) return { accessToken: '', refreshToken: '', deviceCredential: '', userId: '' };
+  if (res.status !== 200) {
+    return { accessToken: '', refreshToken: '', deviceCredential: '', userId: '', installationId: headers['X-Installation-Id'] || '' };
+  }
   const body = res.json();
   // Snowflake userIds exceed Number.MAX_SAFE_INTEGER; keep digits as string for refresh.
   const idMatch = String(res.body || '').match(/"userId"\s*:\s*(\d+)/i);
@@ -221,12 +229,13 @@ function doLogin(headers) {
     refreshToken: body.refreshToken || body.RefreshToken || '',
     deviceCredential: body.deviceCredential || body.DeviceCredential || '',
     userId: (idMatch && idMatch[1]) || String(body.userId || body.UserId || user.userId || ''),
+    installationId: headers['X-Installation-Id'] || '',
   };
 }
 
 // 执行已认证读取 + 可选 refresh。
 // refresh 成功时返回新令牌，调用方据此更新 VU 级会话状态。
-function authedReads(headers, accessToken, refreshToken, deviceCredential, userId, doRefresh) {
+function authedReads(headers, accessToken, refreshToken, deviceCredential, userId, installationId, doRefresh) {
   const auth = Object.assign({}, headers, { Authorization: `Bearer ${accessToken}` });
   let newAccessToken = accessToken;
   let newRefreshToken = refreshToken;
@@ -288,7 +297,7 @@ function authedReads(headers, accessToken, refreshToken, deviceCredential, userI
       const res = http.post(
         `${BASE_URL}/api/auth/refresh-token`,
         `{"userId":${userId},"refreshToken":${JSON.stringify(refreshToken)}}`,
-      { headers: deviceHeaders(__VU, false, deviceCredential), tags: { endpoint: 'refresh' } },
+      { headers: deviceHeaders(__VU, false, deviceCredential, installationId), tags: { endpoint: 'refresh' } },
       );
       refreshTrend.add(res.timings.duration);
       const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
@@ -305,7 +314,7 @@ function authedReads(headers, accessToken, refreshToken, deviceCredential, userI
     });
   }
 
-  return { accessToken: newAccessToken, refreshToken: newRefreshToken, deviceCredential: newDeviceCredential, userId };
+  return { accessToken: newAccessToken, refreshToken: newRefreshToken, deviceCredential: newDeviceCredential, userId, installationId };
 }
 
 export default function () {
@@ -326,12 +335,12 @@ export default function () {
 
   if (isChurn) {
     // 每轮登录 + 换设备：压新设备/会话/通知增长
-    let session = { accessToken: '', refreshToken: '', userId: '' };
+    let session = { accessToken: '', refreshToken: '', deviceCredential: '', userId: '', installationId: headers['X-Installation-Id'] || '' };
     group('login', () => {
       session = doLogin(headers);
     });
     if (session.accessToken) {
-      authedReads(headers, session.accessToken, session.refreshToken, session.deviceCredential, session.userId, false);
+      authedReads(headers, session.accessToken, session.refreshToken, session.deviceCredential, session.userId, session.installationId, false);
     }
     sleep(Number(__ENV.THINK || 0.2));
     return;
@@ -346,11 +355,16 @@ export default function () {
     if (!forceLogin) {
       const preset = pickToken();
       if (preset && preset.accessToken) {
+        const installationId = String(preset.deviceId || preset.installationId || preset.device || '');
+        if (!installationId) {
+          throw new Error('TOKENS_FILE entry is missing deviceId/installationId; preset tokens must reuse the login installation ID');
+        }
         vuSessions[__VU] = {
           accessToken: preset.accessToken,
           refreshToken: preset.refreshToken || '',
           deviceCredential: preset.deviceCredential || preset.DeviceCredential || '',
-          userId: preset.userId || '',
+          userId: String(preset.userId || ''),
+          installationId,
         };
       }
     }
@@ -368,7 +382,8 @@ export default function () {
   }
 
   const s = vuSessions[__VU];
-  const updated = authedReads(headers, s.accessToken, s.refreshToken, s.deviceCredential, s.userId, doRefresh);
+  const sessionHeaders = deviceHeaders(__VU, false, '', s.installationId);
+  const updated = authedReads(sessionHeaders, s.accessToken, s.refreshToken, s.deviceCredential, s.userId, s.installationId, doRefresh);
 
   // 写回更新后的令牌（refresh 成功时为新令牌，me 401 时为空触发重新登录）
   vuSessions[__VU] = updated;

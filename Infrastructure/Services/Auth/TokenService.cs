@@ -1,5 +1,5 @@
+using System.Buffers;
 using System.Security.Cryptography;
-using System.Text;
 using Core.Caching;
 using Core.Interfaces;
 using Core.Interfaces.Auth;
@@ -107,6 +107,9 @@ public sealed class TokenService(
     /// </summary>
     public async Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default)
     {
+        if (!IsValidAccessToken(token))
+            return null;
+
         EnsureL1InvalidationRegistered();
         var key = AccessTokenKey(token);
 
@@ -142,6 +145,9 @@ public sealed class TokenService(
     /// </summary>
     public Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default)
     {
+        if (!IsValidAccessToken(token))
+            return Task.CompletedTask;
+
         EnsureL1InvalidationRegistered();
         var key = AccessTokenKey(token);
         _l1Cache?.Evict(key);
@@ -197,6 +203,9 @@ public sealed class TokenService(
     /// </summary>
     public async Task<bool> ValidateRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
+        if (!IsValidRefreshToken(refreshToken))
+            return false;
+
         var data     = await GetRefreshTokenData(userId, refreshToken, cancellationToken);
         var deviceId = deviceInfo.GetDeviceId();
 
@@ -214,6 +223,9 @@ public sealed class TokenService(
     /// </summary>
     public async Task RevokeRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
+        if (!IsValidRefreshToken(refreshToken))
+            return;
+
         // 先读取设备 ID，以便同步删除会话记录
         var data = await GetRefreshTokenData(userId, refreshToken, cancellationToken);
         await values.RemoveAsync(RefreshTokenKey(userId, refreshToken), cancellationToken);
@@ -226,13 +238,18 @@ public sealed class TokenService(
     /// 查询刷新令牌元数据，不存在则返回 <see langword="null"/>。
     /// </summary>
     public Task<RefreshToken?> GetRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
-        => GetRefreshTokenData(userId, refreshToken, cancellationToken);
+        => !IsValidRefreshToken(refreshToken)
+            ? Task.FromResult<RefreshToken?>(null)
+            : GetRefreshTokenData(userId, refreshToken, cancellationToken);
 
     /// <summary>
     /// 先校验令牌（含设备匹配），通过后立即原子撤销——一次性消费语义。
     /// </summary>
     public async Task<bool> ValidateAndRevokeRefreshTokenAsync(string userId, string refreshToken, CancellationToken cancellationToken = default)
     {
+        if (!IsValidRefreshToken(refreshToken))
+            return false;
+
         var deviceId = deviceInfo.GetDeviceId();
         if (deviceId is null)
             return false;
@@ -261,6 +278,9 @@ public sealed class TokenService(
     /// </summary>
     public async Task<bool> RotateRefreshTokenAsync(string userId, string oldRefreshToken, string newRefreshToken, CancellationToken cancellationToken = default)
     {
+        if (!IsValidRefreshToken(oldRefreshToken))
+            return false;
+
         var device = deviceInfo.GenerateDeviceInfo();
         var expiry = TimeSpan.FromDays(_settings.RefreshTokenExpirationDays);
         var rtKey  = RefreshTokenKey(userId, newRefreshToken);
@@ -470,6 +490,9 @@ public sealed class TokenService(
     public async Task<(string accessToken, string refreshToken, string? deviceCredential)?> IssueRefreshTokensAsync(
         string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default)
     {
+        if (!IsValidRefreshToken(oldRefreshToken))
+            return null;
+
         var device = deviceInfo.GenerateDeviceInfo();
         var now    = DateTime.UtcNow;
         var accessExpiry  = TimeSpan.FromMinutes(_settings.AccessTokenExpirationMinutes);
@@ -766,17 +789,44 @@ public sealed class TokenService(
     }
 
     /// <summary>
-    /// 对令牌做 SHA-256 哈希，用于构造 Redis 键，避免原始值出现在键名中。
-    /// 令牌为 ASCII/Base64url，使用栈内存避免 byte[] 分配。
+    /// 对已校验的 ASCII/Base64url token 做 SHA-256 哈希，用于构造 Redis 键。
+    /// 保留有界 stackalloc 快路径，并在将来配置长度增大或漏掉边界校验时安全地租用数组。
     /// </summary>
-    private static string HashToken(string token)
+    private static string HashToken(ReadOnlySpan<char> token)
     {
-        Span<byte> input = stackalloc byte[128];
-        var length = Encoding.UTF8.GetBytes(token, input);
+        if (token.Length <= 128)
+        {
+            Span<byte> stackInput = stackalloc byte[token.Length];
+            return HashTokenCore(token, stackInput);
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(token.Length);
+        try
+        {
+            return HashTokenCore(token, rented.AsSpan(0, token.Length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private static string HashTokenCore(ReadOnlySpan<char> token, Span<byte> input)
+    {
+        for (var i = 0; i < token.Length; i++)
+            input[i] = checked((byte)token[i]);
+
         Span<byte> hash = stackalloc byte[32];
-        SHA256.HashData(input[..length], hash);
+        SHA256.HashData(input[..token.Length], hash);
         return Convert.ToHexString(hash);
     }
+
+    private static bool IsValidAccessToken(string? token)
+        => token is not null && OpaqueTokenFormat.IsAccessToken(token.AsSpan());
+
+    private bool IsValidRefreshToken(string? token)
+        => token is not null
+           && OpaqueTokenFormat.IsRefreshToken(token.AsSpan(), _settings.RefreshTokenLength);
 
     private static string AccessTokenKey(string token)
         => $"{AccessTokenPrefix}{HashToken(token)}";

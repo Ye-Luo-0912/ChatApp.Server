@@ -7,6 +7,7 @@ using Core.Models.Identity;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace Infrastructure.Services;
 
@@ -49,6 +50,89 @@ public class FriendshipService(
 
     private readonly ILogger<FriendshipService> _logger = logger;
 
+    /// <summary>
+    /// 跨实例成对串行化。使用独立的 PostgreSQL 会话级 advisory lock，使它能覆盖
+    /// 当前 DbContext 内可能创建的多个事务；释放 lease 时关闭会话，异常路径也不会泄漏锁。
+    /// 非 PostgreSQL provider（InMemory/SQLite 单测）保持 no-op。
+    /// </summary>
+    private async Task<IAsyncDisposable> AcquirePairLockAsync(
+        long userId1, long userId2, CancellationToken ct)
+    {
+        if (!string.Equals(
+                context.Database.ProviderName,
+                "Npgsql.EntityFrameworkCore.PostgreSQL",
+                StringComparison.Ordinal))
+            return NoopAsyncDisposable.Instance;
+
+        var connectionString = context.Database.GetDbConnection().ConnectionString;
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException("PostgreSQL connection string is required for relationship locking.");
+
+        var connection = new NpgsqlConnection(connectionString);
+        try
+        {
+            var key = ComputePairLockKey(userId1, userId2);
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT pg_advisory_lock(@pair_key);";
+            command.Parameters.AddWithValue("pair_key", key);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            return new PairAdvisoryLock(connection, key);
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static long ComputePairLockKey(long userId1, long userId2)
+    {
+        var low = Math.Min(userId1, userId2);
+        var high = Math.Max(userId1, userId2);
+        unchecked
+        {
+            ulong hash = 14695981039346656037UL;
+            for (var shift = 0; shift < 64; shift += 8)
+            {
+                hash ^= (byte)((ulong)low >> shift);
+                hash *= 1099511628211UL;
+            }
+
+            for (var shift = 0; shift < 64; shift += 8)
+            {
+                hash ^= (byte)((ulong)high >> shift);
+                hash *= 1099511628211UL;
+            }
+
+            return (long)hash;
+        }
+    }
+
+    private sealed class PairAdvisoryLock(NpgsqlConnection connection, long key) : IAsyncDisposable
+    {
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT pg_advisory_unlock(@pair_key);";
+                command.Parameters.AddWithValue("pair_key", key);
+                await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private sealed class NoopAsyncDisposable : IAsyncDisposable
+    {
+        public static NoopAsyncDisposable Instance { get; } = new();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// 发送好友请求
@@ -67,6 +151,9 @@ public class FriendshipService(
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "不能添加自己为好友");
+
+        await using var pairLock = await AcquirePairLockAsync(requesterId, targetUserId, ct)
+            .ConfigureAwait(false);
 
         var targetUser = await context.Users.AsNoTracking()
             .FirstOrDefaultAsync(u => u.Id == targetUserId, ct)
@@ -129,7 +216,7 @@ public class FriendshipService(
 
         if (incomingRequest)
         {
-            var acceptResult = await AcceptRequestAsync(requesterId, targetUserId, ct)
+            var acceptResult = await AcceptRequestLockedAsync(requesterId, targetUserId, ct)
                 .ConfigureAwait(false);
 
             return !acceptResult.Succeeded
@@ -150,7 +237,7 @@ public class FriendshipService(
         // P0-6：Everyone 自动接受改为单一事务内的 AcceptEveryoneAsync，失败整体回滚不残留 pending 申请
         if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
         {
-            return await AcceptEveryoneAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
+            return await AcceptEveryoneLockedAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
                 .ConfigureAwait(false);
         }
 
@@ -331,6 +418,15 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult<FriendDto>> AcceptRequestAsync(long acceptorId, long requesterId,
         CancellationToken ct = default)
     {
+        await using var pairLock = await AcquirePairLockAsync(acceptorId, requesterId, ct)
+            .ConfigureAwait(false);
+        return await AcceptRequestLockedAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>由公开 Accept 或已持有同一 pair lock 的 Send 调用。</summary>
+    private async Task<FriendshipOperationResult<FriendDto>> AcceptRequestLockedAsync(
+        long acceptorId, long requesterId, CancellationToken ct)
+    {
         //获取好友请求
         var request = await GetFriendRequestAsync(acceptorId, requesterId, RequestStatus.Pending, ct).ConfigureAwait(false);
         if (request == null)
@@ -419,6 +515,9 @@ public class FriendshipService(
         long declinerId, long requesterId,
         bool blockAfterDecline = false, CancellationToken ct = default)
     {
+        await using var pairLock = await AcquirePairLockAsync(declinerId, requesterId, ct)
+            .ConfigureAwait(false);
+
         var request = await GetFriendRequestAsync(declinerId, requesterId, RequestStatus.Pending, ct)
             .ConfigureAwait(false);
 
@@ -507,6 +606,9 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> WithdrawRequestAsync(
         long requesterId, long targetUserId, CancellationToken ct = default)
     {
+        await using var pairLock = await AcquirePairLockAsync(requesterId, targetUserId, ct)
+            .ConfigureAwait(false);
+
         var request = await context.FriendRequests
             .FirstOrDefaultAsync(r =>
                 r.RequesterId == requesterId
@@ -551,6 +653,9 @@ public class FriendshipService(
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "不能拉黑自己");
+
+        await using var pairLock = await AcquirePairLockAsync(blockerId, targetUserId, ct)
+            .ConfigureAwait(false);
 
         if (await context.BlockRecords
                 .AnyAsync(b => b.BlockerId == blockerId && b.BlockedUserId == targetUserId, ct)
@@ -618,6 +723,9 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> UnblockUserAsync(
         long unblockerId, long targetUserId, CancellationToken ct = default)
     {
+        await using var pairLock = await AcquirePairLockAsync(unblockerId, targetUserId, ct)
+            .ConfigureAwait(false);
+
         var blockRecord = await context.BlockRecords
             .FirstOrDefaultAsync(b => b.BlockerId == unblockerId && b.BlockedUserId == targetUserId, ct)
             .ConfigureAwait(false);
@@ -668,6 +776,9 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> DeleteFriendshipAsync(
         long userId, long friendId, CancellationToken ct = default)
     {
+        await using var pairLock = await AcquirePairLockAsync(userId, friendId, ct)
+            .ConfigureAwait(false);
+
         var myRecord = await context.Friendships
             .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
             .ConfigureAwait(false);
@@ -819,6 +930,20 @@ public class FriendshipService(
     /// <returns>关系信息</returns>
     public async Task<FriendshipStatusInfo> CheckRelationshipAsync(long userId1, long userId2, CancellationToken ct = default)
     {
+        var isBlocked = await context.BlockRecords.AsNoTracking()
+            .AnyAsync(b => (b.BlockerId == userId1 && b.BlockedUserId == userId2)
+                        || (b.BlockerId == userId2 && b.BlockedUserId == userId1), ct)
+            .ConfigureAwait(false);
+        if (isBlocked)
+        {
+            return new FriendshipStatusInfo
+            {
+                IsBlocked = true,
+                IsMutual = false,
+                Status = FriendshipStatus.None,
+            };
+        }
+
         var cacheKey = string.Format(RelationshipCacheKey, userId1, userId2);
         // 关系状态变化频率不高，用短缓存可以减少重复查库。
         var cached = await cacheService.TryGetAsync<FriendshipStatusInfo>(cacheKey, ct).ConfigureAwait(false);
@@ -850,6 +975,19 @@ public class FriendshipService(
         if (targets.Count == 0)
             return new Dictionary<long, FriendshipStatusInfo>();
 
+        // Block records are intentionally read through every batch rather than served from
+        // the relationship cache. Presence authorization must never turn a stale IsMutual
+        // cache entry into a bypass of a newly-created block.
+        var blockRows = await context.BlockRecords.AsNoTracking()
+            .Where(b => (b.BlockerId == watcherUserId && targets.Contains(b.BlockedUserId))
+                        || (b.BlockedUserId == watcherUserId && targets.Contains(b.BlockerId)))
+            .Select(b => new { b.BlockerId, b.BlockedUserId })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+        var blockedTargets = blockRows
+            .Select(b => b.BlockerId == watcherUserId ? b.BlockedUserId : b.BlockerId)
+            .ToHashSet();
+
         // 1 次 MGET 批量读取缓存
         var cacheKeys = new string[targets.Count];
         for (var i = 0; i < targets.Count; i++)
@@ -862,10 +1000,24 @@ public class FriendshipService(
         var missedTargets = new List<long>();
         for (var i = 0; i < targets.Count; i++)
         {
-            if (cached[i].Found)
-                result[targets[i]] = cached[i].Value!;
+            var targetId = targets[i];
+            if (blockedTargets.Contains(targetId))
+            {
+                result[targetId] = new FriendshipStatusInfo
+                {
+                    IsBlocked = true,
+                    IsMutual = false,
+                    Status = FriendshipStatus.None,
+                };
+            }
+            else if (cached[i].Found)
+            {
+                result[targetId] = cached[i].Value!;
+            }
             else
-                missedTargets.Add(targets[i]);
+            {
+                missedTargets.Add(targetId);
+            }
         }
 
         if (missedTargets.Count == 0)
@@ -1433,7 +1585,7 @@ public class FriendshipService(
     /// P0-6：Everyone 自动接受——申请创建、通知 Outbox、接受、建立双向关系、关闭反方向 pending
     /// 全部在单一 PostgreSQL 事务内完成，失败整体回滚不残留 pending 申请。
     /// </summary>
-    private async Task<SendFriendRequestResult> AcceptEveryoneAsync(
+    private async Task<SendFriendRequestResult> AcceptEveryoneLockedAsync(
         long requesterId, long targetUserId, string? message, bool targetNotifiesFriendRequests, CancellationToken ct)
     {
         // 接受方为 target，申请方为 requester。
@@ -1531,6 +1683,20 @@ public class FriendshipService(
     /// <returns>表示两个用户之间关系状态的信息</returns>
     private async Task<FriendshipStatusInfo> CheckRelationshipCoreAsync(long userId1, long userId2, CancellationToken ct =  default)
     {
+        var isBlocked = await context.BlockRecords.AsNoTracking()
+            .AnyAsync(b => (b.BlockerId == userId1 && b.BlockedUserId == userId2)
+                        || (b.BlockerId == userId2 && b.BlockedUserId == userId1), ct)
+            .ConfigureAwait(false);
+        if (isBlocked)
+        {
+            return new FriendshipStatusInfo
+            {
+                IsBlocked = true,
+                IsMutual = false,
+                Status = FriendshipStatus.None,
+            };
+        }
+
         var relations = await context.Friendships.IgnoreQueryFilters()
             .Where(f => (f.UserId == userId1 && f.FriendId == userId2) ||
                         (f.UserId == userId2 && f.FriendId == userId1))

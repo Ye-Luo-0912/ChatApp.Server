@@ -13,7 +13,7 @@ namespace Infrastructure.Services;
 /// 附件内容扫描 Worker。
 /// <para>P0-5.2：使用 <see cref="WorkerConcurrencyManager"/> 全局+专属并发预算；</para>
 /// <para>只领取当前可并发处理的作业数量，每个作业在独立作用域中处理并配心跳续租；</para>
-/// <para>终态更新由 <see cref="IAttachmentScanService.ProcessClaimedJobAsync"/> 通过 LeaseToken fencing 落库。</para>
+/// <para>扫描结论由 <see cref="IAttachmentScanService.ProcessClaimedJobAsync"/> 通过 LeaseToken fencing 持久化，外部投递另行执行。</para>
 /// </summary>
 public sealed class AttachmentScanWorker(
     IServiceScopeFactory scopeFactory,
@@ -112,7 +112,7 @@ public sealed class AttachmentScanWorker(
 
     /// <summary>
     /// 单个作业处理：独立作用域 + 独立 DbContext，长扫描期间周期性续租。
-    /// 终态由 Service 的 ApplyFencedUpdateAsync 以 LeaseToken 匹配落库；租约已易主时返回 false。
+    /// 扫描结论由 Service 以 LeaseToken 匹配持久化；仅真正租约丢失才计入 lease-lost 指标。
     /// </summary>
     private async Task ProcessOneAsync(
         AttachmentScanJob claimed, IAsyncDisposable concurrencyScope, CancellationToken cancellationToken)
@@ -157,11 +157,11 @@ public sealed class AttachmentScanWorker(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
-            var terminal = await svc.ProcessClaimedJobAsync(claimed, cancellationToken).ConfigureAwait(false);
-            if (!terminal)
+            var result = await svc.ProcessClaimedJobAsync(claimed, cancellationToken).ConfigureAwait(false);
+            if (result == AttachmentScanProcessResult.LeaseLost)
                 concurrencyManager.RecordLeaseLost(WorkerName);
-            if (terminal)
-                logger.LogInformation("附件扫描完成 JobId={Id} AttachmentId={Aid}", claimed.Id, claimed.AttachmentId);
+            if (result == AttachmentScanProcessResult.ResultStaged)
+                logger.LogInformation("附件扫描结论已持久化 JobId={Id} AttachmentId={Aid}", claimed.Id, claimed.AttachmentId);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
