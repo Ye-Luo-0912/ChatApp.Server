@@ -1,11 +1,9 @@
-name: Performance Regression (PR)
+name: Performance Stage Gate
 
 on:
-  pull_request:
-    branches: [master, main]
   workflow_dispatch:
 
-# 避免同一 PR 多次推送并发跑压测
+# 阶段性手动执行；避免同一分支重复触发并发压测。
 concurrency:
   group: perf-regression-${{ github.ref }}
   cancel-in-progress: true
@@ -174,7 +172,7 @@ jobs:
             echo "找到基线: $BASELINE"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::error::未找到基线 $BASELINE。Nightly workflow 负责生成基线；请先手动触发 Performance Nightly workflow_dispatch 生成基线后再提 PR。"
+            echo "::error::未找到基线 $BASELINE。请先手动运行 Performance Soak，审阅候选 artifact，并通过普通提交加入基线。"
             exit 1
           fi
 

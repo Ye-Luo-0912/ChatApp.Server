@@ -1,9 +1,6 @@
-name: Performance Nightly
+name: Performance Soak (Manual)
 
 on:
-  schedule:
-    # 每天 UTC 02:00（北京时间 10:00）运行
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       soak_duration:
@@ -14,18 +11,18 @@ on:
         type: boolean
         default: false
 
-# 同一时刻只跑一个 nightly
+# 同一时刻只跑一个阶段长测
 concurrency:
-  group: perf-nightly
+  group: perf-soak
   cancel-in-progress: false
 
 jobs:
-  nightly:
+  soak:
     # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
-      contents: write
+      contents: read
     env:
       DOTNET_NOLOGO: "1"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
@@ -33,10 +30,10 @@ jobs:
       ConnectionStrings__Garnet: "127.0.0.1:6379,abortConnect=false"
       JwtSettings__Issuer: ChatApp
       JwtSettings__Audience: ChatApp
-      JwtSettings__Secret: perf-nightly-secret-please-change-32chars
+      JwtSettings__Secret: perf-soak-secret-please-change-32chars
       ForwardedHeaders__KnownProxies__0: "127.0.0.1"
       ForwardedHeaders__KnownNetworks__0: "172.28.0.0/16"
-      Security__SecretEncryptionKey: "perf-nightly-encryption-key-32-chars!!"
+      Security__SecretEncryptionKey: "perf-soak-encryption-key-32-chars!!"
       EmailSettings__Host: "localhost"
       EmailSettings__SenderEmail: "noreply@localhost"
       EmailSettings__Password: "dummy"
@@ -181,27 +178,18 @@ jobs:
             --out json=steady-15m.json \
             mixed-workload.k6.js
 
-      - name: Refresh baseline (summary JSON only)
+      - name: Generate baseline candidate (summary JSON only)
         working-directory: ChatApp.Server
         run: |
           mkdir -p tests/load/baselines
-          # 不再提交原始 k6 事件流（数 MB，每日变化，污染 git 历史）。
-          # 仅保存压缩 summary JSON（几 KB，含 p50/p95/p99/avg/sum/count）。
-          # 原始事件流由下方 Upload all runs 步骤作为 artifact 保留 90 天。
+          # 只生成压缩 summary；工作流不直接写主分支。
+          # 候选 summary 与原始事件流均由下方 artifact 保留 90 天。
           node tests/load/extract-summary.mjs \
             --input tests/load/steady-15m.json \
             --output tests/load/baselines/baseline-steady-rate20.json \
             --runner ubuntu-24.04 \
             --runtime "steady 15m RATE=20"
-          git add tests/load/baselines/baseline-steady-rate20.json
-          if git diff --cached --quiet; then
-            echo "基线无变化"
-          else
-            git commit -m "perf: refresh steady baseline summary (nightly $(date -u +%Y-%m-%d))"
-            # schedule 触发时处于 detached HEAD，显式推到 master
-            git push origin "HEAD:master"
-            echo "基线已推送"
-          fi
+          echo "候选基线已生成；审阅 artifact 后通过普通提交更新基线。"
 
       # ─────────────────────────────────────────────────────────────
       # 场景 2：auth capacity（5 分钟登录容量）
@@ -377,9 +365,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-nightly-${{ github.run_id }}
+          name: perf-soak-${{ github.run_id }}
           path: |
             ChatApp.Server/tests/load/steady-15m.json
+            ChatApp.Server/tests/load/baselines/baseline-steady-rate20.json
             ChatApp.Server/tests/load/auth-capacity-5m.json
             ChatApp.Server/tests/load/device-churn-10m.json
             ChatApp.Server/tests/load/dual-ratelimit.json
@@ -392,7 +381,7 @@ jobs:
         if: always()
         working-directory: ChatApp.Server/tests/load
         run: |
-          echo "## Nightly 性能门禁结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 手动阶段性能门禁结果" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           for f in steady-15m auth-capacity-5m device-churn-10m dual-ratelimit restart-after soak; do
             if [ -f "${f}.json" ]; then
@@ -402,4 +391,4 @@ jobs:
             fi
           done
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "基线已更新至 \`tests/load/baselines/baseline-steady-rate20.json\`（summary JSON，若稳态通过）。原始事件流见 artifact。" >> "$GITHUB_STEP_SUMMARY"
+          echo "候选基线与原始事件流已归档；审阅后通过普通提交更新仓库基线。" >> "$GITHUB_STEP_SUMMARY"

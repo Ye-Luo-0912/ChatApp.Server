@@ -116,6 +116,7 @@ jobs:
       - name: Health ready gate
         working-directory: ChatApp.Server
         env:
+          ASPNETCORE_ENVIRONMENT: Testing
           ASPNETCORE_URLS: http://127.0.0.1:5088
           ConnectionStrings__DefaultConnection: ${{ env.CHATAPP_TEST_POSTGRES }}
           ConnectionStrings__Garnet: ${{ env.CHATAPP_TEST_GARNET }}

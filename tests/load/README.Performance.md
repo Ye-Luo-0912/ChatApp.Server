@@ -84,14 +84,14 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 
 ## 推荐场景
 
-### 两层性能门禁
+### 阶段性性能门禁
 
-| 门禁 | workflow | 触发 | 场景 | 阻塞 PR |
-|------|----------|------|------|---------|
-| PR 回归 | `.github/workflows/performance-regression.yml` | `pull_request` to master | steady 3m + 比对基线 | 是（回归超阈值或绝对目标未达） |
-| Nightly | `.github/workflows/performance-nightly.yml` | `schedule` 每日 / 手动 | steady 15m、auth capacity、device churn、双实例限流、重启恢复、2h soak | 否（仅归档 + 刷新基线） |
+| 门禁 | workflow | 触发 | 场景 | 用途 |
+|------|----------|------|------|------|
+| 快速阶段门禁 | `.github/workflows/performance-regression.yml` | 手动 `workflow_dispatch` | steady 3m + 比对已审核基线 | 一组热路径改造完成后执行 |
+| 完整阶段门禁 | `.github/workflows/performance-nightly.yml` | 手动 `workflow_dispatch` | steady 15m、auth capacity、device churn、双实例限流、重启恢复、可选 2h soak | 里程碑验收并生成候选基线 artifact |
 
-PR 回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
+阶段回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
 
 | 维度 | 阈值 |
 |------|------|
@@ -115,10 +115,10 @@ PR 回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) �
 | Worker | backlog 和 oldest age 不持续增长 |
 
 基线文件存放于 [baselines/](baselines/) 目录，命名 `baseline-<PROFILE>-rate<RATE>.json`。
-Nightly 每日跑完 steady 15m 后自动 commit/push 刷新基线；PR 拉取该基线与当前分支 3m run 比对。
-首次运行（基线不存在）仅校验绝对目标与错误率，不阻塞。
+完整阶段门禁跑完 steady 15m 后上传候选 summary 和原始事件流，不直接写入 master。
+审阅候选结果并通过普通提交更新基线后，快速阶段门禁才执行 3m 比对；缺少基线会明确失败。
 
-Nightly 重启恢复：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
+完整阶段门禁的重启恢复场景：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
 断言重启后错误率 ≤ 5%。覆盖 AGENTS.md 的恢复语义。
 
 ### steady（固定设备基线）
