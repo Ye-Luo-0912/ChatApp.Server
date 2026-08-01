@@ -18,6 +18,8 @@ public class FriendshipConfig:IEntityTypeConfiguration<UserFriendEntry>
             .IsUnique()
             .HasDatabaseName("IX_User_Friend_Unique");
         
+        builder.Property(f => f.Note).HasMaxLength(FriendshipInputLimits.FriendNoteMaxLength);
+
         builder.HasNoForeignKeyConstraints();
 
         // 用户关系配置

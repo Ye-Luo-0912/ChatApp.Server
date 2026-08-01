@@ -1,6 +1,5 @@
 using System.Text.Json;
 using Core.Interfaces;
-using Core.Interfaces.Auth;
 using Core.Models.Auth;
 using Core.Models.Common;
 using Core.Models.Moderation;
@@ -13,7 +12,6 @@ namespace Infrastructure.Services;
 
 public sealed class ModerationService(
     UserDbContext db,
-    ISessionStore sessionStore,
     ISecurityEventStore securityEventStore,
     IMessageEvidenceProvider messageEvidence,
     ILogger<ModerationService> logger) : IModerationService
@@ -185,52 +183,133 @@ public sealed class ModerationService(
     {
         if (newStatus is not (UserReportStatus.Reviewed or UserReportStatus.ActionTaken or UserReportStatus.Rejected))
             return AuthOperationResult.Fail("InvalidTransition", "审核状态无效");
-
-        var strategy = db.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync(async () =>
+        if (newStatus == UserReportStatus.ActionTaken
+            && banUntil is { } requestedBanUntil
+            && requestedBanUntil <= DateTimeOffset.UtcNow)
         {
-            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
-            var report = await db.UserReports.FirstOrDefaultAsync(r => r.Id == reportId, cancellationToken);
-            if (report is null)
-                return AuthOperationResult.Fail("NotFound", "举报不存在");
+            return AuthOperationResult.Fail("ValidationFailed", "封禁截止时间必须晚于当前时间");
+        }
 
-            if (!CanTransition(report.Status, newStatus))
-                return AuthOperationResult.Fail("InvalidTransition",
-                    $"不能从 {report.Status} 转到 {newStatus}");
+        var normalizedNote = string.IsNullOrWhiteSpace(note) ? null : note.Trim();
+        if (normalizedNote is { Length: > 512 })
+            return AuthOperationResult.Fail("ValidationFailed", "审核备注过长");
 
-            report.Status = newStatus;
-            report.ReviewedByAdminId = adminId;
-            report.UpdatedAt = DateTimeOffset.UtcNow;
-            if (!string.IsNullOrWhiteSpace(note))
-                report.Detail = string.IsNullOrWhiteSpace(report.Detail) ? note : $"{report.Detail}\n[admin] {note}";
+        var now = DateTimeOffset.UtcNow;
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        var report = await db.UserReports.AsNoTracking()
+            .FirstOrDefaultAsync(r => r.Id == reportId, cancellationToken);
+        if (report is null)
+            return AuthOperationResult.Fail("NotFound", "举报不存在");
+        if (!CanTransition(report.Status, newStatus))
+        {
+            return AuthOperationResult.Fail(
+                "InvalidTransition",
+                $"不能从 {report.Status} 转到 {newStatus}");
+        }
 
-            if (newStatus == UserReportStatus.ActionTaken && banUntil.HasValue && report.TargetUserId is { } targetId)
+        var reviewedDetail = normalizedNote is null
+            ? null
+            : string.IsNullOrWhiteSpace(report.Detail)
+                ? normalizedNote
+                : $"{report.Detail}\n[admin] {normalizedNote}";
+        if (reviewedDetail is { Length: > 2000 })
+            return AuthOperationResult.Fail("ValidationFailed", "审核备注会超过举报详情长度限制");
+
+        var stageSessionRevocation = newStatus == UserReportStatus.ActionTaken
+                                     && banUntil.HasValue
+                                     && report.TargetUserId.HasValue;
+        var transition = db.UserReports.Where(
+            r => r.Id == reportId && r.Status == report.Status);
+
+        int transitioned;
+        if (reviewedDetail is not null)
+        {
+            transitioned = stageSessionRevocation
+                ? await transition.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(r => r.Status, newStatus)
+                    .SetProperty(r => r.ReviewedByAdminId, adminId)
+                    .SetProperty(r => r.UpdatedAt, now)
+                    .SetProperty(r => r.Detail, reviewedDetail)
+                    .SetProperty(r => r.BanUntil, banUntil), cancellationToken)
+                : await transition.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(r => r.Status, newStatus)
+                    .SetProperty(r => r.ReviewedByAdminId, adminId)
+                    .SetProperty(r => r.UpdatedAt, now)
+                    .SetProperty(r => r.Detail, reviewedDetail), cancellationToken);
+        }
+        else
+        {
+            transitioned = stageSessionRevocation
+                ? await transition.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(r => r.Status, newStatus)
+                    .SetProperty(r => r.ReviewedByAdminId, adminId)
+                    .SetProperty(r => r.UpdatedAt, now)
+                    .SetProperty(r => r.BanUntil, banUntil), cancellationToken)
+                : await transition.ExecuteUpdateAsync(setters => setters
+                    .SetProperty(r => r.Status, newStatus)
+                    .SetProperty(r => r.ReviewedByAdminId, adminId)
+                    .SetProperty(r => r.UpdatedAt, now), cancellationToken);
+        }
+
+        if (transitioned != 1)
+        {
+            return AuthOperationResult.Fail(
+                "Conflict",
+                "举报状态已被其他审核员更新，请刷新后重试");
+        }
+
+        if (stageSessionRevocation)
+        {
+            var targetUserId = report.TargetUserId.GetValueOrDefault();
+            var expectedBanUntil = banUntil.GetValueOrDefault();
+            var securityStamp = Guid.NewGuid().ToString();
+            var userUpdated = await db.Users
+                .Where(u => u.Id == targetUserId && u.SecurityVersion < long.MaxValue)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(u => u.BanUntil, banUntil)
+                    .SetProperty(u => u.SecurityStamp, securityStamp)
+                    .SetProperty(u => u.SecurityVersion, u => u.SecurityVersion + 1), cancellationToken);
+            if (userUpdated != 1)
             {
-                report.BanUntil = banUntil;
-                var user = await db.Users.FirstOrDefaultAsync(u => u.Id == targetId, cancellationToken);
-                if (user is not null)
-                {
-                    user.BanUntil = banUntil;
-                    user.SecurityStamp = Guid.NewGuid().ToString();
-                    user.AdvanceSecurityVersion();
-                    await sessionStore.RevokeAllSessionsAsync(targetId.ToString(), cancellationToken: cancellationToken);
-                }
+                return AuthOperationResult.Fail(
+                    "TargetNotFound",
+                    "目标用户不存在或安全版本不可再推进");
             }
 
-            db.AdminAuditLogs.Add(new AdminAuditLog
-            {
-                AdminUserId = adminId,
-                TargetUserId = report.TargetUserId,
-                Action = "ReviewReport",
-                Reason = note,
-                Detail = $"report={reportId};status={newStatus}",
-                CreatedAt = DateTimeOffset.UtcNow,
-            });
+            var expectedSecurityVersion = await db.Users.AsNoTracking()
+                .Where(u => u.Id == targetUserId)
+                .Select(u => (long?)u.SecurityVersion)
+                .SingleOrDefaultAsync(cancellationToken);
+            if (!expectedSecurityVersion.HasValue)
+                throw new InvalidOperationException("已更新的目标用户无法读取安全版本");
 
-            await db.SaveChangesAsync(cancellationToken);
-            await tx.CommitAsync(cancellationToken);
-            return AuthOperationResult.Success();
+            db.ModerationSessionRevocationOutbox.Add(new ModerationSessionRevocationOutboxItem
+            {
+                SourceReportId = reportId,
+                UserId = targetUserId,
+                ExpectedSecurityVersion = expectedSecurityVersion.Value,
+                ExpectedBanUntil = expectedBanUntil,
+                Status = ModerationSessionRevocationOutboxStatus.Pending,
+                AttemptCount = 0,
+                NextAttemptAt = now,
+                CreatedAt = now,
+                UpdatedAt = now,
+            });
+        }
+
+        db.AdminAuditLogs.Add(new AdminAuditLog
+        {
+            AdminUserId = adminId,
+            TargetUserId = report.TargetUserId,
+            Action = "ReviewReport",
+            Reason = normalizedNote,
+            Detail = $"report={reportId};status={newStatus}",
+            CreatedAt = now,
         });
+
+        await db.SaveChangesAsync(cancellationToken);
+        await tx.CommitAsync(cancellationToken);
+        return AuthOperationResult.Success();
     }
 
     public async Task<AuthOperationResult> AppealAsync(
@@ -255,6 +334,7 @@ public sealed class ModerationService(
         await db.SaveChangesAsync(cancellationToken);
         return AuthOperationResult.Success();
     }
+
 
     private static bool CanTransition(UserReportStatus from, UserReportStatus to) => from switch
     {

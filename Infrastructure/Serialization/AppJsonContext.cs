@@ -51,7 +51,7 @@ namespace Infrastructure.Serialization;
 [JsonSerializable(typeof(UserAuthSnapshot))]
 [JsonSerializable(typeof(FriendshipStatusInfo))]
 [JsonSerializable(typeof(AttachmentDownloadTicketPayload))]
-[JsonSerializable(typeof(LocalAttachmentStorage.AttachmentTicketInfo))]
+[JsonSerializable(typeof(AttachmentUploadTicket))]
 [JsonSerializable(typeof(LocalAvatarStorage.AvatarTicketInfo))]
 [JsonSerializable(typeof(UserStatus))]
 public partial class AppJsonContext : JsonSerializerContext

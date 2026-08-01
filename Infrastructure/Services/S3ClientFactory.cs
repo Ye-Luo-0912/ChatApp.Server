@@ -66,6 +66,25 @@ internal static class S3ClientFactory
         }
     }
 
+    public static void ApplyServerSideEncryption(
+        CopyObjectRequest request,
+        string mode,
+        string? kmsKeyId)
+    {
+        switch (NormalizeMode(mode))
+        {
+            case "SSE-S3":
+                request.ServerSideEncryptionMethod = ServerSideEncryptionMethod.AES256;
+                break;
+            case "SSE-KMS":
+                request.ServerSideEncryptionMethod = ServerSideEncryptionMethod.AWSKMS;
+                request.ServerSideEncryptionKeyManagementServiceKeyId = kmsKeyId;
+                break;
+            default:
+                throw new InvalidOperationException($"不支持的 S3 SSE 模式: {mode}");
+        }
+    }
+
     public static string NormalizeMode(string? mode) =>
         string.Equals(mode, "SSE-KMS", StringComparison.OrdinalIgnoreCase)
             ? "SSE-KMS"

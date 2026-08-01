@@ -16,6 +16,13 @@ public interface IAttachmentStorage
             CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 撤销尚未返回给客户端的上传票。用于元数据预留失败后的编排补偿；幂等。
+    /// </summary>
+    Task CancelUploadTicketAsync(
+        string ticket,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 将请求体流式写入存储。Local 落临时 <c>.uploading</c> 后原子改名；不整文件进内存。
     /// 成功时返回实际字节数与 SHA-256（hex）。
     /// </summary>
@@ -26,7 +33,7 @@ public interface IAttachmentStorage
         string contentType,
         CancellationToken cancellationToken = default);
 
-    /// <summary>确认对象存在；对象键从预签阶段起就是最终键。</summary>
+    /// <summary>确认暂存对象存在；扫描通过后存储实现可将其提升到不可变最终键。</summary>
     Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
         ConfirmObjectAsync(
             long userId,
@@ -68,6 +75,7 @@ public sealed record AttachmentReadResult(
     Stream Content,
     string ContentType,
     long? Length,
-    string? FileName);
+    string? FileName,
+    string? EntityTag = null);
 
 public sealed record AttachmentSignedUrl(string Url, DateTimeOffset ExpiresAt);

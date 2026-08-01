@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Data.Common;
 using System.Security.Cryptography;
 using Core.Interfaces;
 using Core.Models.Export;
@@ -225,19 +226,54 @@ public sealed class AttachmentScanService(
         }
     }
 
-    public Task<int> RenewLeaseAsync(
+    public async Task<LeaseRenewalResult> RenewLeaseAsync(
         long jobId, string leaseOwner, string leaseToken, CancellationToken cancellationToken = default)
     {
         var until = DateTimeOffset.UtcNow.Add(Lease);
-        return db.AttachmentScanJobs
-            .Where(j => j.Id == jobId
-                && j.LeaseOwner == leaseOwner
-                && j.LeaseToken == leaseToken
-                && (j.Status == AttachmentScanJobStatus.Processing
-                    || j.Status == AttachmentScanJobStatus.Finalizing))
-            .ExecuteUpdateAsync(
-                s => s.SetProperty(j => j.LeaseExpiresAt, until),
-                cancellationToken);
+        try
+        {
+            if (!IsNpgsql())
+            {
+                var tracked = await db.AttachmentScanJobs
+                    .FirstOrDefaultAsync(
+                        j => j.Id == jobId
+                             && j.LeaseOwner == leaseOwner
+                             && j.LeaseToken == leaseToken
+                             && (j.Status == AttachmentScanJobStatus.Processing
+                                 || j.Status == AttachmentScanJobStatus.Finalizing),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (tracked is null)
+                    return LeaseRenewalResult.LeaseLost;
+
+                tracked.LeaseExpiresAt = until;
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                return LeaseRenewalResult.Renewed;
+            }
+
+            var updated = await db.AttachmentScanJobs
+                .Where(j => j.Id == jobId
+                    && j.LeaseOwner == leaseOwner
+                    && j.LeaseToken == leaseToken
+                    && (j.Status == AttachmentScanJobStatus.Processing
+                        || j.Status == AttachmentScanJobStatus.Finalizing))
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(j => j.LeaseExpiresAt, until),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return updated == 1
+                ? LeaseRenewalResult.Renewed
+                : LeaseRenewalResult.LeaseLost;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is DbException or TimeoutException)
+        {
+            logger.LogDebug(ex, "附件扫描租约续租发生瞬时失败 JobId={Id}", jobId);
+            return LeaseRenewalResult.TransientFailure;
+        }
     }
 
     private bool IsNpgsql() =>
@@ -405,6 +441,7 @@ public sealed class AttachmentScanService(
             OriginalName = claimed.OriginalName,
             SizeBytes = claimed.SizeBytes,
             ContentHash = result.ContentHash,
+            SourceEntityTag = result.SourceEntityTag,
             Outcome = outcome,
             RejectionReason = rejectionReason,
             AttemptCount = 0,
@@ -734,7 +771,8 @@ public sealed class AttachmentScanService(
         }
 
         return new ContentScanResult(
-            true, finalType, null, false, auditEngine, auditVersion, contentHash);
+            true, finalType, null, false, auditEngine, auditVersion,
+            contentHash, read.EntityTag);
     }
 
     private AttachmentScanAudit CreateScanAudit(
@@ -793,7 +831,8 @@ public sealed class AttachmentScanService(
         bool Transient,
         string? EngineName,
         string? EngineVersion,
-        string? ContentHash = null);
+        string? ContentHash = null,
+        string? SourceEntityTag = null);
 }
 
 /// <summary>DI 作用域工厂封装，供 BackgroundService / Confirm 路径入队。</summary>

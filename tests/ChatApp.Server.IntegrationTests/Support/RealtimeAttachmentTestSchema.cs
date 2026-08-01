@@ -32,6 +32,11 @@ internal static class RealtimeAttachmentTestSchema
             );
             ALTER TABLE realtime.attachments
                 ADD COLUMN IF NOT EXISTS content_hash varchar(64) NULL;
+            ALTER TABLE realtime.attachments
+                DROP CONSTRAINT IF EXISTS ck_attachments_status_known;
+            ALTER TABLE realtime.attachments
+                ADD CONSTRAINT ck_attachments_status_known
+                CHECK (status IN (0, 1, 2, 3, 4, 5, 6));
             CREATE UNIQUE INDEX IF NOT EXISTS ux_attachments_object_key
                 ON realtime.attachments (object_key);
             CREATE TABLE IF NOT EXISTS realtime.conversation_members (

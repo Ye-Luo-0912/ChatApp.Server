@@ -3,7 +3,10 @@
 namespace Core.Models.Friend;
 public record ApiResponse(object? Data);
 public record ApiError(FriendshipOperationResultErrorCode Code, string Message);
-public record SendFriendRequestRequest([Required] long TargetUserId, string? Message);
+public record SendFriendRequestRequest(
+    [param: Range(1, long.MaxValue)] long TargetUserId,
+    [param: StringLength(FriendshipInputLimits.FriendRequestMessageMaxLength)] string? Message);
+
 public class FriendDto
 {
     public long FriendId { get ; set ; }

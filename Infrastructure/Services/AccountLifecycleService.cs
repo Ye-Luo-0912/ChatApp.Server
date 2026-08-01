@@ -5,6 +5,7 @@ using Core.Interfaces;
 using Core.Interfaces.Auth;
 using Core.Models.Auth;
 using Core.Models.Common;
+using Core.Models.Export;
 using Core.Models.Security;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -32,24 +33,90 @@ public sealed class AccountLifecycleService(
 
     public string LeaseOwnerId => _instanceId;
 
-    public async Task<AuthOperationResult> ScheduleDeletionAsync(
-        long userId, CancellationToken cancellationToken = default)
+    public Task<AuthOperationResult> ScheduleDeletionAsync(
+        long userId, CancellationToken cancellationToken = default) =>
+        ScheduleDeletionCoreAsync(
+            userId, actorUserId: null, reason: null, clientIp: null, cancellationToken);
+
+    public Task<AuthOperationResult> ScheduleDeletionByAdminAsync(
+        long userId,
+        long actorUserId,
+        string? reason,
+        string? clientIp,
+        CancellationToken cancellationToken = default) =>
+        ScheduleDeletionCoreAsync(userId, actorUserId, reason, clientIp, cancellationToken);
+
+    private async Task<AuthOperationResult> ScheduleDeletionCoreAsync(
+        long userId,
+        long? actorUserId,
+        string? reason,
+        string? clientIp,
+        CancellationToken cancellationToken)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        await AdminRoleInvariant.AcquireMutationLockAsync(db, cancellationToken);
+        if (db.Database.ProviderName?.Contains(
+                "Npgsql", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
+                cancellationToken);
+        }
+
         var user = await db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
         if (user is null)
+        {
+            await tx.RollbackAsync(cancellationToken);
             return AuthOperationResult.Fail("NotFound", "用户不存在");
+        }
+
+        if (await AdminRoleInvariant.IsLastActiveAdminAsync(db, userId, cancellationToken))
+        {
+            await tx.RollbackAsync(cancellationToken);
+            return AuthOperationResult.Fail("LastAdmin", "不能注销最后一个可用管理员");
+        }
 
         user.DeletionScheduledAt = DateTimeOffset.UtcNow.Add(CoolDown);
         user.DeletionLeaseUntil = null;
         user.DeletionLeaseOwner = null;
         user.SecurityStamp = Guid.NewGuid().ToString();
         user.AdvanceSecurityVersion();
-        await db.SaveChangesAsync(cancellationToken);
-        await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
+
+        if (actorUserId is { } actorId)
+        {
+            db.AdminAuditLogs.Add(new AdminAuditLog
+            {
+                AdminUserId = actorId,
+                TargetUserId = userId,
+                Action = "ScheduleUserDeletion",
+                Reason = reason,
+                Detail = $"scheduled={user.DeletionScheduledAt:O}",
+                ClientIp = clientIp,
+                CreatedAt = DateTimeOffset.UtcNow,
+            });
+        }
+
         await securityEventStore.RecordAsync(
-            userId, SecurityEventType.AccountDeletionScheduled,
-            detail: $"scheduled={user.DeletionScheduledAt:O}",
+            userId,
+            SecurityEventType.AccountDeletionScheduled,
+            clientIp: clientIp,
+            detail: $"scheduled={user.DeletionScheduledAt:O};reason={reason}",
+            actorUserId: actorUserId?.ToString(),
             cancellationToken: cancellationToken);
+        await db.SaveChangesAsync(cancellationToken);
+        await tx.CommitAsync(cancellationToken);
+
+        try
+        {
+            await sessionStore.RevokeAllSessionsAsync(
+                userId.ToString(), cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // SecurityVersion is the durable authorization fence; Redis cleanup
+            // is best-effort after commit and can safely be retried later.
+            logger.LogWarning(ex, "预约注销后撤销会话失败 UserId={UserId}", userId);
+        }
 
         logger.LogWarning("用户 {UserId} 已预约注销，冷静期至 {At}", userId, user.DeletionScheduledAt);
         return AuthOperationResult.Success();
@@ -177,10 +244,25 @@ public sealed class AccountLifecycleService(
         long userId, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         db.ChangeTracker.Clear();
+        if (!attachmentMetadata.IsAvailable)
+            throw new InvalidOperationException(
+                $"附件元数据不可用，拒绝在无法建立删除墓碑时注销账户：{attachmentMetadata.UnavailableReason}");
+
+        // External read happens before the local transaction. Failure is fail-closed;
+        // once the snapshot succeeds, the local tombstones and user deletion commit
+        // atomically below. A scheduled account cannot authenticate to create more uploads.
+        var attachmentObjectKeys = (await attachmentMetadata
+                .ListObjectKeysForUserAsync(userId, cancellationToken)
+                .ConfigureAwait(false))
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Select(key => key.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
         var strategy = db.Database.CreateExecutionStrategy();
         return await strategy.ExecuteAsync(async () =>
         {
             await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+            await AdminRoleInvariant.AcquireMutationLockAsync(db, cancellationToken);
 
             await db.Database.ExecuteSqlInterpolatedAsync(
                 $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
@@ -195,8 +277,6 @@ public sealed class AccountLifecycleService(
 
             var scheduledAt = user.DeletionScheduledAt;
             var leaseOwner = user.DeletionLeaseOwner;
-            // 后续全部用 ExecuteDelete/SQL，避免跟踪实体与批量删除冲突。
-            db.Entry(user).State = EntityState.Detached;
 
             // 取消注销或租约易主：整事务回滚，关联数据不会被部分删除。
             if (scheduledAt is null
@@ -209,21 +289,58 @@ public sealed class AccountLifecycleService(
                 return false;
             }
 
-            // 在 Realtime DeleteByUser 删行之前先快照 object_key，提交后再删 blob。
-            IReadOnlyList<string> attachmentObjectKeys = [];
-            if (attachmentMetadata.IsAvailable)
+            if (await AdminRoleInvariant.IsLastActiveAdminAsync(db, userId, cancellationToken))
             {
-                try
+                user.DeletionScheduledAt = null;
+                user.DeletionLeaseUntil = null;
+                user.DeletionLeaseOwner = null;
+                db.SecurityEvents.Add(new SecurityEvent
                 {
-                    attachmentObjectKeys = await attachmentMetadata
-                        .ListObjectKeysForUserAsync(userId, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
+                    UserId = userId,
+                    EventType = SecurityEventType.AdminAction,
+                    Detail = "account_deletion_cancelled_last_admin",
+                    CreatedAt = DateTimeOffset.UtcNow,
+                });
+                await db.SaveChangesAsync(cancellationToken);
+                await tx.CommitAsync(cancellationToken);
+                logger.LogWarning(
+                    "已取消最后管理员的到期注销 UserId={UserId}", userId);
+                return false;
+            }
+
+            var stagedAttachmentDeleteCount = 0;
+            if (attachmentObjectKeys.Length > 0)
+            {
+                var existingKeys = await db.AttachmentBlobDeleteJobs
+                    .AsNoTracking()
+                    .Where(job => attachmentObjectKeys.Contains(job.ObjectKey)
+                                  && (job.Status == AttachmentBlobDeleteJobStatus.Pending
+                                      || job.Status == AttachmentBlobDeleteJobStatus.Processing))
+                    .Select(job => job.ObjectKey)
+                    .ToListAsync(cancellationToken);
+                var existing = existingKeys.ToHashSet(StringComparer.Ordinal);
+                var tombstones = attachmentObjectKeys
+                    .Where(key => !existing.Contains(key))
+                    .Select(key => new AttachmentBlobDeleteJob
+                    {
+                        ObjectKey = key,
+                        UserId = userId,
+                        Status = AttachmentBlobDeleteJobStatus.Pending,
+                        AttemptCount = 0,
+                        NextAttemptAt = now,
+                        CreatedAt = now,
+                    })
+                    .ToArray();
+                if (tombstones.Length > 0)
                 {
-                    logger.LogWarning(ex, "列举附件 object_key 失败 UserId={UserId}", userId);
+                    db.AttachmentBlobDeleteJobs.AddRange(tombstones);
+                    stagedAttachmentDeleteCount = tombstones.Length;
                 }
             }
+
+            // The tombstones above and user deletion now share this transaction.
+            // Subsequent bulk deletes must not conflict with a tracked user entity.
+            db.Entry(user).State = EntityState.Detached;
 
             await db.Friendships
                 .Where(f => f.UserId == userId || f.FriendId == userId)
@@ -333,31 +450,27 @@ public sealed class AccountLifecycleService(
                 logger.LogWarning(ex, "注销后撤销会话失败 UserId={UserId}（DB 已清理）", userId);
             }
 
-            // 附件 blob GC：入队墓碑（可重试），再 MarkAbandoned；不再仅 fire-and-forget。
+            if (stagedAttachmentDeleteCount > 0)
+            {
+                AuthSecurityMetrics.AttachmentPendingDeleteDelta(stagedAttachmentDeleteCount);
+                logger.LogInformation(
+                    "账户注销事务已持久化 {Count} 条附件删除墓碑 UserId={UserId}",
+                    stagedAttachmentDeleteCount,
+                    userId);
+            }
+
+            // Tombstones are already durable. Immediate processing is an
+            // optimization only; failure leaves Pending rows for the worker.
             try
             {
-                if (attachmentObjectKeys.Count > 0)
-                {
-                    await attachmentBlobDeletes.EnqueueAsync(
-                            attachmentObjectKeys,
-                            userId,
-                            attachmentId: null,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-
-                    // 立即尝试一轮；失败留 Pending + LastError 由 Worker 退避重试。
+                if (stagedAttachmentDeleteCount > 0)
                     await attachmentBlobDeletes.ProcessDueAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                if (attachmentMetadata.IsAvailable)
-                {
-                    await attachmentMetadata.MarkAbandonedByUploaderAsync(userId, cancellationToken)
-                        .ConfigureAwait(false);
-                }
+                await attachmentMetadata.MarkAbandonedByUploaderAsync(userId, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "注销后附件 blob GC 入队/处理失败 UserId={UserId}", userId);
+                logger.LogWarning(ex, "注销后附件 blob GC 处理失败 UserId={UserId}", userId);
             }
 
             var pendingExports = await db.DataExportJobs

@@ -80,9 +80,9 @@ public sealed class RateLimitingOptionsValidator : IValidateOptions<RateLimiting
             failures.Add("RateLimiting:UserSensitiveWindowSeconds 必须大于 0。");
         }
 
-        if (options.ClusterShardCount <= 0 || options.ClusterShardCount > 1024)
+        if (options.ClusterShardCount != 1)
         {
-            failures.Add("RateLimiting:ClusterShardCount 必须在 1 到 1024 之间。");
+            failures.Add("RateLimiting:ClusterShardCount 必须为 1；多维原子限流使用策略级固定 Redis Cluster slot。");
         }
 
         return failures.Count == 0

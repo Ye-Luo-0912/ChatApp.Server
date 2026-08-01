@@ -17,7 +17,8 @@ namespace Infrastructure.Extensions;
 public static class RealtimeModuleExtensions
 {
     /// <summary>注册 Realtime 集成模块。</summary>
-    public static IServiceCollection AddRealtimeIntegrationModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddRealtimeIntegrationModule(this IServiceCollection services, IConfiguration config,
+        bool registerWorkerHostedServices)
     {
         services.Configure<RealtimeGatewayOptions>(config.GetSection(RealtimeGatewayOptions.SectionName))
             .AddOptions<RealtimeGatewayOptions>()
@@ -28,12 +29,15 @@ public static class RealtimeModuleExtensions
         services.Configure<RealtimeIntegrationHostOptions>(config.GetSection(RealtimeIntegrationHostOptions.SectionName));
 
         services.AddScoped<IRealtimeOutboxAdminService, RealtimeOutboxAdminService>();
-        services.AddHostedService(sp => new PresenceAuthorizeWorker(
-            sp.GetService<IRealtimeMessageBus>(),
-            sp.GetRequiredService<IServiceScopeFactory>(),
-            sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
-            sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
-            sp.GetRequiredService<ILogger<PresenceAuthorizeWorker>>()));
+        if (registerWorkerHostedServices)
+        {
+            services.AddHostedService(sp => new PresenceAuthorizeWorker(
+                sp.GetService<IRealtimeMessageBus>(),
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
+                sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
+                sp.GetRequiredService<ILogger<PresenceAuthorizeWorker>>()));
+        }
 
         TryAddRealtimeIntegration(services, config);
 

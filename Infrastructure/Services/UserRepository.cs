@@ -64,12 +64,6 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
         return await db.SaveChangesAsync(cancellationToken) > 0;
     }
 
-    public async Task<bool> DeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default)
-    {
-        db.Users.Remove(user);
-        return await db.SaveChangesAsync(cancellationToken) > 0;
-    }
-
     // ── 用户搜索：%keyword% 依赖 pg_trgm GIN（见 migration AddPgTrgmSearchIndexes）
     public async Task<CursorPage<PublicUserSearchResult>> SearchUsersAsync(
         string searchTerm, string? cursor, int limit, CancellationToken cancellationToken = default)
@@ -208,6 +202,14 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
 
             await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
 
+            if (string.Equals(
+                    normalized,
+                    KnownRoles.Admin.ToUpperInvariant(),
+                    StringComparison.Ordinal))
+            {
+                await AdminRoleInvariant.AcquireMutationLockAsync(db, cancellationToken);
+            }
+
             if (assign)
             {
                 if (await db.UserRoles.AnyAsync(ur => ur.UserId == userId && ur.RoleId == role.Id, cancellationToken))
@@ -230,8 +232,8 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
 
                 if (string.Equals(normalized, KnownRoles.Admin.ToUpperInvariant(), StringComparison.Ordinal))
                 {
-                    var adminCount = await CountUsersInRoleAsync(KnownRoles.Admin, cancellationToken);
-                    if (adminCount <= 1)
+                    if (await AdminRoleInvariant.IsLastActiveAdminAsync(
+                            db, userId, cancellationToken))
                     {
                         await tx.RollbackAsync(cancellationToken);
                         return RoleMutationOutcome.LastAdmin;

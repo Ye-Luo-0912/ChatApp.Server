@@ -187,7 +187,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
         var tokens = CreateTokenService(currentDeviceId);
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var account = new UserAccountService(
-            repo, hasher, email, tokens, new FixedDeviceInfo(currentDeviceId),
+            repo, db, hasher, email, tokens, new FixedDeviceInfo(currentDeviceId),
             new LocalAvatarStorage(
                 Options.Create(new AvatarStorageOptions()),
                 redis.Cache,

@@ -7,7 +7,9 @@ public sealed class DataExportStorageOptions
     /// <summary>Local | S3。生产多实例应使用 S3。</summary>
     public string Provider { get; set; } = "Local";
 
-    public string LocalRootPath { get; set; } = Path.Combine(Path.GetTempPath(), "chatapp-exports");
+    /// <summary>最终对象和 lease-scoped 中间文件使用的持久目录；容器应挂载有容量配额的卷。</summary>
+    public string LocalRootPath { get; set; } = "App_Data/exports";
+
     public int JobTtlHours { get; set; } = 24;
     public int LeaseSeconds { get; set; } = 120;
     public int PollIntervalMilliseconds { get; set; } = 2000;

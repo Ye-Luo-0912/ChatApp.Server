@@ -464,11 +464,23 @@ public class UsersController(
     [HttpDelete("{userId:long}")]
     public async Task<IActionResult> DeleteUser(long userId, CancellationToken cancellationToken)
     {
-        var result = await userAccountService.DeleteAsync(userId, cancellationToken);
-        if (result is null)
-            return NotFound();
+        if (!TryGetCurrentUserId(out var actorId))
+            return Unauthorized();
 
-        return result.Succeeded ? NoContent() : BadRequest(result.Errors);
+        var result = await accountLifecycle.ScheduleDeletionByAdminAsync(
+            userId,
+            actorId,
+            reason: "admin_delete_request",
+            deviceInfo.GenerateDeviceInfo().IpAddress,
+            cancellationToken);
+
+        return result.Succeeded
+            ? Accepted(new
+            {
+                Message = "用户已进入注销冷静期",
+                ScheduledAfter = AccountLifecycleService.CoolDown,
+            })
+            : BadRequest(result.Errors);
     }
 
     [Authorize(Roles = "Admin")]

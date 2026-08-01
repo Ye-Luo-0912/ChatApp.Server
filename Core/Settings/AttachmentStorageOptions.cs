@@ -13,6 +13,16 @@ public sealed class AttachmentStorageOptions
 
     public long MaxBytes { get; set; } = 25 * 1024 * 1024;
 
+    /// <summary>每用户允许同时处于 Ticketed/Uploaded/Scanning 的对象数。</summary>
+    public int MaxUnconfirmedObjectsPerUser { get; set; } = 20;
+
+    /// <summary>
+    /// 每用户附件存储配额。包含 Ticketed/Uploaded/Scanning/Confirmed/Bound，
+    /// Ticketed 按单对象 <see cref="MaxBytes"/> 预留；上传后收敛为实际大小，
+    /// 防止预签 PUT 以虚假的小 Content-Length 绕过配额。
+    /// </summary>
+    public long MaxStorageBytesPerUser { get; set; } = 5L * 1024 * 1024 * 1024;
+
     public string[] AllowedContentTypes { get; set; } =
     [
         "image/jpeg",
@@ -51,7 +61,7 @@ public sealed class AttachmentStorageOptions
     /// </summary>
     public int DownloadTicketMinutes { get; set; } = 2;
 
-    /// <summary>附件 blob 删除墓碑最大重试次数（超过后仍 Pending 并打点告警）。</summary>
+    /// <summary>附件 blob 删除墓碑最大重试次数（超过后转为 DeadLetter，等待人工处置）。</summary>
     public int MaxDeleteAttempts { get; set; } = 20;
 
     /// <summary>删除重试基础退避秒数（指数：base * 2^attempt，上限 1h）。</summary>

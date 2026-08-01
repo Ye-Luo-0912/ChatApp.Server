@@ -30,5 +30,9 @@ public sealed class RateLimitingOptions
     /// </summary>
     public bool FailOpenWhenRedisUnavailable { get; set; }
 
-    public int ClusterShardCount { get; set; } = 16;
+    /// <summary>
+    /// 多维 Lua 限流使用的策略级 Redis Cluster 槽数。必须固定为一个槽，
+    /// 否则同一维度和不同维度组合时会被拆成彼此独立的限额。
+    /// </summary>
+    public int ClusterShardCount { get; set; } = 1;
 }

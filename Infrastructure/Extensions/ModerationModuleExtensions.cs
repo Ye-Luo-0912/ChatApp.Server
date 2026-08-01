@@ -16,7 +16,7 @@ namespace Infrastructure.Extensions;
 public static class ModerationModuleExtensions
 {
     /// <summary>注册内容审核模块。</summary>
-    public static IServiceCollection AddModerationModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddModerationModule(this IServiceCollection services, IConfiguration config, bool registerWorkerHostedServices)
     {
         services.AddValidatedOptions<MessageEvidenceOptions, MessageEvidenceOptionsValidator>(
             config, MessageEvidenceOptions.SectionName);
@@ -36,6 +36,8 @@ public static class ModerationModuleExtensions
             return ActivatorUtilities.CreateInstance<UnavailableMessageEvidenceProvider>(sp);
         });
         services.AddScoped<IModerationService, ModerationService>();
+        if (registerWorkerHostedServices)
+            services.AddHostedService<ModerationSessionRevocationOutboxWorker>();
 
         return services;
     }

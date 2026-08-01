@@ -8,7 +8,7 @@ namespace Infrastructure.Services;
 /// <summary>正式附件上传编排：存储票 + realtime.attachments 元数据 + 鉴权下载。</summary>
 public interface IAttachmentService
 {
-    Task<AttachmentPresignResponse> PresignAsync(
+    Task<AttachmentPresignResult> PresignAsync(
         long userId,
         AttachmentPresignRequest request,
         CancellationToken cancellationToken = default);
@@ -73,7 +73,7 @@ public sealed class AttachmentService(
     IAttachmentDownloadTicketService downloadTickets,
     ILogger<AttachmentService> logger) : IAttachmentService
 {
-    public async Task<AttachmentPresignResponse> PresignAsync(
+    public async Task<AttachmentPresignResult> PresignAsync(
         long userId,
         AttachmentPresignRequest request,
         CancellationToken cancellationToken = default)
@@ -87,39 +87,77 @@ public sealed class AttachmentService(
                 request.ClientAttachmentId,
                 cancellationToken).ConfigureAwait(false);
 
-        var downloadPath = AttachmentApiPaths.DownloadPath(attachmentId);
-
-        if (metadata.IsAvailable)
+        AttachmentUploadReservationStatus reservationStatus;
+        try
         {
-            await metadata.InsertTicketedAsync(
-                attachmentId,
-                userId,
-                objectKey,
-                publicUrl: null,
-                // octet-stream 仅作临时占位；Confirm 时魔数嗅探覆盖
-                request.ContentType,
-                request.ContentLength,
-                request.OriginalName,
-                request.ClientAttachmentId,
-                cancellationToken).ConfigureAwait(false);
+            reservationStatus = metadata.IsAvailable
+                ? await metadata.ReserveTicketedAsync(
+                    attachmentId,
+                    userId,
+                    objectKey,
+                    publicUrl: null,
+                    request.ContentType,
+                    request.ContentLength,
+                    request.OriginalName,
+                    request.ClientAttachmentId,
+                    cancellationToken).ConfigureAwait(false)
+                : AttachmentUploadReservationStatus.MetadataUnavailable;
+        }
+        catch
+        {
+            await CancelUploadTicketSafeAsync(ticket).ConfigureAwait(false);
+            throw;
         }
 
-#pragma warning disable CS0618 // PublicUrl deprecated but kept empty for wire compat
-        return new AttachmentPresignResponse
+        AuthSecurityMetrics.AttachmentUploadReservation(ReservationOutcome(reservationStatus));
+        if (reservationStatus != AttachmentUploadReservationStatus.Reserved)
         {
-            AttachmentId = attachmentId,
-            ObjectKey = objectKey,
-            Ticket = ticket,
-            UploadUrl = uploadUrl,
-            DownloadPath = downloadPath,
-            PublicUrl = string.Empty,
-            ExpiresAt = expiresAt,
-            UploadHeaders = storage is IAttachmentUploadHeadersProvider headers
-                ? headers.GetRequiredUploadHeaders(request.ContentType)
-                : null,
-        };
+            await CancelUploadTicketSafeAsync(ticket).ConfigureAwait(false);
+            return new AttachmentPresignResult(reservationStatus, null);
+        }
+
+        var downloadPath = AttachmentApiPaths.DownloadPath(attachmentId);
+
+#pragma warning disable CS0618 // PublicUrl deprecated but kept empty for wire compat
+        return new AttachmentPresignResult(
+            reservationStatus,
+            new AttachmentPresignResponse
+            {
+                AttachmentId = attachmentId,
+                ObjectKey = objectKey,
+                Ticket = ticket,
+                UploadUrl = uploadUrl,
+                DownloadPath = downloadPath,
+                PublicUrl = string.Empty,
+                ExpiresAt = expiresAt,
+                UploadHeaders = storage is IAttachmentUploadHeadersProvider headers
+                    ? headers.GetRequiredUploadHeaders(request.ContentType)
+                    : null,
+            });
 #pragma warning restore CS0618
     }
+
+    private async Task CancelUploadTicketSafeAsync(string ticket)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            await storage.CancelUploadTicketAsync(ticket, timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "附件预签失败后撤销上传票失败");
+        }
+    }
+
+    private static string ReservationOutcome(AttachmentUploadReservationStatus status) => status switch
+    {
+        AttachmentUploadReservationStatus.Reserved => "reserved",
+        AttachmentUploadReservationStatus.UnconfirmedObjectLimitExceeded => "pending_limit",
+        AttachmentUploadReservationStatus.StorageBytesLimitExceeded => "storage_limit",
+        AttachmentUploadReservationStatus.MetadataUnavailable => "metadata_unavailable",
+        _ => "unexpected",
+    };
 
     public async Task<AuthOperationResult> UploadAsync(
         long userId,

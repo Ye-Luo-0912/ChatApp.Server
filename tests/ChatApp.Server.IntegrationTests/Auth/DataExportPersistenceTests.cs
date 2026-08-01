@@ -100,11 +100,16 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         Assert.NotNull(ready);
         Assert.Equal(DataExportJobStatus.Ready, ready!.Status);
         Assert.False(string.IsNullOrWhiteSpace(ready.ObjectKey));
+        Assert.StartsWith($"{user.Id}/{jobId}-", ready.ObjectKey);
+        Assert.NotEqual($"{user.Id}/{jobId}.json", ready.ObjectKey);
 
         var onDisk = await File.ReadAllBytesAsync(Path.Combine(root, ready.ObjectKey!.Replace('/', Path.DirectorySeparatorChar)));
         Assert.True(onDisk.Length >= 4);
         Assert.Equal("CAE3"u8.ToArray(), onDisk.AsSpan(0, 4).ToArray());
         Assert.DoesNotContain("exportedAt"u8.ToArray(), onDisk);
+        var stagingRoot = Path.Combine(root, ".staging");
+        Assert.True(Directory.Exists(stagingRoot));
+        Assert.Empty(Directory.EnumerateFiles(stagingRoot));
 
         var (stream, _, err) = await export.OpenDownloadAsync(user.Id, jobId!, CancellationToken.None);
         Assert.Null(err);

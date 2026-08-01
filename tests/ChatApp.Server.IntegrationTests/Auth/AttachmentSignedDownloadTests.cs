@@ -69,6 +69,9 @@ public sealed class AttachmentSignedDownloadTests
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public Task CancelUploadTicketAsync(string ticket, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
         public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)> StoreAsync(
             long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
             => throw new NotSupportedException();

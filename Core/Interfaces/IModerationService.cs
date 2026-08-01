@@ -57,6 +57,13 @@ public interface IAccountLifecycleService
 {
     Task<AuthOperationResult> ScheduleDeletionAsync(long userId, CancellationToken cancellationToken = default);
 
+    Task<AuthOperationResult> ScheduleDeletionByAdminAsync(
+        long userId,
+        long actorUserId,
+        string? reason,
+        string? clientIp,
+        CancellationToken cancellationToken = default);
+
     Task<AuthOperationResult> CancelDeletionAsync(long userId, CancellationToken cancellationToken = default);
 
     Task<UserDataExportDto?> ExportAsync(long userId, CancellationToken cancellationToken = default);

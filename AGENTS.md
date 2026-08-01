@@ -24,6 +24,15 @@ In descending order:
 
 Do not trade correctness for a benchmark. Do not add a cache, retry, lock, queue, background worker, abstraction, or service boundary without defining its failure semantics.
 
+## Reuse, performance, and maintainability
+
+These are mandatory development principles for every change:
+
+- Reuse an existing focused component, contract, validation rule, or test helper before adding a parallel implementation. Extract shared behavior only when there are at least two real callers and its ownership is clear.
+- Treat performance as a product requirement: keep request and worker hot paths allocation-aware, avoid unnecessary network round trips, database queries, serialization, and object hydration, and optimize only after measurement.
+- Keep code maintainable: preserve layer boundaries, use small cohesive components and explicit failure semantics, remove superseded paths, and cover behavior with focused tests. Prefer a direct, readable implementation over speculative generality.
+- When reuse, performance, and maintainability conflict, retain correctness and data safety first, then select the smallest measured design with the lowest long-term maintenance cost.
+
 ## Simplicity and code growth
 
 - Prefer deleting obsolete paths and consolidating duplicate behavior over adding adapters around adapters.

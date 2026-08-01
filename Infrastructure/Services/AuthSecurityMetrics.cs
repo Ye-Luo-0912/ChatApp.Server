@@ -51,6 +51,8 @@ public static class AuthSecurityMetrics
         AttachmentMeter.CreateCounter<long>("attachment.blob_delete", "ops", "附件 blob 删除结果");
     private static readonly Counter<long> AttachmentScans =
         AttachmentMeter.CreateCounter<long>("attachment.scan", "ops", "附件内容扫描状态变迁");
+    private static readonly Counter<long> AttachmentUploadReservations =
+        AttachmentMeter.CreateCounter<long>("attachment.upload_reservation", "ops", "附件上传配额预留结果");
     private static long _attachmentPendingDelete;
     private static long _attachmentPendingScan;
 
@@ -141,6 +143,9 @@ public static class AuthSecurityMetrics
 
     public static void AttachmentScan(string outcome)
         => AttachmentScans.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
+
+    public static void AttachmentUploadReservation(string outcome)
+        => AttachmentUploadReservations.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
 
     public static void AttachmentPendingDeleteDelta(int delta)
         => Interlocked.Add(ref _attachmentPendingDelete, delta);

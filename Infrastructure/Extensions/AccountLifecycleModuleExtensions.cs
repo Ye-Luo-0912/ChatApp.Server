@@ -17,7 +17,8 @@ namespace Infrastructure.Extensions;
 public static class AccountLifecycleModuleExtensions
 {
     /// <summary>注册账号生命周期模块。</summary>
-    public static IServiceCollection AddAccountLifecycleModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddAccountLifecycleModule(this IServiceCollection services, IConfiguration config,
+        bool registerWorkerHostedServices)
     {
         services.AddValidatedOptions<AccountCleanupSagaOptions, AccountCleanupSagaOptionsValidator>(
             config, AccountCleanupSagaOptions.SectionName);
@@ -29,13 +30,16 @@ public static class AccountLifecycleModuleExtensions
         services.AddScoped<IAccountCleanupSagaService>(sp => sp.GetRequiredService<AccountCleanupSagaService>());
         services.AddScoped<IUserRepository, UserRepository>();
         services.AddScoped<IUserAccountService, UserAccountService>();
-        services.AddHostedService(sp => new AccountCleanupSagaWorker(
-            sp.GetRequiredService<IServiceScopeFactory>(),
-            sp.GetService<IRealtimeMessageBus>(),
-            sp.GetRequiredService<IOptions<AccountCleanupSagaOptions>>(),
-            sp.GetRequiredService<ILogger<AccountCleanupSagaWorker>>()));
-        services.AddHostedService<AccountDeletionWorker>();
-        services.AddHostedService<SecurityEventArchiveWorker>();
+        if (registerWorkerHostedServices)
+        {
+            services.AddHostedService(sp => new AccountCleanupSagaWorker(
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetService<IRealtimeMessageBus>(),
+                sp.GetRequiredService<IOptions<AccountCleanupSagaOptions>>(),
+                sp.GetRequiredService<ILogger<AccountCleanupSagaWorker>>()));
+            services.AddHostedService<AccountDeletionWorker>();
+            services.AddHostedService<SecurityEventArchiveWorker>();
+        }
         services.AddSingleton<IDataExportBlobStore>(sp =>
         {
             var options = sp.GetRequiredService<IOptions<DataExportStorageOptions>>().Value;
@@ -62,7 +66,8 @@ public static class AccountLifecycleModuleExtensions
             return new UnavailableRealtimeChatExportReader();
         });
         services.AddScoped<IDataExportService, DataExportService>();
-        services.AddHostedService<DataExportWorker>();
+        if (registerWorkerHostedServices)
+            services.AddHostedService<DataExportWorker>();
 
         return services;
     }

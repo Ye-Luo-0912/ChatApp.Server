@@ -10,3 +10,15 @@ public enum AttachmentScanProcessResult
     RetryScheduled,
     LeaseLost,
 }
+
+/// <summary>
+/// Outcome of renewing a fenced background-job lease. Callers must only
+/// cancel active work after <see cref="LeaseRenewalResult.LeaseLost"/> is confirmed; a transient
+/// storage failure leaves the current lease ownership ambiguous.
+/// </summary>
+public enum LeaseRenewalResult
+{
+    Renewed,
+    LeaseLost,
+    TransientFailure,
+}

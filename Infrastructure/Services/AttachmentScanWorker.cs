@@ -117,8 +117,22 @@ public sealed class AttachmentScanWorker(
     private async Task ProcessOneAsync(
         AttachmentScanJob claimed, IAsyncDisposable concurrencyScope, CancellationToken cancellationToken)
     {
-        // 心跳续租：lease/3 周期续租，租约丢失时仅记录，不强制中断（终态 fenced 更新会自然失败）。
+        // Keep the worker's cancellation local to this claimed job. A confirmed
+        // lease loss must abort long object reads/AV scans rather than waiting for
+        // the fenced terminal write to reject the stale worker.
+        using var workCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var leaseLossRecorded = 0;
+
+        void CancelForLeaseLoss()
+        {
+            if (Interlocked.Exchange(ref leaseLossRecorded, 1) != 0)
+                return;
+
+            concurrencyManager.RecordLeaseLost(WorkerName);
+            workCts.Cancel();
+        }
+
         var heartbeatInterval = TimeSpan.FromMinutes(Math.Max(1, AttachmentScanService.LeaseMinutes / 3.0));
         var heartbeat = Task.Run(async () =>
         {
@@ -140,8 +154,24 @@ public sealed class AttachmentScanWorker(
                     var renewed = await svc.RenewLeaseAsync(
                             claimed.Id, claimed.LeaseOwner!, claimed.LeaseToken!, heartbeatCts.Token)
                         .ConfigureAwait(false);
-                    if (renewed == 0)
-                        concurrencyManager.RecordLeaseLost(WorkerName);
+                    switch (renewed)
+                    {
+                        case LeaseRenewalResult.Renewed:
+                            break;
+                        case LeaseRenewalResult.LeaseLost:
+                            CancelForLeaseLoss();
+                            heartbeatCts.Cancel();
+                            return;
+                        case LeaseRenewalResult.TransientFailure:
+                            logger.LogDebug(
+                                "附件扫描租约续租暂时不可用 JobId={Id}，保留当前作业直到下次心跳",
+                                claimed.Id);
+                            break;
+                    }
+                }
+                catch (OperationCanceledException) when (heartbeatCts.IsCancellationRequested)
+                {
+                    return;
                 }
                 catch (Exception ex)
                 {
@@ -157,15 +187,22 @@ public sealed class AttachmentScanWorker(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var svc = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
-            var result = await svc.ProcessClaimedJobAsync(claimed, cancellationToken).ConfigureAwait(false);
+            var result = await svc.ProcessClaimedJobAsync(claimed, workCts.Token).ConfigureAwait(false);
             if (result == AttachmentScanProcessResult.LeaseLost)
-                concurrencyManager.RecordLeaseLost(WorkerName);
+                CancelForLeaseLoss();
             if (result == AttachmentScanProcessResult.ResultStaged)
                 logger.LogInformation("附件扫描结论已持久化 JobId={Id} AttachmentId={Aid}", claimed.Id, claimed.AttachmentId);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // 进程关闭：保持 Processing，租约过期后会被重新领取。
+        }
+        catch (OperationCanceledException) when (workCts.IsCancellationRequested)
+        {
+            logger.LogInformation(
+                "附件扫描因租约已丢失而取消 JobId={Id} AttachmentId={AttachmentId}",
+                claimed.Id,
+                claimed.AttachmentId);
         }
         catch (Exception ex)
         {

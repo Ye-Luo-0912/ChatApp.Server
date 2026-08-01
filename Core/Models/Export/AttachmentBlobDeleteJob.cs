@@ -3,7 +3,9 @@ namespace Core.Models.Export;
 public static class AttachmentBlobDeleteJobStatus
 {
     public const string Pending = "Pending";
+    public const string Processing = "Processing";
     public const string Done = "Done";
+    public const string DeadLetter = "DeadLetter";
 }
 
 /// <summary>
@@ -22,4 +24,16 @@ public sealed class AttachmentBlobDeleteJob
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? CompletedAt { get; set; }
     public string? LastError { get; set; }
+
+    /// <summary>当前领取者；与 <see cref="LeaseToken"/> 一起构成完成/失败更新的 fencing 条件。</summary>
+    public string? LeaseOwner { get; set; }
+
+    /// <summary>租约到期后作业可由其他实例重新领取。</summary>
+    public DateTimeOffset? LeaseExpiresAt { get; set; }
+
+    /// <summary>
+    /// 每次领取生成的随机 token。旧 Worker 只能在 token 仍匹配时将外部删除结果写回，
+    /// 因而不会覆盖已易主的作业。
+    /// </summary>
+    public string? LeaseToken { get; set; }
 }

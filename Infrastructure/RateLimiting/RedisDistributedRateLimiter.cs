@@ -44,7 +44,6 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
 
     private readonly IConnectionMultiplexer _redis;
     private readonly string _keyPrefix;
-    private readonly int _clusterShardCount;
     private readonly ILogger<RedisDistributedRateLimiter> _logger;
 
     public RedisDistributedRateLimiter(
@@ -55,7 +54,15 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
     {
         _redis = redis;
         _keyPrefix = options.Value.KeyPrefix;
-        _clusterShardCount = Math.Max(1, rateOptions?.Value.ClusterShardCount ?? 1);
+        var clusterShardCount = rateOptions?.Value.ClusterShardCount ?? 1;
+        if (clusterShardCount != 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(rateOptions),
+                clusterShardCount,
+                "RateLimiting:ClusterShardCount 必须为 1；多维原子限流必须使用策略级固定 Redis Cluster slot。");
+        }
+
         _logger = logger;
     }
 
@@ -73,10 +80,10 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
         cancellationToken.ThrowIfCancellationRequested();
 
         var keys = new RedisKey[partitionKeys.Count];
-        var shard = SelectShard(policyName, partitionKeys);
-        var clusterTag = _clusterShardCount <= 1
-            ? "{" + policyName + "}:"
-            : "{" + policyName + ":shard-" + shard.ToString("D3") + "}:";
+        // A multi-key Lua decision must remain in one slot. Sharding from the
+        // complete request key set would split a shared dimension (for example,
+        // an IP paired with different devices) across independent quotas.
+        var clusterTag = "{" + policyName + "}:";
         for (var i = 0; i < keys.Length; i++)
             keys[i] = _keyPrefix + "rl:fw:" + clusterTag + partitionKeys[i];
 
@@ -132,32 +139,4 @@ public sealed class RedisDistributedRateLimiter : IDistributedRateLimiter
         }
     }
 
-    private int SelectShard(string policyName, IReadOnlyList<string> partitionKeys)
-    {
-        if (_clusterShardCount <= 1)
-            return 0;
-
-        unchecked
-        {
-            uint hash = 2166136261;
-            foreach (var c in policyName)
-            {
-                hash ^= c;
-                hash *= 16777619;
-            }
-
-            foreach (var key in partitionKeys)
-            {
-                hash ^= 0x1f;
-                hash *= 16777619;
-                foreach (var c in key)
-                {
-                    hash ^= c;
-                    hash *= 16777619;
-                }
-            }
-
-            return (int)(hash % (uint)_clusterShardCount);
-        }
-    }
 }

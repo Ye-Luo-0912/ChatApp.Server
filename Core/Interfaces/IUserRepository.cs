@@ -16,7 +16,6 @@ public interface IUserRepository
     Task<bool> IsEmailTakenAsync(string normalizedEmail, long? excludeUserId = null, CancellationToken cancellationToken = default);
     Task<bool> IsUserNameTakenAsync(string normalizedUserName, long? excludeUserId = null, CancellationToken cancellationToken = default);
     Task<bool> UpdateAsync(ApplicationUser user, CancellationToken cancellationToken = default);
-    Task<bool> DeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default);
 
     Task<CursorPage<PublicUserSearchResult>> SearchUsersAsync(
         string searchTerm, string? cursor, int limit, CancellationToken cancellationToken = default);

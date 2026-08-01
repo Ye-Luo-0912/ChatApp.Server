@@ -9,8 +9,8 @@ using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
-/// <summary>S3/MinIO 预签名附件上传；确认时校验对象并复用稳定最终键。</summary>
-public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadHeadersProvider, IAttachmentScanStateMarker, IObjectStoreHealthProbe, IDisposable
+/// <summary>S3/MinIO 预签名附件上传；扫描通过后以 ETag fencing 提升到不可变最终键。</summary>
+public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadHeadersProvider, IAttachmentScanStateMarker, IAttachmentScanFinalizer, IObjectStoreHealthProbe, IDisposable
 {
     private readonly AttachmentStorageOptions _options;
     private readonly ICacheValueStore _cache;
@@ -78,15 +78,14 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
             throw new ArgumentException($"附件大小须在 1~{MaxBytes} 字节之间");
 
         var attachmentId = Guid.NewGuid().ToString("N");
-        // The final key is allocated once. MIME is carried by S3 Content-Type and
-        // the realtime metadata row; never copy a large object merely to add an extension.
-        var objectKey = $"attachments/{userId}/{attachmentId}";
+        // Client-writable URLs only ever target quarantine/staging objects.
+        var objectKey = $"attachments/{userId}/staging/{attachmentId}";
         var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
 
         await _cache.SetAsync(
-            $"attachment:ticket:{ticket}",
-            new LocalAttachmentStorage.AttachmentTicketInfo(
+            AttachmentUploadTicketKeys.Create(ticket),
+            new AttachmentUploadTicket(
                 userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId,
                 expires.ToUnixTimeMilliseconds()),
             expires - DateTimeOffset.UtcNow,
@@ -106,6 +105,13 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         // 不再返回永久 PublicUrl；聊天侧走鉴权下载。
         return (attachmentId, objectKey, ticket, uploadUrl, string.Empty, expires);
     }
+
+    public Task CancelUploadTicketAsync(
+        string ticket,
+        CancellationToken cancellationToken = default) =>
+        string.IsNullOrWhiteSpace(ticket)
+            ? Task.CompletedTask
+            : _cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken);
 
     public IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(string contentType)
     {
@@ -146,8 +152,8 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         if (string.IsNullOrWhiteSpace(ticket))
             return (false, null, null, null, null, 0, null, "确认附件须提供上传票");
 
-        var ticketKey = $"attachment:ticket:{ticket}";
-        var info = await _atomicCache.TryGetAndDeleteAsync<LocalAttachmentStorage.AttachmentTicketInfo>(
+        var ticketKey = AttachmentUploadTicketKeys.Create(ticket);
+        var info = await _atomicCache.TryGetAndDeleteAsync<AttachmentUploadTicket>(
                 ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
@@ -264,7 +270,8 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
                 response.ResponseStream,
                 contentType,
                 length,
-                fileName);
+                fileName,
+                response.ETag);
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
@@ -338,6 +345,83 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
                 },
                 cancellationToken);
 
+    public async Task<AttachmentFinalizedObject> FinalizeConfirmedAsync(
+        string attachmentId,
+        long userId,
+        string sourceObjectKey,
+        string? expectedEntityTag,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Guid.TryParseExact(attachmentId, "N", out _))
+            throw new InvalidOperationException("附件标识格式无效，拒绝提升对象");
+        if (string.IsNullOrWhiteSpace(expectedEntityTag))
+            throw new InvalidOperationException("扫描结果缺少对象 ETag，拒绝提升可变对象");
+
+        var sourceKey = NormalizeKey(sourceObjectKey);
+        var stagingKey = $"attachments/{userId}/staging/{attachmentId}";
+        var legacyKey = $"attachments/{userId}/{attachmentId}";
+        if (!string.Equals(sourceKey, stagingKey, StringComparison.Ordinal)
+            && !string.Equals(sourceKey, legacyKey, StringComparison.Ordinal))
+            throw new InvalidOperationException("附件暂存键与用户或附件标识不匹配");
+
+        var finalKey = $"attachments/{userId}/confirmed/{attachmentId}";
+        if (!await ObjectHasEntityTagAsync(finalKey, expectedEntityTag, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            var request = new CopyObjectRequest
+            {
+                SourceBucket = _options.S3Bucket,
+                SourceKey = sourceKey,
+                DestinationBucket = _options.S3Bucket,
+                DestinationKey = finalKey,
+                ETagToMatch = expectedEntityTag,
+            };
+            S3ClientFactory.ApplyServerSideEncryption(
+                request, _options.S3SseMode, _options.S3KmsKeyId);
+
+            try
+            {
+                await _s3.CopyObjectAsync(request, cancellationToken).ConfigureAwait(false);
+            }
+            catch (AmazonS3Exception ex)
+                when (ex.StatusCode == System.Net.HttpStatusCode.PreconditionFailed)
+            {
+                // The source changed after its stream was scanned. An earlier
+                // ambiguous copy is safe only when the destination proves that it
+                // already contains the scanned ETag.
+                if (!await ObjectHasEntityTagAsync(
+                        finalKey, expectedEntityTag, cancellationToken).ConfigureAwait(false))
+                    throw new InvalidOperationException(
+                        "附件对象在扫描后发生变化，拒绝确认", ex);
+            }
+        }
+
+        await MarkScanStateAsync(finalKey, "confirmed", cancellationToken)
+            .ConfigureAwait(false);
+        return new AttachmentFinalizedObject(finalKey, sourceKey);
+    }
+
+    private async Task<bool> ObjectHasEntityTagAsync(
+        string objectKey,
+        string expectedEntityTag,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var metadata = await _s3.GetObjectMetadataAsync(
+                    _options.S3Bucket, objectKey, cancellationToken)
+                .ConfigureAwait(false);
+            return string.Equals(
+                metadata.ETag?.Trim(),
+                expectedEntityTag.Trim(),
+                StringComparison.Ordinal);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return false;
+        }
+    }
+
     private string NormalizeKey(string objectKeyOrUrl)
     {
         var key = objectKeyOrUrl;
@@ -349,7 +433,7 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
 
     private async Task RestoreTicketAsync(
         string ticketKey,
-        LocalAttachmentStorage.AttachmentTicketInfo info,
+        AttachmentUploadTicket info,
         CancellationToken cancellationToken)
     {
         // P0 正确性：恢复时使用原始绝对截止时间的剩余 TTL，不重置为完整 TicketMinutes。

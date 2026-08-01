@@ -396,7 +396,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var tokens = CreateTokenService("mfa-device");
         var security = new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance);
         var account = new UserAccountService(
-            repo, hasher, email, tokens, new FixedDeviceInfo("mfa-device"),
+            repo, db, hasher, email, tokens, new FixedDeviceInfo("mfa-device"),
             new LocalAvatarStorage(
                 Options.Create(new AvatarStorageOptions()),
                 redis.Cache,

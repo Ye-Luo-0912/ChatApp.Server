@@ -1,5 +1,7 @@
 using ChatApp.Server.IntegrationTests.Support;
 using Core.Interfaces;
+using Core.Models.Attachment;
+using Core.Models.Export;
 using Core.Models.Friend;
 using Core.Models.Identity;
 using Core.Models.Moderation;
@@ -45,6 +47,30 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
     }
 
     [SkippableFact]
+    public async Task AccountDeletion_CommitsAttachmentTombstoneWithUserDeletion()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var key = $"attachments/account-delete-{Guid.NewGuid():N}";
+        var metadata = new AvailableEmptyAttachmentMetadataStore
+        {
+            ObjectKeys = [key],
+        };
+        var (victim, _, lifecycle) = await SeedScheduledUserAsync(
+            db, "blob", metadata);
+
+        Assert.Equal(1, await lifecycle.ProcessDueDeletionsAsync());
+        Assert.False(await db.Users.AsNoTracking().AnyAsync(user => user.Id == victim.Id));
+        var tombstone = await db.AttachmentBlobDeleteJobs
+            .AsNoTracking()
+            .SingleAsync(job => job.ObjectKey == key);
+        Assert.Equal(victim.Id, tombstone.UserId);
+        Assert.Equal(AttachmentBlobDeleteJobStatus.Pending, tombstone.Status);
+    }
+
+    [SkippableFact]
     public async Task CancelDeletion_AfterClaim_PreservesRelatedData()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
@@ -65,7 +91,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
                 CreateTokenService(),
                 new SecurityEventStore(cancelDb, NullLogger<SecurityEventStore>.Instance),
                 new NoopExportBlob(),
-                UnavailableAttachmentMetadataStore.Instance,
+                AvailableEmptyAttachmentMetadataStore.Instance,
                 new NoopAttachmentBlobDeleteService(),
                 NullLogger<AccountLifecycleService>.Instance);
             var cancel = await cancelSvc.CancelDeletionAsync(victim.Id, ct);
@@ -99,13 +125,13 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         var workerA = new AccountLifecycleService(
             dbA, CreateTokenService(), new SecurityEventStore(dbA, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
-            UnavailableAttachmentMetadataStore.Instance,
+            AvailableEmptyAttachmentMetadataStore.Instance,
             new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
         var workerB = new AccountLifecycleService(
             dbB, CreateTokenService(), new SecurityEventStore(dbB, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
-            UnavailableAttachmentMetadataStore.Instance,
+            AvailableEmptyAttachmentMetadataStore.Instance,
             new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
 
@@ -203,7 +229,8 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
     }
 
     private async Task<(ApplicationUser Victim, ApplicationUser Peer, AccountLifecycleService Lifecycle)>
-        SeedScheduledUserAsync(UserDbContext db, string prefix)
+        SeedScheduledUserAsync(
+            UserDbContext db, string prefix, IAttachmentMetadataStore? metadata = null)
     {
         var tsid = new TsidGeneratorService();
         var suffix = Guid.NewGuid().ToString("N")[..8];
@@ -241,7 +268,7 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             CreateTokenService(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             new NoopExportBlob(),
-            UnavailableAttachmentMetadataStore.Instance,
+            metadata ?? AvailableEmptyAttachmentMetadataStore.Instance,
             new NoopAttachmentBlobDeleteService(),
             NullLogger<AccountLifecycleService>.Instance);
         return (victim, peer, lifecycle);
@@ -317,6 +344,86 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
             => Task.FromResult<Stream?>(null);
         public Task DeleteAsync(string objectKey, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
+    }
+
+    private sealed class AvailableEmptyAttachmentMetadataStore : IAttachmentMetadataStore
+    {
+        public static AvailableEmptyAttachmentMetadataStore Instance { get; } = new();
+        public IReadOnlyList<string> ObjectKeys { get; init; } = [];
+        public bool IsAvailable => true;
+        public string UnavailableReason => string.Empty;
+
+        public Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
+            string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
+            string contentType, long sizeBytes, string? originalName,
+            string? clientAttachmentId = null, CancellationToken cancellationToken = default)
+            => Task.FromResult(AttachmentUploadReservationStatus.Reserved);
+
+        public Task ConfirmAsync(
+            string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
+            string contentType, long sizeBytes, string? originalName = null,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task MarkUploadedScanningAsync(
+            string attachmentId, long uploaderUserId, long sizeBytes, string? sha256Hex = null,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task MarkRejectedAsync(
+            string attachmentId, long uploaderUserId, string? reason = null,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<AttachmentDownloadAccess> ResolveDownloadAccessAsync(
+            string attachmentId, long userId, CancellationToken cancellationToken = default)
+            => Task.FromResult(new AttachmentDownloadAccess(
+                attachmentId, string.Empty, "application/octet-stream", null,
+                AttachmentDownloadDecision.NotFound));
+
+        public Task<IReadOnlyList<AttachmentRecord>> ListForExportAsync(
+            long userId, int maxRows = 50_000, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<AttachmentRecord>>([]);
+
+        public Task<IReadOnlyList<string>> ListObjectKeysForUserAsync(
+            long uploaderUserId, CancellationToken cancellationToken = default)
+            => Task.FromResult(ObjectKeys);
+
+        public Task<IReadOnlySet<string>> ListActiveObjectKeysAsync(
+            CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlySet<string>>(new HashSet<string>(StringComparer.Ordinal));
+
+        public Task MarkAbandonedAsync(
+            IReadOnlyList<string> attachmentIds, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task MarkAbandonedByUploaderAsync(
+            long uploaderUserId, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task<string?> TryAbandonUnboundByUploaderAsync(
+            string attachmentId, long uploaderUserId,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult<string?>(null);
+
+        public Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
+            TimeSpan maxAge, int batchSize, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<AttachmentAbandonBatchItem>>([]);
+
+        public Task<AttachmentOpsOrphanQueryResult> QueryOpsOrphansAsync(
+            TimeSpan orphanAge, TimeSpan stuckScanningAge, int sampleLimit,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(new AttachmentOpsOrphanQueryResult(
+                Available: true,
+                UnavailableReason: null,
+                ConfirmedUnboundPastAgeCount: 0,
+                AbandonedUploadingPastAgeCount: 0,
+                StuckScanningCount: 0,
+                OldestConfirmedUnboundAtMs: null,
+                OldestUploadingAtMs: null,
+                OldestStuckScanningAtMs: null,
+                ActiveAttachmentCount: 0,
+                ActiveSizeBytesSum: 0,
+                WorstConfirmedUnbound: [],
+                WorstUploading: [],
+                WorstStuckScanning: []));
     }
 
     private sealed class NoopAttachmentBlobDeleteService : IAttachmentBlobDeleteService

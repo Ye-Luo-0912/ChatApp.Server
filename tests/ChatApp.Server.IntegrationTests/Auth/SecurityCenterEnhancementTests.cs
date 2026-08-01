@@ -120,6 +120,7 @@ public sealed class SecurityCenterEnhancementTests(PostgresTestFixture postgres,
 
         return new UserAccountService(
             new UserRepository(db, new TsidGeneratorService()),
+            db,
             AuthTestFactories.CreatePasswordHasher(),
             new EmailVerificationService(new NoopEmail(), redis.Cache, redis.Cache),
             tokens,

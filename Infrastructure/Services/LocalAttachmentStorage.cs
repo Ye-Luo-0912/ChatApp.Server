@@ -19,16 +19,6 @@ public sealed class LocalAttachmentStorage(
 {
     private readonly AttachmentStorageOptions _options = options.Value;
 
-    public sealed record AttachmentTicketInfo(
-        long UserId,
-        string AttachmentId,
-        string ObjectKey,
-        string ContentType,
-        long ContentLength,
-        string? OriginalName,
-        string? ClientAttachmentId,
-        long ExpiresAtUnixMs);
-
     public long MaxBytes => _options.MaxBytes;
 
     public Task ProbeAsync(CancellationToken cancellationToken = default)
@@ -68,8 +58,8 @@ public sealed class LocalAttachmentStorage(
         var ttl = expires - DateTimeOffset.UtcNow;
 
         await cache.SetAsync(
-            TicketKey(ticket),
-            new AttachmentTicketInfo(
+            AttachmentUploadTicketKeys.Create(ticket),
+            new AttachmentUploadTicket(
                 userId, attachmentId, objectKey, contentType, contentLength, originalName, clientAttachmentId,
                 expires.ToUnixTimeMilliseconds()),
             ttl,
@@ -79,11 +69,18 @@ public sealed class LocalAttachmentStorage(
         return (attachmentId, objectKey, ticket, uploadUrl, publicUrl, expires);
     }
 
+    public Task CancelUploadTicketAsync(
+        string ticket,
+        CancellationToken cancellationToken = default) =>
+        string.IsNullOrWhiteSpace(ticket)
+            ? Task.CompletedTask
+            : cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken);
+
     public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)> StoreAsync(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
     {
-        var ticketKey = TicketKey(ticket);
-        var info = await atomicCache.TryGetAndDeleteAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
+        var ticketKey = AttachmentUploadTicketKeys.Create(ticket);
+        var info = await atomicCache.TryGetAndDeleteAsync<AttachmentUploadTicket>(ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
             return (false, null, null, null, 0, null, "上传票无效或已过期");
@@ -225,11 +222,11 @@ public sealed class LocalAttachmentStorage(
         if (!objectKey.StartsWith($"{userId}/", StringComparison.Ordinal))
             return (false, null, null, null, null, 0, null, "无效的附件对象键");
 
-        AttachmentTicketInfo? info = null;
+        AttachmentUploadTicket? info = null;
         if (!string.IsNullOrWhiteSpace(ticket))
         {
-            var ticketKey = TicketKey(ticket);
-            info = await atomicCache.TryGetAndDeleteAsync<AttachmentTicketInfo>(ticketKey, cancellationToken)
+            var ticketKey = AttachmentUploadTicketKeys.Create(ticket);
+            info = await atomicCache.TryGetAndDeleteAsync<AttachmentUploadTicket>(ticketKey, cancellationToken)
                 .ConfigureAwait(false);
             if (info is null)
                 return (false, null, null, null, null, 0, null, "上传票无效或已过期");
@@ -245,7 +242,7 @@ public sealed class LocalAttachmentStorage(
         if (!await ObjectExistsAsync(objectKey, cancellationToken).ConfigureAwait(false))
         {
             if (info is not null && !string.IsNullOrWhiteSpace(ticket))
-                await RestoreTicketAsync(TicketKey(ticket!), info, cancellationToken).ConfigureAwait(false);
+                await RestoreTicketAsync(AttachmentUploadTicketKeys.Create(ticket!), info, cancellationToken).ConfigureAwait(false);
             return (false, null, null, null, null, 0, null, "附件尚未上传完成");
         }
 
@@ -355,7 +352,7 @@ public sealed class LocalAttachmentStorage(
     }
 
     private async Task RestoreTicketAsync(
-        string ticketKey, AttachmentTicketInfo info, CancellationToken cancellationToken)
+        string ticketKey, AttachmentUploadTicket info, CancellationToken cancellationToken)
     {
         // P0 正确性：恢复时使用原始绝对截止时间的剩余 TTL，不重置为完整 TicketMinutes。
         // 多次失败恢复不会延长票据寿命超过原始截止时间；已过期则不再恢复。
@@ -397,5 +394,4 @@ public sealed class LocalAttachmentStorage(
                && !Path.IsPathRooted(relative);
     }
 
-    private static string TicketKey(string ticket) => $"attachment:ticket:{ticket}";
 }

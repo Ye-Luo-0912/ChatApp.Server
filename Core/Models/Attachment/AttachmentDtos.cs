@@ -36,6 +36,21 @@ public sealed class AttachmentPresignResponse
     public string PublicUrl { get; init; } = string.Empty;
 }
 
+/// <summary>上传票在元数据侧的原子预留结果。</summary>
+public enum AttachmentUploadReservationStatus
+{
+    Unknown = 0,
+    Reserved = 1,
+    UnconfirmedObjectLimitExceeded = 2,
+    StorageBytesLimitExceeded = 3,
+    MetadataUnavailable = 4,
+}
+
+/// <summary>预签名编排结果；配额拒绝属于预期业务结果，不使用异常控制流。</summary>
+public readonly record struct AttachmentPresignResult(
+    AttachmentUploadReservationStatus Status,
+    AttachmentPresignResponse? Response);
+
 public sealed class ConfirmAttachmentRequest
 {
     public string ObjectKey { get; set; } = string.Empty;

@@ -322,6 +322,7 @@ public sealed class NotificationDispatchWorker(
         {
             try
             {
+                inFlight.RemoveAll(static task => task.IsCompleted);
                 await using var scope = scopeFactory.CreateAsyncScope();
                 var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
                 var email = scope.ServiceProvider.GetRequiredService<IEmailSender>();
@@ -344,7 +345,10 @@ public sealed class NotificationDispatchWorker(
                 }
 
                 if (reservations.Count == 0)
+                {
+                    await WaitForCapacityOrPollAsync(inFlight, poll, stoppingToken).ConfigureAwait(false);
                     continue;
+                }
 
                 IReadOnlyList<NotificationOutboxItem> items;
                 try
@@ -406,6 +410,19 @@ public sealed class NotificationDispatchWorker(
         }
 
         await Task.WhenAll(inFlight);
+    }
+
+    private static async Task WaitForCapacityOrPollAsync(
+        IReadOnlyCollection<Task> inFlight, TimeSpan pollInterval, CancellationToken stoppingToken)
+    {
+        var nextPoll = Task.Delay(pollInterval, stoppingToken);
+        if (inFlight.Count == 0)
+        {
+            await nextPoll.ConfigureAwait(false);
+            return;
+        }
+
+        await Task.WhenAny(Task.WhenAny(inFlight), nextPoll).ConfigureAwait(false);
     }
 
     private async Task ProcessOneAsync(

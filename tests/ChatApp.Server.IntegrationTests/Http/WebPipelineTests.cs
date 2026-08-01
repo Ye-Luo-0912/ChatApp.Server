@@ -65,6 +65,43 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
     }
 
     [SkippableFact]
+    public async Task SecurityVersionAdvance_RejectsCachedAccessTokenWithoutRedisRevocation()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await using var factory = CreateFactory();
+        using var client = factory.CreateClientWithDevice($"dev-version-{Guid.NewGuid():N}"[..24]);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        long userId;
+        await using (var db = postgres.CreateContext())
+        {
+            var user = await WafTestHelpers.SeedUserAsync(
+                db, $"version-{suffix}", $"version-{suffix}@ex.com", "Passw0rd!");
+            userId = user.Id;
+        }
+
+        var login = await WafTestHelpers.LoginAsync(client, $"version-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/users/me")).StatusCode);
+
+        // Deliberately change only PostgreSQL. The access token remains in Redis
+        // and in the in-process L1 cache, reproducing a failed revoke dual-write.
+        await using (var db = postgres.CreateContext())
+        {
+            await db.Users
+                .Where(user => user.Id == userId)
+                .ExecuteUpdateAsync(update => update
+                    .SetProperty(user => user.SecurityVersion, user => user.SecurityVersion + 1)
+                    .SetProperty(user => user.SecurityStamp, Guid.NewGuid().ToString()));
+        }
+
+        Assert.Equal(
+            HttpStatusCode.Unauthorized,
+            (await client.GetAsync("/api/users/me")).StatusCode);
+    }
+
+    [SkippableFact]
     public async Task Idempotent_FriendRequest_Concurrent_OnlyOneCreatesPending()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);

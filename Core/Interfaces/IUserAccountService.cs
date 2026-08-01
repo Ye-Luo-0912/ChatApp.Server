@@ -37,8 +37,6 @@ public interface IUserAccountService
 
     Task<AuthOperationResult?> CancelEmailChangeAsync(long userId, CancellationToken cancellationToken = default);
 
-    Task<AuthOperationResult?> DeleteAsync(long userId, CancellationToken cancellationToken = default);
-
     Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default);
 
     Task<AuthOperationResult?> DisableAsync(long userId, string? reason, long? actorUserId, CancellationToken cancellationToken = default);

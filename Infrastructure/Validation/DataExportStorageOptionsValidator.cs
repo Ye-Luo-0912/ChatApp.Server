@@ -33,6 +33,9 @@ public sealed class DataExportStorageOptionsValidator(IHostEnvironment environme
             failures.Add("生产环境 DataExport:Provider 必须为 S3，以保证多实例共享和重启后可恢复。");
         }
 
+        if (string.IsNullOrWhiteSpace(options.LocalRootPath))
+            failures.Add("DataExport:LocalRootPath 不能为空。");
+
 
         if (options.JobTtlHours <= 0)
         {

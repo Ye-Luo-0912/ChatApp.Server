@@ -57,7 +57,10 @@ public sealed class EmailDispatchWorker(
                 }
 
                 if (reservations.Count == 0)
+                {
+                    await WaitForCapacityOrPollAsync(inFlight, PollInterval, stoppingToken).ConfigureAwait(false);
                     continue;
+                }
 
                 IReadOnlyList<EmailOutboxItem> claimed;
                 try
@@ -100,6 +103,19 @@ public sealed class EmailDispatchWorker(
         }
 
         await Task.WhenAll(inFlight).ConfigureAwait(false);
+    }
+
+    private static async Task WaitForCapacityOrPollAsync(
+        IReadOnlyCollection<Task> inFlight, TimeSpan pollInterval, CancellationToken stoppingToken)
+    {
+        var nextPoll = Task.Delay(pollInterval, stoppingToken);
+        if (inFlight.Count == 0)
+        {
+            await nextPoll.ConfigureAwait(false);
+            return;
+        }
+
+        await Task.WhenAny(Task.WhenAny(inFlight), nextPoll).ConfigureAwait(false);
     }
 
     private async Task ProcessItemAsync(

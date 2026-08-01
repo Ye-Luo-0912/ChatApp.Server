@@ -32,6 +32,21 @@ public sealed class AttachmentStorageOptionsValidator : IValidateOptions<Attachm
             failures.Add("AttachmentStorage:MaxBytes 必须大于 0。");
         }
 
+        if (options.MaxUnconfirmedObjectsPerUser <= 0)
+        {
+            failures.Add("AttachmentStorage:MaxUnconfirmedObjectsPerUser 必须大于 0。");
+        }
+
+        if (options.MaxStorageBytesPerUser <= 0)
+        {
+            failures.Add("AttachmentStorage:MaxStorageBytesPerUser 必须大于 0。");
+        }
+
+        if (options.MaxBytes > 0 && options.MaxStorageBytesPerUser < options.MaxBytes)
+        {
+            failures.Add("AttachmentStorage:MaxStorageBytesPerUser 不得小于 MaxBytes。");
+        }
+
         if (options.TicketMinutes <= 0)
         {
             failures.Add("AttachmentStorage:TicketMinutes 必须大于 0。");

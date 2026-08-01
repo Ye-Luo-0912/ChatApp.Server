@@ -1,10 +1,13 @@
+using System.Data.Common;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
 using Core.Exceptions;
 using Core.Interfaces.Auth;
+using Infrastructure.Data;
 using Core.Models.Token;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -29,7 +32,8 @@ public sealed class OpaqueTokenAuthHandler(
     IOptionsMonitor<AuthenticationSchemeOptions> options,
     ILoggerFactory logger,
     UrlEncoder encoder,
-    IAccessTokenStore tokenStore)
+    IAccessTokenStore tokenStore,
+    UserDbContext db)
     : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
 {
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
@@ -73,6 +77,42 @@ public sealed class OpaqueTokenAuthHandler(
                 return AuthenticateResult.Fail("令牌已过期");
             }
 
+
+            // Redis token deletion and the PostgreSQL security mutation cannot be
+            // committed atomically. The durable SecurityVersion is therefore the
+            // authorization fence: a stale AT must fail even if session revocation
+            // previously suffered an ambiguous/failed Redis write.
+            var now = DateTimeOffset.UtcNow;
+            var state = await db.Users
+                .AsNoTracking()
+                .Where(u => u.Id == data.UserId)
+                .Select(u => new
+                {
+                    u.SecurityVersion,
+                    u.LockoutEnabled,
+                    u.LockoutEnd,
+                    u.BanUntil,
+                    u.DeletionScheduledAt,
+                })
+                .SingleOrDefaultAsync(Context.RequestAborted);
+            if (state is null
+                || data.SecurityVersion <= 0
+                || state.SecurityVersion != data.SecurityVersion
+                || (state.LockoutEnabled && state.LockoutEnd != null && state.LockoutEnd > now)
+                || state.DeletionScheduledAt != null
+                || state.BanUntil > now)
+            {
+                try
+                {
+                    await tokenStore.RevokeAccessTokenAsync(token, Context.RequestAborted);
+                }
+                catch (CacheUnavailableException ex)
+                {
+                    Logger.LogWarning(ex, "清理失效访问令牌失败 UserId={UserId}", data.UserId);
+                }
+
+                return AuthenticateResult.Fail("令牌安全版本已失效");
+            }
             var roleCount = data.Roles?.Length ?? 0;
             var claims = new List<Claim>(roleCount + 4)
             {
@@ -101,6 +141,12 @@ public sealed class OpaqueTokenAuthHandler(
         {
             Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             return AuthenticateResult.Fail("缓存服务不可用");
+        }
+        catch (DbException ex)
+        {
+            Logger.LogError(ex, "认证安全版本查询失败");
+            Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            return AuthenticateResult.Fail("认证数据库不可用");
         }
     }
 }

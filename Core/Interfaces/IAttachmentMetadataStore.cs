@@ -12,7 +12,11 @@ public interface IAttachmentMetadataStore
     bool IsAvailable { get; }
     string UnavailableReason { get; }
 
-    Task InsertTicketedAsync(
+    /// <summary>
+    /// 在用户级串行化边界内检查未确认对象数和总存储字节，并预留 Ticketed 行。
+    /// 配额检查与插入必须原子完成。
+    /// </summary>
+    Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
         string attachmentId,
         long uploaderUserId,
         string objectKey,
@@ -145,7 +149,7 @@ public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStor
     public string UnavailableReason =>
         "未配置 MessageEvidence:RealtimeConnectionString / DataExport:RealtimeConnectionString";
 
-    public Task InsertTicketedAsync(
+    public Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
         string attachmentId,
         long uploaderUserId,
         string objectKey,
@@ -155,7 +159,7 @@ public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStor
         string? originalName,
         string? clientAttachmentId = null,
         CancellationToken cancellationToken = default)
-        => Task.CompletedTask;
+        => Task.FromResult(AttachmentUploadReservationStatus.MetadataUnavailable);
 
     public Task ConfirmAsync(
         string attachmentId,

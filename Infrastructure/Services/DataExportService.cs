@@ -297,7 +297,7 @@ public sealed class LocalDataExportBlobStore : IDataExportBlobStore, IObjectStor
     private static string EnsureRoot(string rootPath)
     {
         if (string.IsNullOrWhiteSpace(rootPath))
-            rootPath = Path.Combine(Path.GetTempPath(), "chatapp-exports");
+            rootPath = "App_Data/exports";
         var full = Path.GetFullPath(rootPath);
         Directory.CreateDirectory(full);
         return full.EndsWith(Path.DirectorySeparatorChar) ? full : full + Path.DirectorySeparatorChar;
@@ -1336,12 +1336,17 @@ public sealed class DataExportWorker(
                 .ToListAsync(cancellationToken);
             var sessionList = await sessions.ListSessionsAsync(userId.ToString(), cancellationToken);
 
-            var objectKey = $"{userId}/{jobId}.json";
-            var tempPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-{jobId}.json");
+            // A lease-scoped candidate is never shared with a later owner of the same job.
+            // It becomes visible to clients only after the fenced Ready transition below succeeds.
+            var objectKey = $"{userId}/{jobId}-{leaseToken}.json";
+            var tempPath = Path.Combine(
+                GetStagingRoot(opts),
+                $"chatapp-export-{jobId}-{leaseToken}.json");
+            var candidateWriteStarted = false;
             try
             {
                 await using (var fs = new FileStream(
-                                 tempPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                 tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                                  bufferSize: 64 * 1024,
                                  FileOptions.Asynchronous | FileOptions.SequentialScan))
                 {
@@ -1383,7 +1388,16 @@ public sealed class DataExportWorker(
                 await using (var read = new FileStream(
                                  tempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
                                  bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    candidateWriteStarted = true;
                     await blob.WriteAsync(objectKey, read, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                if (candidateWriteStarted)
+                    await DiscardUnpublishedCandidateAsync(blob, objectKey).ConfigureAwait(false);
+                throw;
             }
             finally
             {
@@ -1392,25 +1406,38 @@ public sealed class DataExportWorker(
 
             var readyAt = DateTimeOffset.UtcNow;
             var ttlHours = Math.Clamp(opts.JobTtlHours, 1, 168);
-            // P0-5.2：终态匹配 Id + Status(Processing) + LeaseOwner + LeaseToken，避免旧 Worker 覆盖新租约持有者。
-            var updated = await db.DataExportJobs
-                .Where(j => j.Id == jobId
-                    && j.LeaseOwner == leaseOwner
-                    && j.LeaseToken == leaseToken
-                    && j.Status == DataExportJobStatus.Processing)
-                .ExecuteUpdateAsync(
-                    s => s.SetProperty(j => j.Status, DataExportJobStatus.Ready)
-                        .SetProperty(j => j.ReadyAt, readyAt)
-                        .SetProperty(j => j.ExpiresAt, readyAt.AddHours(ttlHours))
-                        .SetProperty(j => j.ObjectKey, objectKey)
-                        .SetProperty(j => j.Error, (string?)null)
-                        .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
-                        .SetProperty(j => j.LeaseOwner, (string?)null)
-                        .SetProperty(j => j.LeaseToken, (string?)null),
-                    cancellationToken)
-                .ConfigureAwait(false);
+            // Only the current holder may publish its candidate key into the durable job row.
+            int updated;
+            try
+            {
+                updated = await db.DataExportJobs
+                    .Where(j => j.Id == jobId
+                        && j.LeaseOwner == leaseOwner
+                        && j.LeaseToken == leaseToken
+                        && j.Status == DataExportJobStatus.Processing)
+                    .ExecuteUpdateAsync(
+                        s => s.SetProperty(j => j.Status, DataExportJobStatus.Ready)
+                            .SetProperty(j => j.ReadyAt, readyAt)
+                            .SetProperty(j => j.ExpiresAt, readyAt.AddHours(ttlHours))
+                            .SetProperty(j => j.ObjectKey, objectKey)
+                            .SetProperty(j => j.Error, (string?)null)
+                            .SetProperty(j => j.LeaseUntil, (DateTimeOffset?)null)
+                            .SetProperty(j => j.LeaseOwner, (string?)null)
+                            .SetProperty(j => j.LeaseToken, (string?)null),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                await DiscardUnpublishedCandidateAsync(blob, objectKey).ConfigureAwait(false);
+                throw;
+            }
+
             if (updated == 0)
-                throw new InvalidOperationException("导出完成但租约已易主，丢弃结果");
+            {
+                await DiscardUnpublishedCandidateAsync(blob, objectKey).ConfigureAwait(false);
+                throw new InvalidOperationException("导出完成但租约已易主，丢弃候选结果");
+            }
         }
         catch (OperationCanceledException) when (heartbeatFailure.Task.IsCompletedSuccessfully)
         {
@@ -1481,19 +1508,20 @@ public sealed class DataExportWorker(
         var attachmentUrlsCapped = false;
         var urlScanSkippedNote = false;
 
-        var receiptsPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-rcpt-{Guid.NewGuid():N}.json");
-        var messagesPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-msg-{Guid.NewGuid():N}.json");
-        var attachmentsPath = Path.Combine(Path.GetTempPath(), $"chatapp-export-att-{Guid.NewGuid():N}.json");
+        var stagingRoot = GetStagingRoot(opts);
+        var receiptsPath = Path.Combine(stagingRoot, $"chatapp-export-rcpt-{Guid.NewGuid():N}.json");
+        var messagesPath = Path.Combine(stagingRoot, $"chatapp-export-msg-{Guid.NewGuid():N}.json");
+        var attachmentsPath = Path.Combine(stagingRoot, $"chatapp-export-att-{Guid.NewGuid():N}.json");
         try
         {
             await using (var messagesFs = new FileStream(
-                             messagesPath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                             messagesPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read,
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var receiptsFs = new FileStream(
-                             receiptsPath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                             receiptsPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read,
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var attachmentsFs = new FileStream(
-                             attachmentsPath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                             attachmentsPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read,
                              bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             await using (var receiptsWriter = new Utf8JsonWriter(receiptsFs))
             await using (var messagesWriter = new Utf8JsonWriter(messagesFs))
@@ -1675,6 +1703,38 @@ public sealed class DataExportWorker(
         await writer.WritePropertyAsync("receipts", Array.Empty<object>(), cancellationToken).ConfigureAwait(false);
         await writer.WritePropertyAsync("attachments", Array.Empty<object>(), cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    private static string GetStagingRoot(DataExportStorageOptions opts)
+    {
+        if (string.IsNullOrWhiteSpace(opts.LocalRootPath))
+            throw new InvalidOperationException("DataExport:LocalRootPath 不能为空");
+
+        var root = Path.GetFullPath(opts.LocalRootPath);
+        var staging = Path.Combine(root, ".staging");
+        Directory.CreateDirectory(staging);
+        return staging;
+    }
+
+    /// A candidate whose lease fence did not publish it must never remain at the shared
+    /// object key. Cleanup is best-effort: a failed cleanup leaves an unreachable orphan,
+    /// but never changes a newer owner's key.
+    /// </summary>
+    private static async Task DiscardUnpublishedCandidateAsync(
+        IDataExportBlobStore blob,
+        string objectKey)
+    {
+        try
+        {
+            await blob.DeleteAsync(objectKey, CancellationToken.None).ConfigureAwait(false);
+            AuthSecurityMetrics.ExportBlobDelete("candidate_cleanup_success");
+        }
+        catch
+        {
+            AuthSecurityMetrics.ExportBlobDelete("candidate_cleanup_failed");
+        }
+    }
+
 
     private static async Task RenewLeaseAsync(
         UserDbContext db,

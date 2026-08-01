@@ -116,30 +116,58 @@ public sealed class AttachmentScanProjectionService(
                     .ConfigureAwait(false);
             }
 
-            if (storage is IAttachmentScanStateMarker marker)
-            {
-                var state = claimed.Outcome == AttachmentScanProjectionOutcome.Confirmed
-                    ? "confirmed"
-                    : "rejected";
-                await marker.MarkScanStateAsync(claimed.ObjectKey, state, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-
             if (claimed.Outcome == AttachmentScanProjectionOutcome.Confirmed)
             {
+                var confirmedObjectKey = claimed.ObjectKey;
+                string? stagingObjectKeyToDelete = null;
+                if (storage is IAttachmentScanFinalizer finalizer)
+                {
+                    var finalized = await finalizer.FinalizeConfirmedAsync(
+                            claimed.AttachmentId,
+                            claimed.UserId,
+                            claimed.ObjectKey,
+                            claimed.SourceEntityTag,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    confirmedObjectKey = finalized.ObjectKey;
+                    stagingObjectKeyToDelete = finalized.StagingObjectKeyToDelete;
+                }
+                else if (storage is IAttachmentScanStateMarker marker)
+                {
+                    await marker.MarkScanStateAsync(
+                            claimed.ObjectKey, "confirmed", cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 await metadata.ConfirmAsync(
                         claimed.AttachmentId,
                         claimed.UserId,
-                        claimed.ObjectKey,
+                        confirmedObjectKey,
                         publicUrl: null,
                         contentType,
                         claimed.SizeBytes,
                         claimed.OriginalName,
                         cancellationToken)
                     .ConfigureAwait(false);
+
+                if (!string.IsNullOrWhiteSpace(stagingObjectKeyToDelete))
+                {
+                    await blobDeletes.EnqueueAsync(
+                            [(stagingObjectKeyToDelete, claimed.AttachmentId)],
+                            claimed.UserId,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
             }
             else
             {
+                if (storage is IAttachmentScanStateMarker marker)
+                {
+                    await marker.MarkScanStateAsync(
+                            claimed.ObjectKey, "rejected", cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 await metadata.MarkRejectedAsync(
                         claimed.AttachmentId,
                         claimed.UserId,

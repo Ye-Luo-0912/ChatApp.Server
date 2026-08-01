@@ -64,6 +64,19 @@ public static class ApiModuleExtensions
             options.AddPolicy("attachment-upload", TimeSpan.FromMinutes(2));
         });
 
+        AddApplicationHealthChecks(services);
+
+        return services;
+    }
+    /// <summary>注册 Worker 的依赖健康检查；不注册认证、限流或 HTTP API 策略。</summary>
+    public static IServiceCollection AddWorkerHealthChecks(this IServiceCollection services)
+    {
+        AddApplicationHealthChecks(services);
+        return services;
+    }
+
+    private static void AddApplicationHealthChecks(IServiceCollection services)
+    {
         services.AddHealthChecks()
             .AddRedis(
                 sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("Garnet")
@@ -87,7 +100,5 @@ public static class ApiModuleExtensions
             .AddCheck<DataExportHealthCheck>(
                 "data-export",
                 tags: ["ready", "dependencies", "capabilities"]);
-
-        return services;
     }
 }

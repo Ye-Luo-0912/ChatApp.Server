@@ -24,8 +24,37 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
 
         try
         {
-            var ticket = await attachments.PresignAsync(userId, model, cancellationToken);
-            return Ok(ticket);
+            var result = await attachments.PresignAsync(userId, model, cancellationToken);
+            return result.Status switch
+            {
+                AttachmentUploadReservationStatus.Reserved when result.Response is not null =>
+                    Ok(result.Response),
+                AttachmentUploadReservationStatus.UnconfirmedObjectLimitExceeded =>
+                    StatusCode(
+                        StatusCodes.Status429TooManyRequests,
+                        new
+                        {
+                            Message = "未确认附件数量已达上限，请完成、放弃或稍后重试",
+                            Code = "AttachmentPendingLimitExceeded",
+                        }),
+                AttachmentUploadReservationStatus.StorageBytesLimitExceeded =>
+                    Conflict(new
+                    {
+                        Message = "附件存储配额不足",
+                        Code = "AttachmentStorageQuotaExceeded",
+                    }),
+                AttachmentUploadReservationStatus.MetadataUnavailable =>
+                    StatusCode(
+                        StatusCodes.Status503ServiceUnavailable,
+                        new
+                        {
+                            Message = "附件元数据服务不可用",
+                            Code = "AttachmentMetadataUnavailable",
+                        }),
+                _ => StatusCode(
+                    StatusCodes.Status500InternalServerError,
+                    new { Message = "附件预签状态异常", Code = "AttachmentPresignUnexpected" }),
+            };
         }
         catch (ArgumentException ex)
         {

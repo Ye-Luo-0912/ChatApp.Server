@@ -18,19 +18,22 @@ namespace Infrastructure.Extensions;
 public static class NotificationModuleExtensions
 {
     /// <summary>注册通知与邮件模块。</summary>
-    public static IServiceCollection AddNotificationModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddNotificationModule(this IServiceCollection services, IConfiguration config,
+        bool registerWorkerHostedServices)
     {
         services.AddValidatedOptions<NotificationOutboxOptions, NotificationOutboxOptionsValidator>(
             config, NotificationOutboxOptions.SectionName);
 
         services.AddSingleton<NotificationOutboxMetrics>();
         services.AddScoped<INotificationQuery, NotificationQuery>();
-        services.AddHostedService<NotificationDispatchWorker>();
+        if (registerWorkerHostedServices)
+            services.AddHostedService<NotificationDispatchWorker>();
 
         services.AddSingleton<EmailOutboxMetrics>();
         services.AddSingleton<SmtpEmailSender>();
         services.AddSingleton<IEmailSender, QueuedEmailSender>();
-        services.AddHostedService<EmailDispatchWorker>();
+        if (registerWorkerHostedServices)
+            services.AddHostedService<EmailDispatchWorker>();
         services.AddSingleton<IEmailVerificationService, EmailVerificationService>();
 
         services.Configure<EmailConfig>(config.GetSection("EmailSettings"))

@@ -34,7 +34,6 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
 
         var moderation = new ModerationService(
             db,
-            new NoopSessionStore(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             provider,
             NullLogger<ModerationService>.Instance);
@@ -73,7 +72,7 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
             messageId, outsider.Id, outsider.Id + 1, DateTimeOffset.UtcNow, "h", "body"));
 
         var moderation = new ModerationService(
-            db, new NoopSessionStore(),
+            db,
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             provider, NullLogger<ModerationService>.Instance);
 
@@ -96,7 +95,7 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
             messageId, sender.Id, reporter.Id, DateTimeOffset.UtcNow, "h", "body"));
 
         var moderation = new ModerationService(
-            db, new NoopSessionStore(),
+            db,
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             provider, NullLogger<ModerationService>.Instance);
 
@@ -116,7 +115,6 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
 
         var moderation = new ModerationService(
             db,
-            new NoopSessionStore(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             new UnavailableMessageEvidenceProvider(NullLogger<UnavailableMessageEvidenceProvider>.Instance),
             NullLogger<ModerationService>.Instance);
@@ -156,7 +154,6 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
 
         var moderation = new ModerationService(
             db,
-            new NoopSessionStore(),
             new SecurityEventStore(db, NullLogger<SecurityEventStore>.Instance),
             provider,
             NullLogger<ModerationService>.Instance);

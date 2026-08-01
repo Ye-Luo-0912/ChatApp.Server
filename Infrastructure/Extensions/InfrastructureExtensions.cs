@@ -32,9 +32,7 @@ public static class InfrastructureExtensions
         {
             services.AddOptions<DatabasePoolOptions>()
                 .Bind(configuration.GetSection(DatabasePoolOptions.SectionName))
-                .Validate(o => string.Equals(o.Role?.Trim(), "Api", StringComparison.OrdinalIgnoreCase)
-                               || string.Equals(o.Role?.Trim(), "Worker", StringComparison.OrdinalIgnoreCase)
-                               || string.Equals(o.Role?.Trim(), "All", StringComparison.OrdinalIgnoreCase),
+                .Validate(o => DatabasePoolOptions.IsSupportedRole(o.Role),
                     "DatabasePool:Role 必须为 Api、Worker 或 All")
                 .Validate(o => o.ApiMaximumPoolSize >= 1, "DatabasePool:ApiMaximumPoolSize 必须 >= 1")
                 .Validate(o => o.WorkerMaximumPoolSize >= 1, "DatabasePool:WorkerMaximumPoolSize 必须 >= 1")

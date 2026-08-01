@@ -15,6 +15,8 @@ public class FriendRequestConfig:IEntityTypeConfiguration<FriendRequest>
         builder.HasIndex(r => r.TargetUserId).HasDatabaseName("IX_FriendRequest_TargetUser");
         builder.HasIndex(r => new { r.TargetUserId, r.Status });
         builder.HasIndex(r => new { r.RequesterId, r.Status });
+
+        builder.Property(r => r.Message).HasMaxLength(FriendshipInputLimits.FriendRequestMessageMaxLength);
         
         builder.HasNoForeignKeyConstraints();
 

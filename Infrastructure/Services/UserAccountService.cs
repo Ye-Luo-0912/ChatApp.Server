@@ -8,7 +8,9 @@ using Core.Models.Common;
 using Core.Models.Identity;
 using Core.Models.Security;
 using Core.Models.Token;
+using Infrastructure.Data;
 using Core.Models.User;
+using Microsoft.EntityFrameworkCore;
 using Core.Settings;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -20,6 +22,7 @@ namespace Infrastructure.Services;
 /// </summary>
 public partial class UserAccountService(
     IUserRepository userRepository,
+    UserDbContext db,
     IPasswordHasher passwordHasher,
     IEmailVerificationService emailVerificationService,
     ISessionStore sessionStore,
@@ -318,31 +321,6 @@ public partial class UserAccountService(
             : AuthOperationResult.Fail("UpdateFailed", "取消邮箱变更失败");
     }
 
-    public async Task<AuthOperationResult?> DeleteAsync(long userId, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            var user = await userRepository.FindByIdAsync(userId, cancellationToken);
-            if (user is null)
-                return null;
-
-            await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
-
-            var ok = await userRepository.DeleteAsync(user, cancellationToken);
-            if (ok) logger.LogInformation("成功删除用户 {UserId}", userId);
-
-            return ok
-                ? AuthOperationResult.Success()
-                : AuthOperationResult.Fail("DeleteFailed", "用户删除失败");
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "删除用户 {UserId} 时发生异常", userId);
-            throw new IdentityException("用户删除失败", ex);
-        }
-    }
-
     public async Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default)
     {
         try
@@ -394,9 +372,28 @@ public partial class UserAccountService(
     public async Task<AuthOperationResult?> DisableAsync(
         long userId, string? reason, long? actorUserId, CancellationToken cancellationToken = default)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        await AdminRoleInvariant.AcquireMutationLockAsync(db, cancellationToken);
+        if (db.Database.ProviderName?.Contains(
+                "Npgsql", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"""SELECT 1 FROM "AspNetUsers" WHERE "Id" = {userId} FOR UPDATE""",
+                cancellationToken);
+        }
+
         var user = await userRepository.FindByIdAsync(userId, cancellationToken);
         if (user is null)
+        {
+            await tx.RollbackAsync(cancellationToken);
             return null;
+        }
+
+        if (await AdminRoleInvariant.IsLastActiveAdminAsync(db, userId, cancellationToken))
+        {
+            await tx.RollbackAsync(cancellationToken);
+            return AuthOperationResult.Fail("LastAdmin", "不能禁用最后一个可用管理员");
+        }
 
         user.LockoutEnabled = true;
         user.LockoutEnd = DateTimeOffset.MaxValue;
@@ -405,13 +402,26 @@ public partial class UserAccountService(
 
         var ok = await userRepository.UpdateAsync(user, cancellationToken);
         if (!ok)
+        {
+            await tx.RollbackAsync(cancellationToken);
             return AuthOperationResult.Fail("UpdateFailed", "禁用账户失败");
+        }
 
-        await sessionStore.RevokeAllSessionsAsync(userId.ToString(), cancellationToken: cancellationToken);
         await WriteAdminAuditAsync(actorUserId, userId, "DisableUser", reason, cancellationToken);
         await securityEventStore.RecordAsync(
             userId, SecurityEventType.AccountDisabled, actorUserId: actorUserId?.ToString(),
             detail: reason, cancellationToken: cancellationToken);
+        await tx.CommitAsync(cancellationToken);
+
+        try
+        {
+            await sessionStore.RevokeAllSessionsAsync(
+                userId.ToString(), cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "禁用后撤销会话失败 UserId={UserId}", userId);
+        }
 
         logger.LogWarning("用户 {UserId} 已被禁用并强制下线", userId);
         return AuthOperationResult.Success();

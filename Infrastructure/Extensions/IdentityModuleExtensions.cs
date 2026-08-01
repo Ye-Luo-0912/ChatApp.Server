@@ -22,7 +22,8 @@ public static class IdentityModuleExtensions
     /// 注册身份认证模块：JWT、安全密钥、密码哈希、受信设备选项绑定与校验，
     /// 以及 TokenService、AuthService、MFA、登录风险分析、地理位置等服务。
     /// </summary>
-    public static IServiceCollection AddIdentityModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddIdentityModule(this IServiceCollection services, IConfiguration config,
+        bool registerApiLocalHostedServices)
     {
         services.Configure<JwtSettings>(config.GetSection("JwtSettings"))
             .AddOptions<JwtSettings>()
@@ -55,7 +56,8 @@ public static class IdentityModuleExtensions
         services.AddSingleton<AccessTokenL1InvalidationBus>();
         services.AddSingleton<IAccessTokenL1InvalidationBus>(sp =>
             sp.GetRequiredService<AccessTokenL1InvalidationBus>());
-        services.AddHostedService(sp => sp.GetRequiredService<AccessTokenL1InvalidationBus>());
+        if (registerApiLocalHostedServices)
+            services.AddHostedService(sp => sp.GetRequiredService<AccessTokenL1InvalidationBus>());
         services.AddSingleton<IAuthCpuLimiter, AuthCpuLimiter>();
         services.AddSingleton<IPasswordHasher, BcryptPasswordHasher>();
 
@@ -77,7 +79,8 @@ public static class IdentityModuleExtensions
         services.AddScoped<ITrustedDeviceService, TrustedDeviceService>();
         services.AddSingleton<LoginRiskAnalyzer>();
         services.AddSingleton<ILoginRiskAnalyzer>(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
-        services.AddHostedService(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
+        if (registerApiLocalHostedServices)
+            services.AddHostedService(sp => sp.GetRequiredService<LoginRiskAnalyzer>());
 
         // 使用命名 HttpClient，IHttpClientFactory 管理连接池，避免套接字耗尽
         services.AddHttpClient(nameof(GeoLocationService), client =>

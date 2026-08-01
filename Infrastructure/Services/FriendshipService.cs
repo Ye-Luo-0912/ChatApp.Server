@@ -6,8 +6,8 @@ using Core.Models.Friend;
 using Core.Models.Identity;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
-using Npgsql;
 
 namespace Infrastructure.Services;
 
@@ -51,37 +51,45 @@ public class FriendshipService(
     private readonly ILogger<FriendshipService> _logger = logger;
 
     /// <summary>
-    /// 跨实例成对串行化。使用独立的 PostgreSQL 会话级 advisory lock，使它能覆盖
-    /// 当前 DbContext 内可能创建的多个事务；释放 lease 时关闭会话，异常路径也不会泄漏锁。
-    /// 非 PostgreSQL provider（InMemory/SQLite 单测）保持 no-op。
+    /// Starts the transaction that owns a relationship write and, for PostgreSQL,
+    /// acquires the pair advisory lock on that same transaction connection.
     /// </summary>
-    private async Task<IAsyncDisposable> AcquirePairLockAsync(
+    /// <remarks>
+    /// A session-scoped lock on a separately opened NpgsqlConnection used to hold
+    /// one pool slot while this DbContext checked out another. Transaction-scoped
+    /// advisory locking provides the same cross-instance serialization without
+    /// that double-connection pattern, and PostgreSQL releases it on commit or
+    /// rollback. The in-memory provider does not implement transactions, so it
+    /// remains a deliberate no-op for unit-level validation tests.
+    /// </remarks>
+    private async Task<PairWriteTransaction> BeginPairWriteTransactionAsync(
         long userId1, long userId2, CancellationToken ct)
     {
-        if (!string.Equals(
+        if (string.Equals(
                 context.Database.ProviderName,
-                "Npgsql.EntityFrameworkCore.PostgreSQL",
+                "Microsoft.EntityFrameworkCore.InMemory",
                 StringComparison.Ordinal))
-            return NoopAsyncDisposable.Instance;
+            return PairWriteTransaction.Noop;
 
-        var connectionString = context.Database.GetConnectionString();
-        if (string.IsNullOrWhiteSpace(connectionString))
-            throw new InvalidOperationException("PostgreSQL connection string is required for relationship locking.");
-
-        var connection = new NpgsqlConnection(connectionString);
+        var transaction = await context.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
         try
         {
-            var key = ComputePairLockKey(userId1, userId2);
-            await connection.OpenAsync(ct).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            command.CommandText = "SELECT pg_advisory_lock(@pair_key);";
-            command.Parameters.AddWithValue("pair_key", key);
-            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            return new PairAdvisoryLock(connection, key);
+            if (string.Equals(
+                    context.Database.ProviderName,
+                    "Npgsql.EntityFrameworkCore.PostgreSQL",
+                    StringComparison.Ordinal))
+            {
+                var key = ComputePairLockKey(userId1, userId2);
+                await context.Database.ExecuteSqlInterpolatedAsync(
+                        $"SELECT pg_advisory_xact_lock({key});", ct)
+                    .ConfigureAwait(false);
+            }
+
+            return new PairWriteTransaction(transaction);
         }
         catch
         {
-            await connection.DisposeAsync().ConfigureAwait(false);
+            await transaction.DisposeAsync().ConfigureAwait(false);
             throw;
         }
     }
@@ -109,30 +117,37 @@ public class FriendshipService(
         }
     }
 
-    private sealed class PairAdvisoryLock(NpgsqlConnection connection, long key) : IAsyncDisposable
+    private sealed class PairWriteTransaction(IDbContextTransaction? transaction) : IAsyncDisposable
     {
-        public async ValueTask DisposeAsync()
-        {
-            try
-            {
-                await using var command = connection.CreateCommand();
-                command.CommandText = "SELECT pg_advisory_unlock(@pair_key);";
-                command.Parameters.AddWithValue("pair_key", key);
-                await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            finally
-            {
-                await connection.DisposeAsync().ConfigureAwait(false);
-            }
-        }
+        public static PairWriteTransaction Noop { get; } = new(null);
+
+        public Task CommitAsync(CancellationToken ct) =>
+            transaction?.CommitAsync(ct) ?? Task.CompletedTask;
+
+        public Task RollbackAsync() =>
+            transaction?.RollbackAsync(CancellationToken.None) ?? Task.CompletedTask;
+
+        public ValueTask DisposeAsync() =>
+            transaction?.DisposeAsync() ?? ValueTask.CompletedTask;
     }
 
-    private sealed class NoopAsyncDisposable : IAsyncDisposable
-    {
-        public static NoopAsyncDisposable Instance { get; } = new();
+    private static bool HasValidPairIds(long userId1, long userId2) =>
+        userId1 > 0 && userId2 > 0 && userId1 != userId2;
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    private static string? NormalizeMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return null;
+
+        return message.Trim();
     }
+
+    private static bool IsValidMessage(string? message) =>
+        message is null || message.Length <= FriendshipInputLimits.FriendRequestMessageMaxLength;
+
+    private static bool IsValidNote(string? note) =>
+        !string.IsNullOrWhiteSpace(note)
+        && note.Trim().Length <= FriendshipInputLimits.FriendNoteMaxLength;
 
     /// <summary>
     /// 发送好友请求
@@ -146,103 +161,134 @@ public class FriendshipService(
         long requesterId, long targetUserId,
         string? message = null, CancellationToken ct = default)
     {
-        // 1. 基本校验 
+        if (requesterId <= 0 || targetUserId <= 0)
+            return SendFriendRequestResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数");
+
         if (requesterId == targetUserId)
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "不能添加自己为好友");
 
-        await using var pairLock = await AcquirePairLockAsync(requesterId, targetUserId, ct)
-            .ConfigureAwait(false);
-
-        var targetUser = await context.Users.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Id == targetUserId, ct)
-            .ConfigureAwait(false);
-        if (targetUser is null)
+        if (!IsValidMessage(message))
             return SendFriendRequestResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
-                "目标用户不存在");
+                $"好友申请消息不能超过 {FriendshipInputLimits.FriendRequestMessageMaxLength} 个字符");
 
-        if (targetUser.LockoutEnabled && targetUser.LockoutEnd > DateTimeOffset.UtcNow)
-            return SendFriendRequestResult.Failed(
-                FriendshipOperationResultErrorCode.ValidationFailed,
-                "目标账户不可用");
+        message = NormalizeMessage(message);
 
-        // P0-6：申请前检查任一方向的拉黑关系（BlockedByA/BlockedByB/BlockedMutual 均禁止发起申请）
-        var blockedEitherDirection = await context.BlockRecords.AsNoTracking()
-            .AnyAsync(b => (b.BlockerId == requesterId && b.BlockedUserId == targetUserId)
-                        || (b.BlockerId == targetUserId && b.BlockedUserId == requesterId), ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(requesterId, targetUserId, ct)
             .ConfigureAwait(false);
-        if (blockedEitherDirection)
-            return SendFriendRequestResult.Failed(
-                FriendshipOperationResultErrorCode.RequestAlreadyBlocked,
-                "存在拉黑关系，无法发送好友申请");
 
-        if (targetUser.FriendRequestPolicy == FriendRequestPolicy.NoStrangers)
+        try
         {
-            var alreadyFriends = await context.Friendships.AsNoTracking()
-                .AnyAsync(f => f.UserId == targetUserId && f.FriendId == requesterId && !f.IsDeleted, ct)
+            var targetUser = await context.Users.AsNoTracking()
+                .FirstOrDefaultAsync(u => u.Id == targetUserId, ct)
                 .ConfigureAwait(false);
-            if (!alreadyFriends)
+            if (targetUser is null)
                 return SendFriendRequestResult.Failed(
-                    FriendshipOperationResultErrorCode.FriendRequestRejectedByPrivacy,
-                    "对方不允许陌生人添加好友");
+                    FriendshipOperationResultErrorCode.ValidationFailed,
+                    "目标用户不存在");
+
+            if (targetUser.LockoutEnabled && targetUser.LockoutEnd > DateTimeOffset.UtcNow)
+                return SendFriendRequestResult.Failed(
+                    FriendshipOperationResultErrorCode.ValidationFailed,
+                    "目标账户不可用");
+
+            var blockedEitherDirection = await context.BlockRecords.AsNoTracking()
+                .AnyAsync(b => (b.BlockerId == requesterId && b.BlockedUserId == targetUserId)
+                            || (b.BlockerId == targetUserId && b.BlockedUserId == requesterId), ct)
+                .ConfigureAwait(false);
+            if (blockedEitherDirection)
+                return SendFriendRequestResult.Failed(
+                    FriendshipOperationResultErrorCode.RequestAlreadyBlocked,
+                    "存在拉黑关系，无法发送好友申请");
+
+            if (targetUser.FriendRequestPolicy == FriendRequestPolicy.NoStrangers)
+            {
+                var alreadyFriends = await context.Friendships.AsNoTracking()
+                    .AnyAsync(f => f.UserId == targetUserId && f.FriendId == requesterId && !f.IsDeleted, ct)
+                    .ConfigureAwait(false);
+                if (!alreadyFriends)
+                    return SendFriendRequestResult.Failed(
+                        FriendshipOperationResultErrorCode.FriendRequestRejectedByPrivacy,
+                        "对方不允许陌生人添加好友");
+            }
+
+            var relationships = await context.Friendships
+                .IgnoreQueryFilters()
+                .Where(f => (f.UserId == requesterId && f.FriendId == targetUserId) ||
+                            (f.UserId == targetUserId && f.FriendId == requesterId))
+                .ToListAsync(ct)
+                .ConfigureAwait(false);
+
+            var requesterRecord = relationships.FirstOrDefault(f => f.UserId == requesterId);
+            var targetRecord = relationships.FirstOrDefault(f => f.UserId == targetUserId);
+
+            if (requesterRecord is { IsDeleted: false })
+                return SendFriendRequestResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipAlreadyExists,
+                    "你们已经是好友了");
+
+            SendFriendRequestResult result;
+            var incomingRequest = await context.FriendRequests
+                .AnyAsync(r =>
+                    r.RequesterId == targetUserId &&
+                    r.TargetUserId == requesterId &&
+                    r.Status == RequestStatus.Pending, ct)
+                .ConfigureAwait(false);
+
+            if (incomingRequest)
+            {
+                var acceptResult = await AcceptRequestLockedAsync(requesterId, targetUserId, ct)
+                    .ConfigureAwait(false);
+                result = !acceptResult.Succeeded
+                    ? SendFriendRequestResult.Failed(acceptResult.ErrorCode, acceptResult.Message)
+                    : SendFriendRequestResult.Success(
+                        SendFriendRequestOutcome.AcceptedDirectly,
+                        "对方已请求添加，已自动成为好友",
+                        acceptResult.Data);
+            }
+            else if (requesterRecord is { IsDeleted: true } && targetRecord is { IsDeleted: false })
+            {
+                result = await RestoreFriendshipAsync(requesterRecord, ct)
+                    .ConfigureAwait(false);
+            }
+            else if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
+            {
+                result = await AcceptEveryoneLockedAsync(
+                        requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                result = await CreateOrUpdateRequestAsync(
+                        requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
+                    .ConfigureAwait(false);
+            }
+
+            if (!result.IsSuccess)
+                return result;
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(requesterId, targetUserId).ConfigureAwait(false);
+            return result;
         }
-
-        // 查询现有关系 
-        var relationships = await context.Friendships
-            .IgnoreQueryFilters()
-            .Where(f => (f.UserId == requesterId && f.FriendId == targetUserId) ||
-                        (f.UserId == targetUserId && f.FriendId == requesterId))
-            .ToListAsync(ct)
-            .ConfigureAwait(false);
-
-        var requesterRecord = relationships.FirstOrDefault(f => f.UserId == requesterId);
-        var targetRecord = relationships.FirstOrDefault(f => f.UserId == targetUserId);
-
-        // 已经是好友
-        if (requesterRecord is { IsDeleted: false })
+        catch (OperationCanceledException)
+        {
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            _logger.LogError(ex, "发送好友请求失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
+                requesterId, targetUserId);
             return SendFriendRequestResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipAlreadyExists,
-                "你们已经是好友了");
-
-        // 对方已有待处理请求 → 自动接受 
-        var incomingRequest = await context.FriendRequests
-            .AnyAsync(r =>
-                r.RequesterId == targetUserId &&
-                r.TargetUserId == requesterId &&
-                r.Status == RequestStatus.Pending, ct)
-            .ConfigureAwait(false);
-
-        if (incomingRequest)
-        {
-            var acceptResult = await AcceptRequestLockedAsync(requesterId, targetUserId, ct)
-                .ConfigureAwait(false);
-
-            return !acceptResult.Succeeded
-                ? SendFriendRequestResult.Failed(acceptResult.ErrorCode, acceptResult.Message)
-                : SendFriendRequestResult.Success(
-                    SendFriendRequestOutcome.AcceptedDirectly,
-                    "对方已请求添加，已自动成为好友",
-                    acceptResult.Data);
+                FriendshipOperationResultErrorCode.InternalSystemError,
+                "操作失败，请稍后重试");
         }
-
-        // 我删了对方，但对方没删我 → 直接恢复关系，无需走请求流程
-        if (requesterRecord is { IsDeleted: true } && targetRecord is { IsDeleted: false })
-        {
-            return await RestoreFriendshipAsync(requesterRecord, requesterId, targetUserId, ct)
-                .ConfigureAwait(false);
-        }
-
-        // P0-6：Everyone 自动接受改为单一事务内的 AcceptEveryoneAsync，失败整体回滚不残留 pending 申请
-        if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
-        {
-            return await AcceptEveryoneLockedAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
-                .ConfigureAwait(false);
-        }
-
-        return await CreateOrUpdateRequestAsync(requesterId, targetUserId, message, targetUser.NotifyFriendRequests, ct)
-            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -253,29 +299,13 @@ public class FriendshipService(
     /// <param name="targetUserId">目标用户的ID</param>
     /// <param name="ct">用于取消操作的CancellationToken</param>
     /// <returns>返回恢复好友关系的结果，包含操作是否成功、错误码及消息等信息</returns>
-    private async Task<SendFriendRequestResult> RestoreFriendshipAsync(UserFriendEntry requesterRecord,
-        long requesterId, long targetUserId, CancellationToken ct)
+    private async Task<SendFriendRequestResult> RestoreFriendshipAsync(
+        UserFriendEntry requesterRecord, CancellationToken ct)
     {
-        try
-        {
-            requesterRecord.IsDeleted = false;
-            requesterRecord.DeletedAt = null;
+        requesterRecord.IsDeleted = false;
+        requesterRecord.DeletedAt = null;
 
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "恢复好友关系失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
-                requesterId, targetUserId);
-            return SendFriendRequestResult.Failed(FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
-        }
-
-        // 缓存清理（失败不影响业务结果）
-        await SafeClearCacheAsync(requesterId, targetUserId);
+        await context.SaveChangesAsync(ct).ConfigureAwait(false);
 
         // 加载导航属性用于返回 DTO
         await context.Entry(requesterRecord)
@@ -309,7 +339,6 @@ public class FriendshipService(
         long requesterId, long targetUserId,
         string? message, bool targetNotifiesFriendRequests, CancellationToken ct)
     {
-        //获取好友请求
         var existingRequest = await context.FriendRequests
             .FirstOrDefaultAsync(r =>
                 r.RequesterId == requesterId &&
@@ -321,54 +350,37 @@ public class FriendshipService(
             return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestAlreadyPending, "好友请求已发送，请勿重复操作");
         }
 
-
-        try
+        if (existingRequest is null)
         {
-            if (existingRequest is null)
+            await context.FriendRequests.AddAsync(new FriendRequest
             {
-                await context.FriendRequests.AddAsync(new FriendRequest
-                {
-                    RequesterId = requesterId,
-                    TargetUserId = targetUserId,
-                    Message = message,
-                    Status = RequestStatus.Pending,
-                    CreatedAt = DateTime.UtcNow
-                }, ct).ConfigureAwait(false);
-            }
-            else
-            {
-                // 被拒绝过 → 复用旧记录
-                existingRequest.Status = RequestStatus.Pending;
-                existingRequest.Message = message;
-                existingRequest.CreatedAt = DateTime.UtcNow;
-                existingRequest.RespondedAt = null;
-            }
-
-            // 好友申请通知在同一事务内写入 NotificationOutbox，由 Worker 投递。
-            // 不再使用 fire-and-forget（避免 DbContext 释放/并发使用/丢通知）。
-            if (targetNotifiesFriendRequests && securityNotifications is not null)
-            {
-                securityNotifications.StageNotify(
-                    targetUserId, "FriendRequest", "新的好友申请",
-                    $"用户 {requesterId} 向你发送了好友申请。",
-                    preferEmail: false);
-            }
-
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+                RequesterId = requesterId,
+                TargetUserId = targetUserId,
+                Message = message,
+                Status = RequestStatus.Pending,
+                CreatedAt = DateTime.UtcNow
+            }, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        else
         {
-            _logger.LogDebug("{name} --> 该操作被取消", nameof(CreateOrUpdateRequestAsync));
-            throw;
+            // 被拒绝过 → 复用旧记录
+            existingRequest.Status = RequestStatus.Pending;
+            existingRequest.Message = message;
+            existingRequest.CreatedAt = DateTime.UtcNow;
+            existingRequest.RespondedAt = null;
         }
-        catch (Exception ex)
+
+        // 好友申请通知在同一事务内写入 NotificationOutbox，由 Worker 投递。
+        // 不再使用 fire-and-forget（避免 DbContext 释放/并发使用/丢通知）。
+        if (targetNotifiesFriendRequests && securityNotifications is not null)
         {
-            _logger.LogError(ex, "发送好友请求失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
-                requesterId, targetUserId);
-            return SendFriendRequestResult.Failed(
-                FriendshipOperationResultErrorCode.InternalSystemError,
-                "操作失败，请稍后重试");
+            securityNotifications.StageNotify(
+                targetUserId, "FriendRequest", "新的好友申请",
+                $"用户 {requesterId} 向你发送了好友申请。",
+                preferEmail: false);
         }
+
+        await context.SaveChangesAsync(ct).ConfigureAwait(false);
 
         return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestSent);
     }
@@ -415,12 +427,42 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult<FriendDto>> AcceptRequestAsync(long acceptorId, long requesterId,
         CancellationToken ct = default)
     {
-        await using var pairLock = await AcquirePairLockAsync(acceptorId, requesterId, ct)
+        if (!HasValidPairIds(acceptorId, requesterId))
+            return FriendshipOperationResult<FriendDto>.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
+
+        await using var transaction = await BeginPairWriteTransactionAsync(acceptorId, requesterId, ct)
             .ConfigureAwait(false);
-        return await AcceptRequestLockedAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
+        try
+        {
+            var result = await AcceptRequestLockedAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
+            if (!result.Succeeded)
+                return result;
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(acceptorId, requesterId).ConfigureAwait(false);
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            _logger.LogWarning("接受好友请求操作被取消，AcceptorId={AcceptorId}, RequesterId={RequesterId}", acceptorId,
+                requesterId);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            _logger.LogError(ex, "执行接受好友请求出现错误，AcceptorId={AcceptorId}, RequesterId={RequesterId}", acceptorId,
+                requesterId);
+            return FriendshipOperationResult<FriendDto>.Failed(
+                FriendshipOperationResultErrorCode.InternalSystemError,
+                "操作失败，请稍后重试");
+        }
     }
 
-    /// <summary>由公开 Accept 或已持有同一 pair lock 的 Send 调用。</summary>
+    /// <summary>由公开 Accept 或已持有同一 pair write transaction 的 Send 调用。</summary>
     private async Task<FriendshipOperationResult<FriendDto>> AcceptRequestLockedAsync(
         long acceptorId, long requesterId, CancellationToken ct)
     {
@@ -444,44 +486,20 @@ public class FriendshipService(
         UserFriendEntry acceptorRecord;
         UserFriendEntry requesterRecord;
 
-        await using var transaction = await context.Database.BeginTransactionAsync(ct);
-        try
-        {
-            request.Status = RequestStatus.Accepted;
-            request.RespondedAt = DateTime.UtcNow;
+        request.Status = RequestStatus.Accepted;
+        request.RespondedAt = DateTime.UtcNow;
 
-            // P0-6：建立双向关系（复用历史记录或新建），同一事务内关闭反方向 pending（双方互发场景）
-            (acceptorRecord, requesterRecord) = await EnsureMutualRowsAsync(acceptorId, requesterId, ct)
-                .ConfigureAwait(false);
-            await CloseReversePendingAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
+        // P0-6：建立双向关系（复用历史记录或新建），同一事务内关闭反方向 pending（双方互发场景）
+        (acceptorRecord, requesterRecord) = await EnsureMutualRowsAsync(acceptorId, requesterId, ct)
+            .ConfigureAwait(false);
+        await CloseReversePendingAsync(acceptorId, requesterId, ct).ConfigureAwait(false);
 
-            await context.Entry(acceptorRecord)
-                .Reference(f => f.Friend)
-                .LoadAsync(ct)
-                .ConfigureAwait(false);
+        await context.Entry(acceptorRecord)
+            .Reference(f => f.Friend)
+            .LoadAsync(ct)
+            .ConfigureAwait(false);
 
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-            _logger.LogWarning("接受好友请求操作被取消，AcceptorId={AcceptorId}, RequesterId={RequesterId}", acceptorId,
-                requesterId);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-            _logger.LogError(ex, "执行接受好友请求出现错误，AcceptorId={AcceptorId}, RequesterId={RequesterId}", acceptorId,
-                requesterId);
-            return FriendshipOperationResult<FriendDto>.Failed(
-                FriendshipOperationResultErrorCode.InternalSystemError,
-                "操作失败，请稍后重试");
-        }
-
-        // 缓存清理：失败只记日志，不影响结果
-        await SafeClearCacheAsync(acceptorId, requesterId);
+        await context.SaveChangesAsync(ct).ConfigureAwait(false);
 
         var dto = new FriendDto
         {
@@ -512,29 +530,33 @@ public class FriendshipService(
         long declinerId, long requesterId,
         bool blockAfterDecline = false, CancellationToken ct = default)
     {
-        await using var pairLock = await AcquirePairLockAsync(declinerId, requesterId, ct)
-            .ConfigureAwait(false);
-
-        var request = await GetFriendRequestAsync(declinerId, requesterId, RequestStatus.Pending, ct)
-            .ConfigureAwait(false);
-
-        if (request == null)
+        if (!HasValidPairIds(declinerId, requesterId))
             return FriendshipOperationResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipRequestExpired,
-                "好友请求不存在或已处理");
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
+
+        await using var transaction = await BeginPairWriteTransactionAsync(declinerId, requesterId, ct)
+            .ConfigureAwait(false);
 
         try
         {
+            var request = await GetFriendRequestAsync(declinerId, requesterId, RequestStatus.Pending, ct)
+                .ConfigureAwait(false);
+
+            if (request == null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipRequestExpired,
+                    "好友请求不存在或已处理");
+
             request.Status = RequestStatus.Declined;
             request.RespondedAt = DateTime.UtcNow;
 
             if (blockAfterDecline)
             {
-                await using var transaction = await context.Database
-                    .BeginTransactionAsync(ct)
+                var alreadyBlocked = await context.BlockRecords
+                    .AnyAsync(b => b.BlockerId == declinerId && b.BlockedUserId == requesterId, ct)
                     .ConfigureAwait(false);
-
-                try
+                if (!alreadyBlocked)
                 {
                     await context.BlockRecords.AddAsync(new BlockRecord
                     {
@@ -542,98 +564,93 @@ public class FriendshipService(
                         BlockedUserId = requesterId,
                         BlockedAt = DateTime.UtcNow
                     }, ct).ConfigureAwait(false);
-
-                    // P0-6：拒绝并拉黑时关闭双方 pending（含反方向 decliner->requester 的待处理申请）
-                    await ClosePendingForBlockAsync(declinerId, requesterId, ct).ConfigureAwait(false);
-
-                    var friendships = await context.Friendships
-                        .IgnoreQueryFilters()
-                        .Where(f => (f.UserId == declinerId && f.FriendId == requesterId) ||
-                                    (f.UserId == requesterId && f.FriendId == declinerId))
-                        .ToListAsync(ct)
-                        .ConfigureAwait(false);
-
-                    foreach (var friendship in friendships)
-                    {
-                        friendship.IsDeleted = true;
-                        friendship.DeletedAt = DateTime.UtcNow;
-                    }
-
-                    await context.SaveChangesAsync(ct).ConfigureAwait(false);
-                    await transaction.CommitAsync(ct).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+
+                // P0-6：拒绝并拉黑时关闭双方 pending（含反方向 decliner->requester 的待处理申请）
+                await ClosePendingForBlockAsync(declinerId, requesterId, ct).ConfigureAwait(false);
+
+                var friendships = await context.Friendships
+                    .IgnoreQueryFilters()
+                    .Where(f => (f.UserId == declinerId && f.FriendId == requesterId) ||
+                                (f.UserId == requesterId && f.FriendId == declinerId))
+                    .ToListAsync(ct)
+                    .ConfigureAwait(false);
+
+                foreach (var friendship in friendships)
                 {
-                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    throw;
-                }
-                catch
-                {
-                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    throw;
+                    friendship.IsDeleted = true;
+                    friendship.DeletedAt = DateTime.UtcNow;
                 }
             }
-            else
-            {
-                await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            }
+
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+            await SafeClearCacheAsync(declinerId, requesterId).ConfigureAwait(false);
+            return FriendshipOperationResult.Success(request.RequesterId.ToString());
         }
         catch (OperationCanceledException)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "拒绝好友请求失败，DeclinerId={DeclinerId}, RequesterId={RequesterId}",
                 declinerId, requesterId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError,
                 "操作失败，请稍后重试");
         }
-
-        if (blockAfterDecline)
-        {
-            await SafeClearCacheAsync(declinerId, requesterId).ConfigureAwait(false);
-        }
-
-        return FriendshipOperationResult.Success(request.RequesterId.ToString());
     }
 
     /// <inheritdoc />
     public async Task<FriendshipOperationResult> WithdrawRequestAsync(
         long requesterId, long targetUserId, CancellationToken ct = default)
     {
-        await using var pairLock = await AcquirePairLockAsync(requesterId, targetUserId, ct)
-            .ConfigureAwait(false);
-
-        var request = await context.FriendRequests
-            .FirstOrDefaultAsync(r =>
-                r.RequesterId == requesterId
-                && r.TargetUserId == targetUserId
-                && r.Status == RequestStatus.Pending, ct)
-            .ConfigureAwait(false);
-
-        if (request is null)
+        if (!HasValidPairIds(requesterId, targetUserId))
             return FriendshipOperationResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipRequestNotFound,
-                "没有待撤回的好友申请");
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
+
+        await using var transaction = await BeginPairWriteTransactionAsync(requesterId, targetUserId, ct)
+            .ConfigureAwait(false);
 
         try
         {
+            var request = await context.FriendRequests
+                .FirstOrDefaultAsync(r =>
+                    r.RequesterId == requesterId
+                    && r.TargetUserId == targetUserId
+                    && r.Status == RequestStatus.Pending, ct)
+                .ConfigureAwait(false);
+
+            if (request is null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipRequestNotFound,
+                    "没有待撤回的好友申请");
+
             request.Status = RequestStatus.Withdrawn;
             request.RespondedAt = DateTime.UtcNow;
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(requesterId, targetUserId).ConfigureAwait(false);
+            return FriendshipOperationResult.Success();
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException)
+        {
+            await transaction.RollbackAsync().ConfigureAwait(false);
+            throw;
+        }
         catch (Exception ex)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "撤回好友申请失败 Requester={RequesterId} Target={TargetUserId}",
                 requesterId, targetUserId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
         }
-
-        return FriendshipOperationResult.Success();
     }
 
     /// <summary>
@@ -646,25 +663,34 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> BlockUserAsync(
         long blockerId, long targetUserId, CancellationToken ct = default)
     {
+        if (blockerId <= 0 || targetUserId <= 0)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数");
+
         if (blockerId == targetUserId)
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "不能拉黑自己");
 
-        await using var pairLock = await AcquirePairLockAsync(blockerId, targetUserId, ct)
-            .ConfigureAwait(false);
-
-        if (await context.BlockRecords
-                .AnyAsync(b => b.BlockerId == blockerId && b.BlockedUserId == targetUserId, ct)
-                .ConfigureAwait(false))
-            return FriendshipOperationResult.Success("已在黑名单中");
-
-        await using var transaction = await context.Database
-            .BeginTransactionAsync(ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(blockerId, targetUserId, ct)
             .ConfigureAwait(false);
 
         try
         {
+            var targetExists = await context.Users.AsNoTracking()
+                .AnyAsync(user => user.Id == targetUserId, ct)
+                .ConfigureAwait(false);
+            if (!targetExists)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.ValidationFailed,
+                    "目标用户不存在");
+
+            if (await context.BlockRecords
+                    .AnyAsync(b => b.BlockerId == blockerId && b.BlockedUserId == targetUserId, ct)
+                    .ConfigureAwait(false))
+                return FriendshipOperationResult.Success("已在黑名单中");
+
             await context.BlockRecords.AddAsync(new BlockRecord
             {
                 BlockerId = blockerId,
@@ -690,24 +716,23 @@ public class FriendshipService(
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(blockerId, targetUserId).ConfigureAwait(false);
+            return FriendshipOperationResult.Success();
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "拉黑用户失败，BlockerId={BlockerId}, TargetUserId={TargetUserId}",
                 blockerId, targetUserId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError,
                 "操作失败，请稍后重试");
         }
-
-        await SafeClearCacheAsync(blockerId, targetUserId);
-        return FriendshipOperationResult.Success();
     }
 
     /// <summary>
@@ -720,48 +745,48 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> UnblockUserAsync(
         long unblockerId, long targetUserId, CancellationToken ct = default)
     {
-        await using var pairLock = await AcquirePairLockAsync(unblockerId, targetUserId, ct)
-            .ConfigureAwait(false);
-
-        var blockRecord = await context.BlockRecords
-            .FirstOrDefaultAsync(b => b.BlockerId == unblockerId && b.BlockedUserId == targetUserId, ct)
-            .ConfigureAwait(false);
-
-        if (blockRecord == null)
+        if (!HasValidPairIds(unblockerId, targetUserId))
             return FriendshipOperationResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipNotFound,
-                "未找到拉黑记录");
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
 
-        await using var transaction = await context.Database
-            .BeginTransactionAsync(ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(unblockerId, targetUserId, ct)
             .ConfigureAwait(false);
 
         try
         {
+            var blockRecord = await context.BlockRecords
+                .FirstOrDefaultAsync(b => b.BlockerId == unblockerId && b.BlockedUserId == targetUserId, ct)
+                .ConfigureAwait(false);
+
+            if (blockRecord == null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到拉黑记录");
+
             // P0-6：解除拉黑仅删除 BlockRecord，不自动恢复历史 friendship（需重新申请）。
             // 历史若为 Accepted 则保持 Removed 状态，由双方重新发起申请建立关系。
             context.BlockRecords.Remove(blockRecord);
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(unblockerId, targetUserId).ConfigureAwait(false);
+            return FriendshipOperationResult.Success();
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "解除拉黑失败，UnblockerId={UnblockerId}, TargetUserId={TargetUserId}",
                 unblockerId, targetUserId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError,
                 "操作失败，请稍后重试");
         }
-
-        await SafeClearCacheAsync(unblockerId, targetUserId);
-        return FriendshipOperationResult.Success();
     }
 
     /// <summary>
@@ -773,74 +798,62 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> DeleteFriendshipAsync(
         long userId, long friendId, CancellationToken ct = default)
     {
-        await using var pairLock = await AcquirePairLockAsync(userId, friendId, ct)
-            .ConfigureAwait(false);
-
-        var myRecord = await context.Friendships
-            .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
-            .ConfigureAwait(false);
-
-        if (myRecord == null)
+        if (!HasValidPairIds(userId, friendId))
             return FriendshipOperationResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipNotFound,
-                "未找到对应的好友关系");
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
 
-        var friendRecord = await context.Friendships
-            .IgnoreQueryFilters()
-            .FirstOrDefaultAsync(f => f.UserId == friendId && f.FriendId == userId, ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(userId, friendId, ct)
             .ConfigureAwait(false);
 
         try
         {
+            var myRecord = await context.Friendships
+                .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
+                .ConfigureAwait(false);
+
+            if (myRecord == null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到对应的好友关系");
+
+            var friendRecord = await context.Friendships
+                .IgnoreQueryFilters()
+                .FirstOrDefaultAsync(f => f.UserId == friendId && f.FriendId == userId, ct)
+                .ConfigureAwait(false);
+
             if (friendRecord is { IsDeleted: true })
             {
-                await using var transaction = await context.Database
-                    .BeginTransactionAsync(ct)
-                    .ConfigureAwait(false);
-
-                try
-                {
-                    // 对方已删除 → 双向物理删除
-                    context.Friendships.Remove(myRecord);
-                    context.Friendships.Remove(friendRecord);
-
-                    await context.SaveChangesAsync(ct).ConfigureAwait(false);
-                    await transaction.CommitAsync(ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    throw;
-                }
-                catch
-                {
-                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                    throw;
-                }
+                // 对方已删除 → 双向物理删除
+                context.Friendships.Remove(myRecord);
+                context.Friendships.Remove(friendRecord);
             }
             else
             {
                 // 对方还没删 → 单边软删除
                 myRecord.IsDeleted = true;
                 myRecord.DeletedAt = DateTime.UtcNow;
-                await context.SaveChangesAsync(ct).ConfigureAwait(false);
             }
+
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(userId, friendId).ConfigureAwait(false);
+            return FriendshipOperationResult.Success();
         }
         catch (OperationCanceledException)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "删除好友失败，UserId={UserId}, FriendId={FriendId}",
                 userId, friendId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError,
                 "操作失败，请稍后重试");
         }
-
-        await SafeClearCacheAsync(userId, friendId);
-        return FriendshipOperationResult.Success();
     }
 
     /// <summary>
@@ -1091,10 +1104,22 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> UpdateFriendNoteAsync(long userId, long friendId, string note,
         CancellationToken ct = default)
     {
+        if (!HasValidPairIds(userId, friendId))
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                "用户 ID 必须为正数，且不能是同一用户");
+
         if (string.IsNullOrWhiteSpace(note))
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed,
                 "备注不能为空");
+
+        if (!IsValidNote(note))
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed,
+                $"好友备注不能超过 {FriendshipInputLimits.FriendNoteMaxLength} 个字符");
+
+        var normalizedNote = note.Trim();
 
         var friendship = await context.Friendships
             .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId && !f.IsDeleted, ct)
@@ -1107,7 +1132,7 @@ public class FriendshipService(
 
         try
         {
-            friendship.Note = note.Trim();
+            friendship.Note = normalizedNote;
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -1619,7 +1644,6 @@ public class FriendshipService(
         if (request?.Status == RequestStatus.Pending)
             return SendFriendRequestResult.Success(SendFriendRequestOutcome.RequestAlreadyPending, "好友请求已发送，请勿重复操作");
 
-        await using var transaction = await context.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
         try
         {
             if (request is null)
@@ -1663,7 +1687,6 @@ public class FriendshipService(
                 .ConfigureAwait(false);
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
 
             var dto = new FriendDto
             {
@@ -1676,7 +1699,6 @@ public class FriendshipService(
                 Note = requesterRecord.Note
             };
 
-            await SafeClearCacheAsync(requesterId, targetUserId).ConfigureAwait(false);
             return SendFriendRequestResult.Success(
                 SendFriendRequestOutcome.AcceptedDirectly,
                 "对方允许所有人添加，已自动成为好友",
@@ -1684,12 +1706,10 @@ public class FriendshipService(
         }
         catch (OperationCanceledException)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             _logger.LogError(ex, "Everyone 自动接受失败，RequesterId={RequesterId}, TargetUserId={TargetUserId}",
                 requesterId, targetUserId);
             return SendFriendRequestResult.Failed(

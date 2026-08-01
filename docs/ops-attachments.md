@@ -23,19 +23,33 @@ Read-only operational visibility for attachment GC / scan / delete tombs. Auth: 
 - `OpsHighDeleteAttemptThreshold` (default 5)
 - `OpsSampleLimit` (default 20, clamped 1–20)
 
+## Upload quota contract
+
+- `MaxUnconfirmedObjectsPerUser` (default 20) limits `Ticketed` / `Uploaded` / `Scanning` objects per uploader.
+- `MaxStorageBytesPerUser` (default 5 GiB) covers `Ticketed` / `Uploaded` / `Scanning` / `Confirmed` / `Bound` metadata rows.
+- A `Ticketed` row reserves one `MaxBytes` unit, not the client-declared length; this prevents direct S3 PUT from under-declaring its body to bypass the quota. The size is replaced with the actual value after upload.
+- Presign uses a per-user PostgreSQL transaction advisory lock before it reads usage and inserts the metadata row. A denial never returns an upload URL: pending-object limit is `429 AttachmentPendingLimitExceeded`, storage quota is `409 AttachmentStorageQuotaExceeded`, and unavailable metadata is `503 AttachmentMetadataUnavailable`.
+- The orchestration immediately cancels the Redis upload ticket on a denied or failed reservation. Lifecycle and aged-unbound cleanup remain the fallback for crashes after a successful reservation.
+
 ## Related metrics (meter `Infrastructure.Attachments`)
 
 - `attachment.blob_delete` (`outcome`: success/failed/exhausted)
 - `attachment.scan` (`outcome`: enqueued/…/dead_letter)
+- `attachment.upload_reservation` (`outcome`: reserved/pending_limit/storage_limit/metadata_unavailable)
 - `attachment.pending_delete` / `attachment.pending_scan` gauges
 
 Account cleanup saga / inbox DLQ remain under `/api/admin/account-cleanup-saga`.
 
 ## S3 production contract
 
-- Attachment keys are allocated once as `attachments/{userId}/{attachmentId}`. The
-  MIME type is stored in object `Content-Type` and realtime metadata; file-name
-  extensions are not used for finalization.
+- Client uploads are written only to
+  `attachments/{userId}/staging/{attachmentId}`. The scanner records the exact
+  source ETag, and confirmation conditionally copies that version to the immutable
+  `attachments/{userId}/confirmed/{attachmentId}` key before publishing the final
+  key to realtime metadata. A later PUT to the staging URL therefore cannot mutate
+  a confirmed attachment. The staging object is removed through the durable blob
+  delete queue. MIME type is stored in object `Content-Type` and realtime metadata;
+  file-name extensions are not used for finalization.
 - S3 clients use the AWS SDK default credential chain. Inject an IAM role,
   workload identity, profile, or standard environment credentials; do not put
   access keys in `AttachmentStorage` configuration.

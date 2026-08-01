@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
 using Core.Interfaces;
 using Core.Models.Common;
@@ -5,6 +6,7 @@ using Core.Models.Friend;
 using Core.Models.Friend.Requests;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace ChatApp.Server.Controllers;
 
@@ -37,7 +39,8 @@ public class FriendshipController(
     /// <param name="friendId">要删除的好友ID。</param>
     /// <returns>表示异步操作的结果，成功时返回200 OK，失败时返回400 Bad Request。</returns>
     [HttpDelete("{friendId:long}")]
-    public async Task<IActionResult> DeleteFriend([FromRoute] long friendId, CancellationToken cancellationToken)
+    [EnableRateLimiting("friendship-write")]
+    public async Task<IActionResult> DeleteFriend([FromRoute, Range(1, long.MaxValue)] long friendId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.DeleteFriendshipAsync(
             GetCurrentUserId(), friendId, cancellationToken);
@@ -50,6 +53,7 @@ public class FriendshipController(
     /// <param name="request">包含目标用户ID和可选消息的请求对象</param>
     /// <returns>表示请求发送结果的操作结果</returns>
     [HttpPost("requests")]
+    [EnableRateLimiting("friendship-write")]
     [Filters.Idempotent]
     public async Task<IActionResult> SendFriendRequest(
         [FromBody] SendFriendRequestRequest request,
@@ -66,7 +70,8 @@ public class FriendshipController(
     /// <param name="requesterId">请求方用户的ID。</param>
     /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含新添加的好友信息。</returns>
     [HttpPut("requests/{requesterId:long}/accept")]
-    public async Task<IActionResult> AcceptFriendRequest([FromRoute] long requesterId, CancellationToken cancellationToken)
+    [EnableRateLimiting("friendship-write")]
+    public async Task<IActionResult> AcceptFriendRequest([FromRoute, Range(1, long.MaxValue)] long requesterId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.AcceptRequestAsync(
             GetCurrentUserId(), requesterId, cancellationToken);
@@ -80,8 +85,9 @@ public class FriendshipController(
     /// <param name="blockAfterDecline">拒绝后是否拉黑请求方，默认为false。</param>
     /// <returns>操作结果，成功返回200 OK，失败返回400 Bad Request。</returns>
     [HttpPut("requests/{requesterId:long}/decline")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> DeclineFriendRequest(
-        [FromRoute] long requesterId,
+        [FromRoute, Range(1, long.MaxValue)] long requesterId,
         [FromQuery] bool blockAfterDecline = false,
         CancellationToken cancellationToken = default)
     {
@@ -92,8 +98,9 @@ public class FriendshipController(
 
     /// <summary>撤回自己发出的待处理好友申请。</summary>
     [HttpDelete("requests/{targetUserId:long}")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> WithdrawFriendRequest(
-        [FromRoute] long targetUserId, CancellationToken cancellationToken)
+        [FromRoute, Range(1, long.MaxValue)] long targetUserId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.WithdrawRequestAsync(
             GetCurrentUserId(), targetUserId, cancellationToken);
@@ -143,6 +150,7 @@ public class FriendshipController(
     /// <param name="request">包含目标用户ID的请求对象</param>
     /// <returns>返回操作结果，成功时为Ok响应，失败时为BadRequest响应</returns>
     [HttpPost("block")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> BlockUser([FromBody] BlockUserRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.BlockUserAsync(
@@ -156,7 +164,8 @@ public class FriendshipController(
     /// <param name="targetUserId">要解除拉黑的目标用户ID。</param>
     /// <returns>返回一个表示操作结果的IActionResult对象，成功时包含解封信息，失败时包含错误详情。</returns>
     [HttpDelete("block/{targetUserId:long}")]
-    public async Task<IActionResult> UnblockUser([FromRoute] long targetUserId, CancellationToken cancellationToken)
+    [EnableRateLimiting("friendship-write")]
+    public async Task<IActionResult> UnblockUser([FromRoute, Range(1, long.MaxValue)] long targetUserId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.UnblockUserAsync(
             GetCurrentUserId(), targetUserId, cancellationToken);
@@ -187,8 +196,9 @@ public class FriendshipController(
     /// <param name="request">包含新备注信息的请求对象。</param>
     /// <returns>如果操作成功，返回200状态码；如果失败，返回400状态码及错误详情。</returns>
     [HttpPut("friends/{friendId:long}/note")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> UpdateFriendNote(
-        [FromRoute] long friendId, [FromBody] UpdateNoteRequest request, CancellationToken cancellationToken)
+        [FromRoute, Range(1, long.MaxValue)] long friendId, [FromBody] UpdateNoteRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.UpdateFriendNoteAsync(
             GetCurrentUserId(), friendId, request.Note, cancellationToken);
@@ -202,8 +212,9 @@ public class FriendshipController(
     /// <param name="request">包含目标分组ID的请求对象</param>
     /// <returns>返回操作结果，成功时返回200 OK，失败时返回400 Bad Request</returns>
     [HttpPut("friends/{friendId:long}/group")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> AssignFriendToGroup(
-        [FromRoute] long friendId, [FromBody] AssignGroupRequest request, CancellationToken cancellationToken)
+        [FromRoute, Range(1, long.MaxValue)] long friendId, [FromBody] AssignGroupRequest request, CancellationToken cancellationToken)
     {
         var result = await friendshipService.AssignFriendToGroupAsync(
             GetCurrentUserId(), friendId, request.GroupId, cancellationToken);
@@ -211,6 +222,7 @@ public class FriendshipController(
     }
 
     [HttpPost("groups")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> CreateGroup(
         [FromBody] CreateFriendGroupRequest request, CancellationToken cancellationToken)
     {
@@ -227,6 +239,7 @@ public class FriendshipController(
     }
 
     [HttpPut("groups/reorder")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> ReorderGroups(
         [FromBody] ReorderFriendGroupsRequest request, CancellationToken cancellationToken)
     {
@@ -236,6 +249,7 @@ public class FriendshipController(
     }
 
     [HttpPut("groups/default")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> SetDefaultGroup(
         [FromBody] SetDefaultFriendGroupRequest request, CancellationToken cancellationToken)
     {
@@ -245,6 +259,7 @@ public class FriendshipController(
     }
 
     [HttpPut("groups/{groupId:int}")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> RenameGroup(
         [FromRoute] int groupId, [FromBody] RenameFriendGroupRequest request, CancellationToken cancellationToken)
     {
@@ -254,6 +269,7 @@ public class FriendshipController(
     }
 
     [HttpDelete("groups/{groupId:int}")]
+    [EnableRateLimiting("friendship-write")]
     public async Task<IActionResult> DeleteGroup([FromRoute] int groupId, CancellationToken cancellationToken)
     {
         var result = await friendshipService.DeleteGroupAsync(GetCurrentUserId(), groupId, cancellationToken);

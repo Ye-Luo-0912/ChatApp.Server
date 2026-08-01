@@ -25,6 +25,7 @@ namespace Infrastructure.Data
         public DbSet<RealtimeIntegrationOutboxItem> RealtimeOutbox { get; set; }
         public DbSet<EmailOutboxItem> EmailOutbox { get; set; }
         public DbSet<NotificationOutboxItem> NotificationOutbox { get; set; }
+        public DbSet<ModerationSessionRevocationOutboxItem> ModerationSessionRevocationOutbox { get; set; }
         public DbSet<SecurityEvent> SecurityEvents { get; set; }
         public DbSet<AdminAuditLog> AdminAuditLogs { get; set; }
         public DbSet<InAppNotification> InAppNotifications { get; set; }
@@ -178,10 +179,16 @@ namespace Infrastructure.Data
                 e.Property(x => x.AttachmentId).HasMaxLength(64);
                 e.Property(x => x.Status).HasMaxLength(32).IsRequired();
                 e.Property(x => x.LastError).HasMaxLength(500);
+                e.Property(x => x.LeaseOwner).HasMaxLength(128);
+                e.Property(x => x.LeaseToken).HasMaxLength(64);
                 e.HasIndex(x => new { x.Status, x.NextAttemptAt })
                     .HasDatabaseName("IX_AttachmentBlobDeleteJob_Due");
+                e.HasIndex(x => new { x.Status, x.LeaseExpiresAt })
+                    .HasDatabaseName("IX_AttachmentBlobDeleteJob_Status_LeaseExpiresAt");
                 e.HasIndex(x => x.ObjectKey)
-                    .HasDatabaseName("IX_AttachmentBlobDeleteJob_ObjectKey");
+                    .IsUnique()
+                    .HasFilter("\"Status\" IN ('Pending', 'Processing')")
+                    .HasDatabaseName("UX_AttachmentBlobDeleteJob_ActiveObjectKey");
                 e.HasIndex(x => x.UserId)
                     .HasDatabaseName("IX_AttachmentBlobDeleteJob_UserId");
             });
@@ -241,6 +248,7 @@ namespace Infrastructure.Data
                 e.Property(x => x.ContentType).HasMaxLength(128);
                 e.Property(x => x.OriginalName).HasMaxLength(256);
                 e.Property(x => x.ContentHash).HasMaxLength(64);
+                e.Property(x => x.SourceEntityTag).HasMaxLength(256);
                 e.Property(x => x.Outcome).HasMaxLength(32).IsRequired();
                 e.Property(x => x.RejectionReason).HasMaxLength(500);
                 e.Property(x => x.Status).HasMaxLength(32).IsRequired();
@@ -304,6 +312,7 @@ namespace Infrastructure.Data
             builder.ApplyConfiguration(new FriendGroupConfig());
             builder.ApplyConfiguration(new EmailOutboxItemConfig());
             builder.ApplyConfiguration(new NotificationOutboxItemConfig());
+            builder.ApplyConfiguration(new ModerationSessionRevocationOutboxItemConfig());
             builder.AddChatAppRealtimeOutbox();
         }
     }

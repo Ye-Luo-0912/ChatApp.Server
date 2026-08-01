@@ -16,6 +16,11 @@ public sealed class AttachmentScanProjection
     public string? OriginalName { get; set; }
     public long SizeBytes { get; set; }
     public string? ContentHash { get; set; }
+    /// <summary>
+    /// Object-store ETag observed on the exact stream that was scanned. S3 promotion
+    /// must use it as an If-Match fence so a later client PUT cannot be confirmed.
+    /// </summary>
+    public string? SourceEntityTag { get; set; }
     public string Outcome { get; set; } = AttachmentScanProjectionOutcome.Confirmed;
     public string? RejectionReason { get; set; }
     public int AttemptCount { get; set; }

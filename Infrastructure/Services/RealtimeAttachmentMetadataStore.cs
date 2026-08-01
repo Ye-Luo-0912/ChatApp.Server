@@ -15,17 +15,22 @@ namespace Infrastructure.Services;
 /// </summary>
 public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
 {
+    private const long AttachmentQuotaLockNamespace = 0x4154545100000000L;
+
     private readonly MessageEvidenceOptions _evidence;
     private readonly DataExportStorageOptions _export;
+    private readonly AttachmentStorageOptions _attachments;
     private readonly ILogger<RealtimeAttachmentMetadataStore> _logger;
 
     public RealtimeAttachmentMetadataStore(
         IOptions<MessageEvidenceOptions> evidence,
         IOptions<DataExportStorageOptions> export,
+        IOptions<AttachmentStorageOptions> attachments,
         ILogger<RealtimeAttachmentMetadataStore> logger)
     {
         _evidence = evidence.Value;
         _export = export.Value;
+        _attachments = attachments.Value;
         _logger = logger;
     }
 
@@ -36,7 +41,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             ? string.Empty
             : "未配置 MessageEvidence:RealtimeConnectionString / DataExport:RealtimeConnectionString";
 
-    public async Task InsertTicketedAsync(
+    public async Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
         string attachmentId,
         long uploaderUserId,
         string objectKey,
@@ -47,39 +52,113 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         string? clientAttachmentId = null,
         CancellationToken cancellationToken = default)
     {
+        if (sizeBytes <= 0 || sizeBytes > _attachments.MaxBytes)
+            throw new ArgumentOutOfRangeException(nameof(sizeBytes));
+
         var cs = RequireConnectionString();
         var table = TableSql();
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        // PUT 预签名不能约束实际 Content-Length；Ticketed 按单对象上限预留，
+        // 上传后再收敛为实际大小，避免客户端用小声明绕过总字节配额。
+        var reservationBytes = _attachments.MaxBytes;
 
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var cmd = new NpgsqlCommand(
-            $"""
-             INSERT INTO {table} (
-                 attachment_id, uploader_user_id, object_key, public_url,
-                 content_type, size_bytes, original_name, status,
-                 message_id, conversation_id, client_attachment_id,
-                 created_at_ms, confirmed_at_ms, bound_at_ms)
-             VALUES (
-                 @id, @uid, @key, @url,
-                 @ct, @size, @name, @status,
-                 NULL, NULL, @clientId,
-                 @created, NULL, NULL)
-             ON CONFLICT (attachment_id) DO NOTHING
-             """, conn);
+        await using var transaction = await conn.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-        cmd.Parameters.AddWithValue("id", attachmentId);
-        cmd.Parameters.AddWithValue("uid", uploaderUserId);
-        cmd.Parameters.AddWithValue("key", objectKey);
-        cmd.Parameters.AddWithValue("url", (object?)publicUrl ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("ct", contentType);
-        cmd.Parameters.AddWithValue("size", sizeBytes);
-        cmd.Parameters.AddWithValue("name", (object?)originalName ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("status", (short)AttachmentStatus.Ticketed);
-        cmd.Parameters.AddWithValue("clientId", (object?)clientAttachmentId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("created", nowMs);
+        // 必须先在独立语句中等待用户锁。若把锁放进后续 CTE，READ COMMITTED
+        // 会在等待前取得旧快照，两个实例仍可能同时通过配额检查。
+        await using (var quotaLock = new NpgsqlCommand(
+                         "SELECT pg_advisory_xact_lock(@lockKey)",
+                         conn,
+                         transaction))
+        {
+            quotaLock.Parameters.AddWithValue(
+                "lockKey",
+                AttachmentQuotaLockNamespace ^ uploaderUserId);
+            await quotaLock.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
 
-        await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        long unconfirmedCount;
+        long activeBytes;
+        bool inserted;
+
+        await using (var cmd = new NpgsqlCommand(
+                         $"""
+                          WITH usage AS MATERIALIZED (
+                              SELECT
+                                  COUNT(*) FILTER (
+                                      WHERE status IN (@ticketed, @uploaded, @scanning)
+                                  )::bigint AS unconfirmed_count,
+                                  COALESCE(SUM(size_bytes) FILTER (
+                                      WHERE status IN (
+                                          @ticketed, @uploaded, @scanning, @confirmed, @bound)
+                                  ), 0)::bigint AS active_bytes
+                              FROM {table}
+                              WHERE uploader_user_id = @uid
+                          ),
+                          inserted AS (
+                              INSERT INTO {table} (
+                                  attachment_id, uploader_user_id, object_key, public_url,
+                                  content_type, size_bytes, original_name, status,
+                                  message_id, conversation_id, client_attachment_id,
+                                  created_at_ms, confirmed_at_ms, bound_at_ms)
+                              SELECT
+                                  @id, @uid, @key, @url,
+                                  @ct, @reservationBytes, @name, @ticketed,
+                                  NULL, NULL, @clientId,
+                                  @created, NULL, NULL
+                              FROM usage
+                              WHERE unconfirmed_count < @maxUnconfirmed
+                                AND active_bytes <= @maxStorageBytes - @reservationBytes
+                              ON CONFLICT (attachment_id) DO NOTHING
+                              RETURNING 1
+                          )
+                          SELECT
+                              usage.unconfirmed_count,
+                              usage.active_bytes,
+                              EXISTS (SELECT 1 FROM inserted)
+                          FROM usage
+                          """,
+                         conn,
+                         transaction))
+        {
+            cmd.Parameters.AddWithValue("id", attachmentId);
+            cmd.Parameters.AddWithValue("uid", uploaderUserId);
+            cmd.Parameters.AddWithValue("key", objectKey);
+            cmd.Parameters.AddWithValue("url", (object?)publicUrl ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("ct", contentType);
+            cmd.Parameters.AddWithValue("reservationBytes", reservationBytes);
+            cmd.Parameters.AddWithValue("name", (object?)originalName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+            cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+            cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+            cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+            cmd.Parameters.AddWithValue("bound", (short)AttachmentStatus.Bound);
+            cmd.Parameters.AddWithValue("clientId", (object?)clientAttachmentId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("created", nowMs);
+            cmd.Parameters.AddWithValue("maxUnconfirmed", _attachments.MaxUnconfirmedObjectsPerUser);
+            cmd.Parameters.AddWithValue("maxStorageBytes", _attachments.MaxStorageBytesPerUser);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("附件配额查询未返回结果");
+
+            unconfirmedCount = reader.GetInt64(0);
+            activeBytes = reader.GetInt64(1);
+            inserted = reader.GetBoolean(2);
+        }
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+        if (inserted)
+            return AttachmentUploadReservationStatus.Reserved;
+        if (unconfirmedCount >= _attachments.MaxUnconfirmedObjectsPerUser)
+            return AttachmentUploadReservationStatus.UnconfirmedObjectLimitExceeded;
+        if (activeBytes > _attachments.MaxStorageBytesPerUser - reservationBytes)
+            return AttachmentUploadReservationStatus.StorageBytesLimitExceeded;
+
+        throw new InvalidOperationException($"附件上传预留冲突。AttachmentId={attachmentId}");
     }
 
     public async Task ConfirmAsync(

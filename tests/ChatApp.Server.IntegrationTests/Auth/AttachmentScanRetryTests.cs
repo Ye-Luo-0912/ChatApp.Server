@@ -94,6 +94,36 @@ public sealed class AttachmentScanRetryTests
     }
 
     [Fact]
+    public async Task RenewLease_ReturnsExplicitFencedOutcome()
+    {
+        await using var db = CreateDb();
+        var storage = new MemoryAttachmentStorage();
+        var meta = new RecordingMetadataStore();
+        var svc = CreateService(db, storage, meta, new DenyListAttachmentContentScanner());
+        var job = new AttachmentScanJob
+        {
+            AttachmentId = "att-renew",
+            ObjectKey = "u/1/renew.bin",
+            UserId = 9,
+            ContentType = "application/octet-stream",
+            SizeBytes = 1,
+            Status = AttachmentScanJobStatus.Processing,
+            LeaseOwner = "owner",
+            LeaseToken = "token",
+            LeaseExpiresAt = DateTimeOffset.UtcNow.AddMinutes(1),
+        };
+        db.AttachmentScanJobs.Add(job);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(
+            LeaseRenewalResult.Renewed,
+            await svc.RenewLeaseAsync(job.Id, "owner", "token"));
+        Assert.Equal(
+            LeaseRenewalResult.LeaseLost,
+            await svc.RenewLeaseAsync(job.Id, "owner", "different-token"));
+    }
+
+    [Fact]
     public async Task ProjectionFailure_RetriesWithoutRescanning()
     {
         await using var db = CreateDb();
@@ -140,6 +170,52 @@ public sealed class AttachmentScanRetryTests
         Assert.Equal(0, done.AttemptCount);
         Assert.Contains("att-bad", meta.Rejected);
         Assert.Empty(meta.Confirmed);
+    }
+
+    [Fact]
+    public async Task ConfirmedProjection_PromotesTheExactScannedEntityTag()
+    {
+        await using var db = CreateDb();
+        var storage = new FinalizingMemoryAttachmentStorage();
+        const string sourceKey = "u/9/staging/promote.bin";
+        storage.Put(sourceKey, "immutable-after-scan"u8.ToArray());
+        var metadata = new RecordingMetadataStore();
+        var svc = CreateService(
+            db, storage, metadata, new DenyListAttachmentContentScanner());
+
+        await svc.EnqueueAsync(
+            "att-promote", 9, sourceKey, "application/octet-stream", "promote.bin", 20);
+
+        Assert.Equal(1, await svc.ProcessDueAsync());
+        Assert.Equal(storage.EntityTagFor(sourceKey), storage.FinalizedEntityTag);
+        Assert.Equal(
+            "u/9/confirmed/att-promote",
+            Assert.Single(metadata.ConfirmedObjectKeys));
+    }
+
+    [Fact]
+    public async Task SourceMutationAfterScan_PreventsConfirmation()
+    {
+        await using var db = CreateDb();
+        var storage = new FinalizingMemoryAttachmentStorage();
+        const string sourceKey = "u/9/staging/mutable.bin";
+        storage.Put(sourceKey, "scanned-content"u8.ToArray());
+        var metadata = new RecordingMetadataStore();
+        var scanner = new MutatingAllowScanner(
+            () => storage.Put(sourceKey, "changed-after-read"u8.ToArray()));
+        var svc = CreateService(db, storage, metadata, scanner);
+
+        await svc.EnqueueAsync(
+            "att-mutable", 9, sourceKey, "application/octet-stream", "mutable.bin", 15);
+
+        Assert.Equal(0, await svc.ProcessDueAsync());
+        Assert.Empty(metadata.Confirmed);
+        Assert.Empty(metadata.ConfirmedObjectKeys);
+        var job = await db.AttachmentScanJobs.SingleAsync();
+        var projection = await db.AttachmentScanProjections.SingleAsync();
+        Assert.Equal(AttachmentScanJobStatus.Finalizing, job.Status);
+        Assert.Equal(AttachmentScanProjectionStatus.Pending, projection.Status);
+        Assert.Equal(1, projection.AttemptCount);
     }
 
     private static AttachmentScanService CreateService(
@@ -205,6 +281,7 @@ public sealed class AttachmentScanRetryTests
             string? originalName,
             CancellationToken cancellationToken = default)
         {
+
             _calls++;
             if (_calls <= failTransientUntil)
                 return Task.FromResult(AttachmentContentScanResult.TransientFail("scanner_overloaded"));
@@ -212,10 +289,26 @@ public sealed class AttachmentScanRetryTests
         }
     }
 
-    private sealed class MemoryAttachmentStorage : IAttachmentStorage
+    private sealed class MutatingAllowScanner(Action mutate) : IAttachmentContentScanner
     {
-        private readonly Dictionary<string, byte[]> _files = new(StringComparer.Ordinal);
-        public void Put(string key, byte[] bytes) => _files[key] = bytes;
+        public Task<AttachmentContentScanResult> ScanAsync(
+            Stream content,
+            string? sniffedContentType,
+            string? originalName,
+            CancellationToken cancellationToken = default)
+        {
+            mutate();
+            return Task.FromResult(AttachmentContentScanResult.Allow());
+        }
+    }
+
+    private class MemoryAttachmentStorage : IAttachmentStorage
+    {
+        protected readonly Dictionary<string, byte[]> Files = new(StringComparer.Ordinal);
+        public string EntityTagFor(string key) => ComputeEntityTag(Files[key]);
+        protected static string ComputeEntityTag(byte[] bytes) =>
+            $"\"{Convert.ToHexString(SHA256.HashData(bytes))}\"";
+        public void Put(string key, byte[] bytes) => Files[key] = bytes;
 
         public bool IsAllowedContentType(string contentType) => true;
         public long MaxBytes => 1024 * 1024;
@@ -226,6 +319,9 @@ public sealed class AttachmentScanRetryTests
                 string? originalName = null, string? clientAttachmentId = null,
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
+
+        public Task CancelUploadTicketAsync(string ticket, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
 
         public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)>
             StoreAsync(long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
@@ -241,10 +337,11 @@ public sealed class AttachmentScanRetryTests
 
         public Task<AttachmentReadResult?> OpenReadAsync(string objectKey, CancellationToken cancellationToken = default)
         {
-            if (!_files.TryGetValue(objectKey, out var bytes))
+            if (!Files.TryGetValue(objectKey, out var bytes))
                 return Task.FromResult<AttachmentReadResult?>(null);
             return Task.FromResult<AttachmentReadResult?>(
-                new AttachmentReadResult(new MemoryStream(bytes), "application/octet-stream", bytes.Length, Path.GetFileName(objectKey)));
+                new AttachmentReadResult(new MemoryStream(bytes), "application/octet-stream", bytes.Length,
+                    Path.GetFileName(objectKey), ComputeEntityTag(bytes)));
         }
 
         public Task<AttachmentSignedUrl?> CreateSignedDownloadUrlAsync(
@@ -272,9 +369,34 @@ public sealed class AttachmentScanRetryTests
             long? userId = null,
             CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
-
         public Task<int> ProcessDueAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(0);
+    }
+
+    private sealed class FinalizingMemoryAttachmentStorage
+        : MemoryAttachmentStorage, IAttachmentScanFinalizer
+    {
+        public string? FinalizedEntityTag { get; private set; }
+
+        public Task<AttachmentFinalizedObject> FinalizeConfirmedAsync(
+            string attachmentId,
+            long userId,
+            string sourceObjectKey,
+            string? expectedEntityTag,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(expectedEntityTag)
+                || !Files.TryGetValue(sourceObjectKey, out var source)
+                || !string.Equals(
+                    ComputeEntityTag(source), expectedEntityTag, StringComparison.Ordinal))
+                throw new InvalidOperationException("source_changed_after_scan");
+
+            FinalizedEntityTag = expectedEntityTag;
+            var finalKey = $"u/{userId}/confirmed/{attachmentId}";
+            Files[finalKey] = source.ToArray();
+            return Task.FromResult(
+                new AttachmentFinalizedObject(finalKey, sourceObjectKey));
+        }
     }
 
     private sealed class RecordingMetadataStore : IAttachmentMetadataStore
@@ -282,15 +404,16 @@ public sealed class AttachmentScanRetryTests
         public List<string> Confirmed { get; } = [];
         public List<string> Rejected { get; } = [];
         public List<string> UploadedHashes { get; } = [];
+        public List<string> ConfirmedObjectKeys { get; } = [];
         public int RemainingConfirmFailures { get; set; }
         public bool IsAvailable => true;
         public string UnavailableReason => "";
 
-        public Task InsertTicketedAsync(
+        public Task<Core.Models.Attachment.AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
             string contentType, long sizeBytes, string? originalName, string? clientAttachmentId = null,
             CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+            => Task.FromResult(Core.Models.Attachment.AttachmentUploadReservationStatus.Reserved);
 
         public Task ConfirmAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
@@ -304,6 +427,7 @@ public sealed class AttachmentScanRetryTests
             }
 
             Confirmed.Add(attachmentId);
+            ConfirmedObjectKeys.Add(objectKey);
             return Task.CompletedTask;
         }
 

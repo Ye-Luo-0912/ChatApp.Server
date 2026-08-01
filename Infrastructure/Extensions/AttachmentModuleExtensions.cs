@@ -4,7 +4,6 @@ using Infrastructure.Services;
 using Infrastructure.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Extensions;
@@ -16,7 +15,8 @@ namespace Infrastructure.Extensions;
 public static class AttachmentModuleExtensions
 {
     /// <summary>注册附件与头像存储模块。</summary>
-    public static IServiceCollection AddAttachmentModule(this IServiceCollection services, IConfiguration config)
+    public static IServiceCollection AddAttachmentModule(this IServiceCollection services, IConfiguration config,
+        bool registerWorkerHostedServices)
     {
         services.AddValidatedOptions<AttachmentStorageOptions, AttachmentStorageOptionsValidator>(
             config, AttachmentStorageOptions.SectionName);
@@ -34,7 +34,8 @@ public static class AttachmentModuleExtensions
                 return ActivatorUtilities.CreateInstance<S3AvatarStorage>(sp);
             return ActivatorUtilities.CreateInstance<LocalAvatarStorage>(sp);
         });
-        services.AddHostedService<AvatarCleanupWorker>();
+        if (registerWorkerHostedServices)
+            services.AddHostedService<AvatarCleanupWorker>();
         services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
         services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
         services.AddScoped<AttachmentAbandonedAgeSweeper>();
@@ -67,18 +68,18 @@ public static class AttachmentModuleExtensions
             if (!string.IsNullOrWhiteSpace(export.RealtimeConnectionString)
                 || !string.IsNullOrWhiteSpace(evidence.RealtimeConnectionString))
             {
-                return new RealtimeAttachmentMetadataStore(
-                    sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
-                    sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
-                    sp.GetRequiredService<ILogger<RealtimeAttachmentMetadataStore>>());
+                return ActivatorUtilities.CreateInstance<RealtimeAttachmentMetadataStore>(sp);
             }
 
             return new UnavailableAttachmentMetadataStore();
         });
         services.AddScoped<IAttachmentService, AttachmentService>();
-        services.AddHostedService<AttachmentCleanupWorker>();
-        services.AddHostedService<AttachmentScanWorker>();
-        services.AddHostedService<AttachmentScanProjectionWorker>();
+        if (registerWorkerHostedServices)
+        {
+            services.AddHostedService<AttachmentCleanupWorker>();
+            services.AddHostedService<AttachmentScanWorker>();
+            services.AddHostedService<AttachmentScanProjectionWorker>();
+        }
         services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
 
         return services;

@@ -43,6 +43,11 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
+        if (_extra.TryGetValue("DatabasePool:Role", out var processRole)
+            && !string.IsNullOrWhiteSpace(processRole))
+        {
+            builder.UseSetting("DatabasePool:Role", processRole);
+        }
         builder.ConfigureAppConfiguration((_, config) =>
         {
             var values = new Dictionary<string, string?>

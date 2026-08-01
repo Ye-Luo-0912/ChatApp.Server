@@ -57,6 +57,7 @@ services:
     env_file:
       - .env
     environment:
+      DatabasePool__Role: Worker
       ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
       ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
       Security__SecretEncryptionKey: ${Security__SecretEncryptionKey:?Set Security__SecretEncryptionKey}
@@ -78,7 +79,6 @@ services:
     build:
       context: ..
       dockerfile: ChatApp.Server/Dockerfile
-    container_name: chatapp_api
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -86,9 +86,11 @@ services:
     volumes:
       - avatar_data:/app/App_Data/avatars
       - attachment_data:/app/App_Data/attachments
+      - export_data:/app/App_Data/exports
     env_file:
       - .env
     environment:
+      DatabasePool__Role: Api
       ASPNETCORE_URLS: http://0.0.0.0:8080
       EnableHttpsRedirection: "false"
       ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
@@ -99,6 +101,50 @@ services:
       EmailSettings__Password: ${EmailSettings__Password:?Set EmailSettings__Password}
       ForwardedHeaders__KnownNetworks__0: 172.28.0.0/16
       ForwardedHeaders__KnownProxies__0: 127.0.0.1
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres_db:
+        condition: service_healthy
+      garnet_cache:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf "GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          grep -q "200 OK" <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+    networks:
+      - chatapp_net
+
+  worker:
+    build:
+      context: ..
+      dockerfile: ChatApp.Server/Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - avatar_data:/app/App_Data/avatars
+      - attachment_data:/app/App_Data/attachments
+      - export_data:/app/App_Data/exports
+    env_file:
+      - .env
+    environment:
+      DatabasePool__Role: Worker
+      ASPNETCORE_URLS: http://127.0.0.1:8080
+      ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
+      ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      Security__SecretEncryptionKey: ${Security__SecretEncryptionKey:?Set Security__SecretEncryptionKey}
+      EmailSettings__Host: ${EmailSettings__Host:?Set EmailSettings__Host}
+      EmailSettings__SenderEmail: ${EmailSettings__SenderEmail:?Set EmailSettings__SenderEmail}
+      EmailSettings__Password: ${EmailSettings__Password:?Set EmailSettings__Password}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -150,6 +196,7 @@ volumes:
   garnet_data:
   avatar_data:
   attachment_data:
+  export_data:
 
 networks:
   chatapp_net:

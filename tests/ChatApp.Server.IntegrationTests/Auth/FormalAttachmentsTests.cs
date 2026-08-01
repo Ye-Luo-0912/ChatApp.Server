@@ -113,6 +113,61 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         Assert.Equal(payload.Length, reader.GetInt64(4));
     }
 
+    [SkippableFact]
+    public async Task Presign_StorageQuotaExceeded_DoesNotReturnUploadUrl()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
+
+        var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-quota-att", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(attachmentRoot);
+
+        await using var factory = new ChatAppWebApplicationFactory(
+            postgres.ConnectionString,
+            redis.ConnectionString,
+            extraConfig: new Dictionary<string, string?>
+            {
+                ["AttachmentStorage:Provider"] = "Local",
+                ["AttachmentStorage:LocalRootPath"] = attachmentRoot,
+                ["AttachmentStorage:MaxBytes"] = "1024",
+                ["AttachmentStorage:MaxUnconfirmedObjectsPerUser"] = "20",
+                ["AttachmentStorage:MaxStorageBytesPerUser"] = "1024",
+                ["AttachmentStorage:AllowedContentTypes:0"] = "application/octet-stream",
+                ["MessageEvidence:RealtimeConnectionString"] = postgres.ConnectionString,
+                ["MessageEvidence:Schema"] = "realtime",
+            });
+
+        using var client = factory.CreateClientWithDevice($"dev-quota-{Guid.NewGuid():N}"[..24]);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        await using (var db = postgres.CreateContext())
+        {
+            await WafTestHelpers.SeedUserAsync(db, $"quota-{suffix}", $"quota-{suffix}@ex.com", "Passw0rd!");
+        }
+
+        var login = await WafTestHelpers.LoginAsync(client, $"quota-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+
+        var first = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = 1,
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+
+        var denied = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = 1,
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.Conflict, denied.StatusCode);
+
+        using var body = JsonDocument.Parse(await denied.Content.ReadAsStringAsync());
+        Assert.Equal("AttachmentStorageQuotaExceeded", body.RootElement.GetProperty("code").GetString());
+        Assert.False(body.RootElement.TryGetProperty("uploadUrl", out _));
+    }
+
     [Fact]
     public async Task WriteChatExport_PrefersFormal_ThenLegacyParserDeduped()
     {
@@ -202,11 +257,11 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         public bool IsAvailable => true;
         public string UnavailableReason => string.Empty;
 
-        public Task InsertTicketedAsync(
+        public Task<Core.Models.Attachment.AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
             string contentType, long sizeBytes, string? originalName, string? clientAttachmentId = null,
             CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+            => Task.FromResult(Core.Models.Attachment.AttachmentUploadReservationStatus.Reserved);
 
         public Task ConfirmAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,

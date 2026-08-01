@@ -58,6 +58,60 @@ public sealed class AttachmentBlobDeleteTests
     }
 
     [Fact]
+    public async Task MaxAttempts_TransitionsToDeadLetter_InsteadOfInfinitePendingRetry()
+    {
+        await using var db = CreateDb();
+        var storage = new FlakyAttachmentStorage(failUntilAttempt: 99);
+        var svc = CreateService(db, storage, maxDeleteAttempts: 1);
+
+        await svc.EnqueueAsync(["user/1/dead-letter.png"], userId: 42);
+        Assert.Equal(0, await svc.ProcessDueAsync());
+
+        var job = await db.AttachmentBlobDeleteJobs.SingleAsync();
+        Assert.Equal(AttachmentBlobDeleteJobStatus.DeadLetter, job.Status);
+        Assert.Equal(1, job.AttemptCount);
+        Assert.NotNull(job.CompletedAt);
+        Assert.False(string.IsNullOrWhiteSpace(job.LastError));
+
+        job.NextAttemptAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Equal(0, await svc.ProcessDueAsync());
+        Assert.Single(storage.DeleteCalls);
+    }
+
+    [Fact]
+    public async Task ProcessingLease_PreventsSecondActiveTombstone_AndFencesStaleCompletion()
+    {
+        await using var db = CreateDb();
+        var storage = new FlakyAttachmentStorage(failUntilAttempt: 0);
+        var svc = CreateService(db, storage);
+
+        await svc.EnqueueAsync(["user/1/leased.png"], userId: 42);
+        var claimed = Assert.Single(await svc.ClaimDueJobsAsync(1));
+        await svc.EnqueueAsync(["user/1/leased.png"], userId: 42);
+        Assert.Single(await db.AttachmentBlobDeleteJobs.ToListAsync());
+
+        var stale = new AttachmentBlobDeleteJob
+        {
+            Id = claimed.Id,
+            ObjectKey = claimed.ObjectKey,
+            AttemptCount = claimed.AttemptCount,
+            NextAttemptAt = claimed.NextAttemptAt,
+            LeaseOwner = claimed.LeaseOwner,
+            LeaseToken = claimed.LeaseToken,
+        };
+        var current = await db.AttachmentBlobDeleteJobs.SingleAsync();
+        current.LeaseToken = Guid.NewGuid().ToString("N");
+        await db.SaveChangesAsync();
+
+        Assert.False(await svc.ProcessClaimedJobAsync(stale));
+        var after = await db.AttachmentBlobDeleteJobs.SingleAsync();
+        Assert.Equal(AttachmentBlobDeleteJobStatus.Processing, after.Status);
+        Assert.NotEqual(stale.LeaseToken, after.LeaseToken);
+    }
+
+
+    [Fact]
     public async Task AbandonedPng_Orphan_CleanedViaJob()
     {
         var root = Path.Combine(Path.GetTempPath(), "chatapp-att-orphan", Guid.NewGuid().ToString("N"));
@@ -87,13 +141,16 @@ public sealed class AttachmentBlobDeleteTests
             (await db.AttachmentBlobDeleteJobs.SingleAsync()).Status);
     }
 
-    private static AttachmentBlobDeleteService CreateService(UserDbContext db, IAttachmentStorage storage)
+    private static AttachmentBlobDeleteService CreateService(
+        UserDbContext db,
+        IAttachmentStorage storage,
+        int maxDeleteAttempts = 20)
         => new(
             db,
             storage,
             Options.Create(new AttachmentStorageOptions
             {
-                MaxDeleteAttempts = 20,
+                MaxDeleteAttempts = maxDeleteAttempts,
                 DeleteBackoffSeconds = 1,
                 DeleteBatchSize = 50,
             }),
@@ -121,6 +178,9 @@ public sealed class AttachmentBlobDeleteTests
                 string? originalName = null, string? clientAttachmentId = null,
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
+
+        public Task CancelUploadTicketAsync(string ticket, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
 
         public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)> StoreAsync(
             long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
