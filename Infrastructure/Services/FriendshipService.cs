@@ -39,13 +39,16 @@ public class FriendshipService(
     UserDbContext context,
     IDerivedCache cacheService,
     ILogger<FriendshipService> logger,
-    ISecurityNotificationService? securityNotifications = null)
+    ISecurityNotificationService? securityNotifications = null,
+    ICacheValueStore? presenceCache = null,
+    IAtomicCacheStore? presenceAtomicCache = null)
     : IFriendshipService
 {
     private const string RelationshipCacheKey = "Relationship_{0}_{1}"; // {userId1}_{userId2}
 
     private const int DefaultPageLimit = 50;
     private const int MaxPageLimit = 100;
+    private const int MaxFriendGroups = 100;
 
 
     private readonly ILogger<FriendshipService> _logger = logger;
@@ -149,6 +152,56 @@ public class FriendshipService(
         !string.IsNullOrWhiteSpace(note)
         && note.Trim().Length <= FriendshipInputLimits.FriendNoteMaxLength;
 
+    private async Task<PairRelationshipState> LoadPairRelationshipStateAsync(
+        long userAId, long userBId, CancellationToken ct)
+    {
+        var friendshipRows = await context.Friendships
+            .IgnoreQueryFilters()
+            .Where(f => (f.UserId == userAId && f.FriendId == userBId)
+                        || (f.UserId == userBId && f.FriendId == userAId))
+            .Select(f => new { f.UserId, f.FriendId, f.IsDeleted })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var blockRows = await context.BlockRecords.AsNoTracking()
+            .Where(b => (b.BlockerId == userAId && b.BlockedUserId == userBId)
+                        || (b.BlockerId == userBId && b.BlockedUserId == userAId))
+            .Select(b => new { b.BlockerId, b.BlockedUserId })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var pendingRows = await context.FriendRequests.AsNoTracking()
+            .Where(r => r.Status == RequestStatus.Pending
+                        && ((r.RequesterId == userAId && r.TargetUserId == userBId)
+                            || (r.RequesterId == userBId && r.TargetUserId == userAId)))
+            .Select(r => new { r.RequesterId, r.TargetUserId })
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var pending = pendingRows.Any(r => r.RequesterId == userAId)
+            ? PairRequestDirection.AToB
+            : pendingRows.Any(r => r.RequesterId == userBId)
+                ? PairRequestDirection.BToA
+                : PairRequestDirection.None;
+
+        return new PairRelationshipState
+        {
+            UserAId = userAId,
+            UserBId = userBId,
+            AHasB = friendshipRows.Any(f => f.UserId == userAId
+                                             && f.FriendId == userBId
+                                             && !f.IsDeleted),
+            BHasA = friendshipRows.Any(f => f.UserId == userBId
+                                             && f.FriendId == userAId
+                                             && !f.IsDeleted),
+            ABlocksB = blockRows.Any(b => b.BlockerId == userAId
+                                          && b.BlockedUserId == userBId),
+            BBlocksA = blockRows.Any(b => b.BlockerId == userBId
+                                          && b.BlockedUserId == userAId),
+            PendingDirection = pending,
+        };
+    }
+
     /// <summary>
     /// 发送好友请求
     /// </summary>
@@ -196,48 +249,28 @@ public class FriendshipService(
                     FriendshipOperationResultErrorCode.ValidationFailed,
                     "目标账户不可用");
 
-            var blockedEitherDirection = await context.BlockRecords.AsNoTracking()
-                .AnyAsync(b => (b.BlockerId == requesterId && b.BlockedUserId == targetUserId)
-                            || (b.BlockerId == targetUserId && b.BlockedUserId == requesterId), ct)
+            var pair = await LoadPairRelationshipStateAsync(requesterId, targetUserId, ct)
                 .ConfigureAwait(false);
-            if (blockedEitherDirection)
+            if (pair.IsBlocked)
                 return SendFriendRequestResult.Failed(
                     FriendshipOperationResultErrorCode.RequestAlreadyBlocked,
                     "存在拉黑关系，无法发送好友申请");
 
             if (targetUser.FriendRequestPolicy == FriendRequestPolicy.NoStrangers)
             {
-                var alreadyFriends = await context.Friendships.AsNoTracking()
-                    .AnyAsync(f => f.UserId == targetUserId && f.FriendId == requesterId && !f.IsDeleted, ct)
-                    .ConfigureAwait(false);
-                if (!alreadyFriends)
+                if (!pair.AHasB && !pair.BHasA)
                     return SendFriendRequestResult.Failed(
                         FriendshipOperationResultErrorCode.FriendRequestRejectedByPrivacy,
                         "对方不允许陌生人添加好友");
             }
 
-            var relationships = await context.Friendships
-                .IgnoreQueryFilters()
-                .Where(f => (f.UserId == requesterId && f.FriendId == targetUserId) ||
-                            (f.UserId == targetUserId && f.FriendId == requesterId))
-                .ToListAsync(ct)
-                .ConfigureAwait(false);
-
-            var requesterRecord = relationships.FirstOrDefault(f => f.UserId == requesterId);
-            var targetRecord = relationships.FirstOrDefault(f => f.UserId == targetUserId);
-
-            if (requesterRecord is { IsDeleted: false })
+            if (pair.IsMutualFriendship)
                 return SendFriendRequestResult.Failed(
                     FriendshipOperationResultErrorCode.FriendshipAlreadyExists,
                     "你们已经是好友了");
 
             SendFriendRequestResult result;
-            var incomingRequest = await context.FriendRequests
-                .AnyAsync(r =>
-                    r.RequesterId == targetUserId &&
-                    r.TargetUserId == requesterId &&
-                    r.Status == RequestStatus.Pending, ct)
-                .ConfigureAwait(false);
+            var incomingRequest = pair.PendingDirection == PairRequestDirection.BToA;
 
             if (incomingRequest)
             {
@@ -250,9 +283,9 @@ public class FriendshipService(
                         "对方已请求添加，已自动成为好友",
                         acceptResult.Data);
             }
-            else if (requesterRecord is { IsDeleted: true } && targetRecord is { IsDeleted: false })
+            else if (pair.AHasB || pair.BHasA)
             {
-                result = await RestoreFriendshipAsync(requesterRecord, ct)
+                result = await RestorePairFriendshipAsync(requesterId, targetUserId, ct)
                     .ConfigureAwait(false);
             }
             else if (targetUser.FriendRequestPolicy == FriendRequestPolicy.Everyone)
@@ -299,6 +332,32 @@ public class FriendshipService(
     /// <param name="targetUserId">目标用户的ID</param>
     /// <param name="ct">用于取消操作的CancellationToken</param>
     /// <returns>返回恢复好友关系的结果，包含操作是否成功、错误码及消息等信息</returns>
+    private async Task<SendFriendRequestResult> RestorePairFriendshipAsync(
+        long requesterId, long targetUserId, CancellationToken ct)
+    {
+        var (_, requesterRecord) = await EnsureMutualRowsAsync(targetUserId, requesterId, ct)
+            .ConfigureAwait(false);
+        await context.Entry(requesterRecord)
+            .Reference(f => f.Friend)
+            .LoadAsync(ct)
+            .ConfigureAwait(false);
+        await context.SaveChangesAsync(ct).ConfigureAwait(false);
+
+        return SendFriendRequestResult.Success(
+            SendFriendRequestOutcome.FriendshipRestored,
+            "成功恢复好友关系",
+            new FriendDto
+            {
+                FriendId = requesterRecord.FriendId,
+                FriendName = requesterRecord.Friend?.UserName,
+                AvatarUrl = requesterRecord.Friend?.AvatarUrl,
+                GroupId = requesterRecord.GroupId,
+                GroupName = requesterRecord.Group?.GroupName,
+                CreatedAt = requesterRecord.CreatedAt,
+                Note = requesterRecord.Note,
+            });
+    }
+
     private async Task<SendFriendRequestResult> RestoreFriendshipAsync(
         UserFriendEntry requesterRecord, CancellationToken ct)
     {
@@ -394,7 +453,7 @@ public class FriendshipService(
     /// Presence 另走数据库权威查询，此缓存仅服务可重建的非授权读取。
     /// 此处使用独立 500ms 短超时，不传播 OperationCanceledException（视为缓存清理失败，仅记日志）。
     /// </remarks>
-    private async Task SafeClearCacheAsync(long userId1, long userId2)
+    private async Task SafeClearCacheAsync(long userId1, long userId2, bool? blocked = null)
     {
         using var cleanupCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
         try
@@ -414,6 +473,40 @@ public class FriendshipService(
         {
             _logger.LogWarning(ex, "缓存清理失败，UserId1={UserId1}, UserId2={UserId2}",
                 userId1, userId2);
+        }
+
+        // Presence authorization has a separate fail-closed projection.  Its
+        // relationship epoch is the correctness fence after every committed
+        // relationship write; block writes additionally install a deny
+        // marker before removing the old allow decision.
+        if (presenceCache is null)
+            return;
+
+        try
+        {
+            await PresenceAuthorizationCache.InvalidatePairAsync(
+                    presenceCache,
+                    presenceAtomicCache,
+                    userId1,
+                    userId2,
+                    blocked,
+                    cleanupCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cleanupCts.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Presence 授权缓存失效超过独立 500ms 预算，UserId1={UserId1}, UserId2={UserId2}",
+                userId1,
+                userId2);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Presence 授权缓存失效失败，UserId1={UserId1}, UserId2={UserId2}",
+                userId1,
+                userId2);
         }
     }
 
@@ -586,7 +679,11 @@ public class FriendshipService(
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
 
-            await SafeClearCacheAsync(declinerId, requesterId).ConfigureAwait(false);
+            await SafeClearCacheAsync(
+                    declinerId,
+                    requesterId,
+                    blockAfterDecline ? true : null)
+                .ConfigureAwait(false);
             return FriendshipOperationResult.Success(request.RequesterId.ToString());
         }
         catch (OperationCanceledException)
@@ -716,7 +813,7 @@ public class FriendshipService(
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
-            await SafeClearCacheAsync(blockerId, targetUserId).ConfigureAwait(false);
+            await SafeClearCacheAsync(blockerId, targetUserId, blocked: true).ConfigureAwait(false);
             return FriendshipOperationResult.Success();
         }
         catch (OperationCanceledException)
@@ -770,7 +867,7 @@ public class FriendshipService(
 
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
-            await SafeClearCacheAsync(unblockerId, targetUserId).ConfigureAwait(false);
+            await SafeClearCacheAsync(unblockerId, targetUserId, blocked: false).ConfigureAwait(false);
             return FriendshipOperationResult.Success();
         }
         catch (OperationCanceledException)
@@ -808,19 +905,21 @@ public class FriendshipService(
 
         try
         {
-            var myRecord = await context.Friendships
-                .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
+            var pair = await LoadPairRelationshipStateAsync(userId, friendId, ct)
                 .ConfigureAwait(false);
-
-            if (myRecord == null)
+            if (!pair.AHasB)
                 return FriendshipOperationResult.Failed(
                     FriendshipOperationResultErrorCode.FriendshipNotFound,
                     "未找到对应的好友关系");
 
-            var friendRecord = await context.Friendships
+            var rows = await context.Friendships
                 .IgnoreQueryFilters()
-                .FirstOrDefaultAsync(f => f.UserId == friendId && f.FriendId == userId, ct)
+                .Where(f => (f.UserId == userId && f.FriendId == friendId)
+                            || (f.UserId == friendId && f.FriendId == userId))
+                .ToListAsync(ct)
                 .ConfigureAwait(false);
+            var myRecord = rows.First(f => f.UserId == userId && f.FriendId == friendId);
+            var friendRecord = rows.FirstOrDefault(f => f.UserId == friendId && f.FriendId == userId);
 
             if (friendRecord is { IsDeleted: true })
             {
@@ -866,7 +965,11 @@ public class FriendshipService(
         var cursorId = ParseCursor(cursor);
 
         var query = context.Friendships
-            .Where(f => f.UserId == userId);
+            .Where(f => f.UserId == userId
+                        && context.Friendships.Any(reverse =>
+                            reverse.UserId == f.FriendId
+                            && reverse.FriendId == userId
+                            && !reverse.IsDeleted));
 
         if (cursorId.HasValue)
             query = query.Where(f => f.FriendId > cursorId.Value);
@@ -1120,27 +1223,39 @@ public class FriendshipService(
                 $"好友备注不能超过 {FriendshipInputLimits.FriendNoteMaxLength} 个字符");
 
         var normalizedNote = note.Trim();
-
-        var friendship = await context.Friendships
-            .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId && !f.IsDeleted, ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(userId, friendId, ct)
             .ConfigureAwait(false);
-
-        if (friendship == null)
-            return FriendshipOperationResult.Failed(
-                FriendshipOperationResultErrorCode.FriendshipNotFound,
-                "未找到好友关系");
 
         try
         {
+            var pair = await LoadPairRelationshipStateAsync(userId, friendId, ct)
+                .ConfigureAwait(false);
+            if (!pair.IsMutualFriendship)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到好友关系");
+
+            var friendship = await context.Friendships
+                .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
+                .ConfigureAwait(false);
+            if (friendship is null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到好友关系");
+
             friendship.Note = normalizedNote;
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(userId, friendId).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "更新好友备注失败，UserId={UserId}, FriendId={FriendId}",
                 userId, friendId);
             return FriendshipOperationResult.Failed(
@@ -1162,31 +1277,47 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> AssignFriendToGroupAsync(
         long userId, long friendId, int groupId, CancellationToken ct = default)
     {
-        var groupExists = await context.FriendGroups
-            .AnyAsync(g => g.GroupId == groupId && g.UserId == userId, ct)
+        await using var transaction = await BeginPairWriteTransactionAsync(userId, friendId, ct)
             .ConfigureAwait(false);
-
-        if (!groupExists)
-            return FriendshipOperationResult.Failed(FriendshipOperationResultErrorCode.FriendGroupNotFound, "未找到好友分组");
-
-        var friendship = await context.Friendships
-            .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId && !f.IsDeleted, ct)
-            .ConfigureAwait(false);
-
-        if (friendship == null)
-            return FriendshipOperationResult.Failed(FriendshipOperationResultErrorCode.FriendshipNotFound, "未找到好友关系");
 
         try
         {
+            var groupExists = await context.FriendGroups
+                .AnyAsync(g => g.GroupId == groupId && g.UserId == userId, ct)
+                .ConfigureAwait(false);
+            if (!groupExists)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendGroupNotFound,
+                    "未找到好友分组");
+
+            var pair = await LoadPairRelationshipStateAsync(userId, friendId, ct)
+                .ConfigureAwait(false);
+            if (!pair.IsMutualFriendship)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到好友关系");
+
+            var friendship = await context.Friendships
+                .FirstOrDefaultAsync(f => f.UserId == userId && f.FriendId == friendId, ct)
+                .ConfigureAwait(false);
+            if (friendship is null)
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.FriendshipNotFound,
+                    "未找到好友关系");
+
             friendship.GroupId = groupId;
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await SafeClearCacheAsync(userId, friendId).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
+            await transaction.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "分配好友到分组失败，UserId={UserId}, FriendId={FriendId}, GroupId={GroupId}",
                 userId, friendId, groupId);
             return FriendshipOperationResult.Failed(FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
@@ -1203,40 +1334,58 @@ public class FriendshipService(
             return FriendshipOperationResult<FriendGroupDto>.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed, "分组名称不能为空");
 
-        if (await context.FriendGroups.AnyAsync(g => g.UserId == userId && g.GroupName == name, ct))
-            return FriendshipOperationResult<FriendGroupDto>.Failed(
-                FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
-
-        var maxSort = await context.FriendGroups
-            .Where(g => g.UserId == userId)
-            .Select(g => (int?)g.SortOrder)
-            .MaxAsync(ct)
-            .ConfigureAwait(false) ?? -1;
-
-        var group = new FriendGroup
-        {
-            UserId = userId,
-            GroupName = name,
-            CreatedAt = DateTime.UtcNow,
-            SortOrder = maxSort + 1,
-            IsDefault = false,
-        };
-
-        context.FriendGroups.Add(group);
+        await using var tx = await BeginPairWriteTransactionAsync(userId, userId, ct)
+            .ConfigureAwait(false);
+        FriendGroup? group = null;
         try
         {
+            var groupCount = await context.FriendGroups
+                .CountAsync(g => g.UserId == userId, ct)
+                .ConfigureAwait(false);
+            if (groupCount >= MaxFriendGroups)
+                return FriendshipOperationResult<FriendGroupDto>.Failed(
+                    FriendshipOperationResultErrorCode.ValidationFailed,
+                    $"好友分组数量不能超过 {MaxFriendGroups}");
+
+            if (await context.FriendGroups.AnyAsync(g => g.UserId == userId && g.GroupName == name, ct))
+                return FriendshipOperationResult<FriendGroupDto>.Failed(
+                    FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
+
+            var maxSort = await context.FriendGroups
+                .Where(g => g.UserId == userId)
+                .Select(g => (int?)g.SortOrder)
+                .MaxAsync(ct)
+                .ConfigureAwait(false) ?? -1;
+
+            group = new FriendGroup
+            {
+                UserId = userId,
+                GroupName = name,
+                CreatedAt = DateTime.UtcNow,
+                SortOrder = maxSort + 1,
+                IsDefault = false,
+            };
+
+            context.FriendGroups.Add(group);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await tx.RollbackAsync().ConfigureAwait(false);
+            throw;
         }
         catch (DbUpdateException ex) when (PostgresDbException.IsUniqueViolation(
                   ex, PostgresDbException.FriendGroupNameConstraint))
         {
+            await tx.RollbackAsync().ConfigureAwait(false);
             return FriendshipOperationResult<FriendGroupDto>.Failed(
                 FriendshipOperationResultErrorCode.FriendGroupNameConflict, "分组名称已存在");
         }
 
         return FriendshipOperationResult<FriendGroupDto>.Success(new FriendGroupDto
         {
-            GroupId = group.GroupId,
+            GroupId = group!.GroupId,
             GroupName = group.GroupName,
             CreatedAt = group.CreatedAt,
             MemberCount = 0,
@@ -1259,7 +1408,13 @@ public class FriendshipService(
                 SortOrder = g.SortOrder,
                 IsDefault = g.IsDefault,
                 MemberCount = context.Friendships.Count(f =>
-                    f.UserId == userId && f.GroupId == g.GroupId && !f.IsDeleted),
+                    f.UserId == userId
+                    && f.GroupId == g.GroupId
+                    && !f.IsDeleted
+                    && context.Friendships.Any(reverse =>
+                        reverse.UserId == f.FriendId
+                        && reverse.FriendId == userId
+                        && !reverse.IsDeleted)),
             })
             .ToListAsync(ct)
             .ConfigureAwait(false);
@@ -1284,9 +1439,16 @@ public class FriendshipService(
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.ValidationFailed, "分组列表不完整或不属于当前用户");
 
+        var groupById = groups.ToDictionary(g => g.GroupId);
+        if (groupById.Count != groupIdsInOrder.Count)
+            return FriendshipOperationResult.Failed(
+                FriendshipOperationResultErrorCode.ValidationFailed, "分组列表不能包含重复 ID");
+
         for (var i = 0; i < groupIdsInOrder.Count; i++)
         {
-            var g = groups.First(x => x.GroupId == groupIdsInOrder[i]);
+            if (!groupById.TryGetValue(groupIdsInOrder[i], out var g))
+                return FriendshipOperationResult.Failed(
+                    FriendshipOperationResultErrorCode.ValidationFailed, "分组列表不完整或不属于当前用户");
             g.SortOrder = i;
         }
 
@@ -1308,26 +1470,36 @@ public class FriendshipService(
     public async Task<FriendshipOperationResult> SetDefaultGroupAsync(
         long userId, int groupId, CancellationToken ct = default)
     {
-        var groups = await context.FriendGroups
-            .Where(g => g.UserId == userId)
-            .ToListAsync(ct)
+        await using var tx = await BeginPairWriteTransactionAsync(userId, userId, ct)
             .ConfigureAwait(false);
 
-        var target = groups.FirstOrDefault(g => g.GroupId == groupId);
+        var target = await context.FriendGroups.AsNoTracking()
+            .FirstOrDefaultAsync(g => g.UserId == userId && g.GroupId == groupId, ct)
+            .ConfigureAwait(false);
         if (target is null)
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.FriendGroupNotFound, "未找到好友分组");
 
-        foreach (var g in groups)
-            g.IsDefault = g.GroupId == groupId;
-
         try
         {
-            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            await context.FriendGroups
+                .Where(g => g.UserId == userId && g.IsDefault)
+                .ExecuteUpdateAsync(s => s.SetProperty(g => g.IsDefault, false), ct)
+                .ConfigureAwait(false);
+            await context.FriendGroups
+                .Where(g => g.UserId == userId && g.GroupId == groupId)
+                .ExecuteUpdateAsync(s => s.SetProperty(g => g.IsDefault, true), ct)
+                .ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException)
+        {
+            await tx.RollbackAsync().ConfigureAwait(false);
+            throw;
+        }
         catch (Exception ex)
         {
+            await tx.RollbackAsync().ConfigureAwait(false);
             _logger.LogError(ex, "设置默认分组失败 UserId={UserId}", userId);
             return FriendshipOperationResult.Failed(
                 FriendshipOperationResultErrorCode.InternalSystemError, "操作失败，请稍后重试");
@@ -1421,7 +1593,13 @@ public class FriendshipService(
         var cursorId = ParseCursor(cursor);
 
         var query = context.Friendships
-            .Where(f => f.UserId == userId && f.GroupId == groupId && !f.IsDeleted);
+            .Where(f => f.UserId == userId
+                        && f.GroupId == groupId
+                        && !f.IsDeleted
+                        && context.Friendships.Any(reverse =>
+                            reverse.UserId == f.FriendId
+                            && reverse.FriendId == userId
+                            && !reverse.IsDeleted));
 
         if (cursorId.HasValue)
             query = query.Where(f => f.FriendId > cursorId.Value);
@@ -1456,35 +1634,69 @@ public class FriendshipService(
             throw new ArgumentException("搜索关键词至少需要 2 个字符。");
 
         var pageSize = ClampLimit(limit);
-        var cursorId = ParseCursor(cursor);
+        var hasCursor = SearchCursor.TryDecode(cursor, out var searchCursor);
+        var normalizedTerm = searchTerm.Trim().ToUpperInvariant();
 
         // 对通配符做转义，避免用户输入 % 时把 Like 查询放大。  
         var safeSearchTerm = searchTerm.Replace("%", @"\%").Replace("_", @"\_");
         var cleanSearchTerm = $"%{safeSearchTerm}%";
 
         var query = context.Friendships
-            .Where(f => f.UserId == userId)
+            .Where(f => f.UserId == userId
+                        && context.Friendships.Any(reverse =>
+                            reverse.UserId == f.FriendId
+                            && reverse.FriendId == userId
+                            && !reverse.IsDeleted))
             .Where(f => EF.Functions.ILike(f.Friend!.UserName!, cleanSearchTerm) ||
                         EF.Functions.ILike(f.Note!, cleanSearchTerm));
 
-        if (cursorId.HasValue)
-            query = query.Where(f => f.FriendId > cursorId.Value);
+        var scored = query.Select(f => new
+        {
+            Friendship = f,
+            Score = f.Friend!.NormalizedUserName == normalizedTerm
+                ? 3
+                : f.Friend.NormalizedUserName != null
+                  && f.Friend.NormalizedUserName.StartsWith(normalizedTerm)
+                    ? 2
+                    : f.Note != null && f.Note.ToUpper().StartsWith(normalizedTerm)
+                        ? 2
+                        : 1,
+        });
+        if (hasCursor)
+        {
+            scored = scored.Where(x => x.Score < searchCursor.Score
+                                       || (x.Score == searchCursor.Score
+                                           && x.Friendship.FriendId > searchCursor.Id));
+        }
 
-        var items = await query
-            .OrderBy(f => f.FriendId)
-            .Select(f => new FriendSearchResultDto
+        var items = await scored
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => x.Friendship.FriendId)
+            .Select(x => new FriendSearchResultDto
             {
-                FriendId = f.FriendId,
-                FriendName = f.Friend!.UserName,
-                Note = f.Note,
-                LastInteractionAt = f.Friend!.LastLoginDate,
+                FriendId = x.Friendship.FriendId,
+                FriendName = x.Friendship.Friend!.UserName,
+                Note = x.Friendship.Note,
+                LastInteractionAt = x.Friendship.Friend!.LastLoginDate,
+                RelevanceScore = x.Score,
             })
             .Take(pageSize + 1)
             .AsNoTracking()
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        return BuildPage(items, pageSize, x => x.FriendId);
+        var hasMore = items.Count > pageSize;
+        if (hasMore)
+            items.RemoveAt(items.Count - 1);
+
+        return new CursorPage<FriendSearchResultDto>
+        {
+            Items = items,
+            HasMore = hasMore,
+            NextCursor = hasMore && items.Count > 0
+                ? new SearchCursor(items[^1].RelevanceScore, items[^1].FriendId).Encode()
+                : null,
+        };
     }
 
 

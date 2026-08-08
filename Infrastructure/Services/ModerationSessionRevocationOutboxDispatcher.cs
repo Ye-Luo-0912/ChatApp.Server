@@ -1,7 +1,10 @@
 using System.Globalization;
+using Core.Interfaces;
 using Core.Interfaces.Auth;
+using Core.Models.Export;
 using Core.Models.Security;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -18,7 +21,7 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
     string? ownerId = null,
     TimeSpan? leaseDuration = null,
     int maxAttempts = 8,
-    int batchSize = 16)
+    int batchSize = 16) : ILeasedJobStore<ModerationSessionRevocationOutboxItem>, IReclaimCountSource
 {
     public static readonly TimeSpan DefaultLeaseDuration = TimeSpan.FromMinutes(2);
 
@@ -26,8 +29,11 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
     private readonly TimeSpan _leaseDuration = leaseDuration ?? DefaultLeaseDuration;
     private readonly int _maxAttempts = Math.Max(1, maxAttempts);
     private readonly int _batchSize = Math.Max(1, batchSize);
+    private int _reclaimed;
 
     public string OwnerId => _ownerId;
+
+    public int MaxAttempts => _maxAttempts;
 
     public async Task<int> ReclaimExpiredLeasesAsync(CancellationToken cancellationToken = default)
     {
@@ -56,6 +62,7 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
 
         if (reclaimed > 0)
         {
+            Interlocked.Add(ref _reclaimed, reclaimed);
             logger.LogWarning(
                 "回收 {Count} 条过期审核会话撤销租约 Owner={OwnerId}",
                 reclaimed,
@@ -72,7 +79,6 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
         var now = DateTimeOffset.UtcNow;
-        var leaseToken = Guid.NewGuid().ToString("N");
         var leaseExpiresAt = now.Add(_leaseDuration);
         var claimLimit = Math.Clamp(maxItems ?? _batchSize, 1, _batchSize);
 
@@ -81,7 +87,7 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
                 UPDATE "T_ModerationSessionRevocationOutbox" AS o
                 SET "Status" = {(byte)ModerationSessionRevocationOutboxStatus.Processing},
                     "LeaseOwner" = {_ownerId},
-                    "LeaseToken" = {leaseToken},
+                    "LeaseToken" = md5(random()::text || clock_timestamp()::text || o."Id"::text),
                     "LeaseExpiresAt" = {leaseExpiresAt},
                     "UpdatedAt" = {now}
                 WHERE o."Id" IN (
@@ -107,39 +113,148 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
             .AsNoTracking()
             .Where(x => claimedIds.Contains(x.Id)
                         && x.Status == ModerationSessionRevocationOutboxStatus.Processing
-                        && x.LeaseOwner == _ownerId
-                        && x.LeaseToken == leaseToken)
+                        && x.LeaseOwner == _ownerId)
             .OrderBy(x => x.Id)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
     }
 
-    public async Task ProcessItemAsync(
+    /// <summary>
+    /// Shared leased-job store entry point. Reclaiming is part of claiming so
+    /// the worker does not need a second scheduler with a separate lease model.
+    /// </summary>
+    public async Task<IReadOnlyList<ModerationSessionRevocationOutboxItem>> ClaimAsync(
+        int maxCount,
+        CancellationToken cancellationToken = default)
+    {
+        await ReclaimExpiredLeasesAsync(cancellationToken).ConfigureAwait(false);
+        return await ClaimDueItemsAsync(maxCount, cancellationToken).ConfigureAwait(false);
+    }
+
+    public int ConsumeReclaimedCount()
+        => Interlocked.Exchange(ref _reclaimed, 0);
+
+    public async Task<LeaseRenewalResult> RenewAsync(
+        ModerationSessionRevocationOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var until = now.Add(_leaseDuration);
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            var updated = await db.ModerationSessionRevocationOutbox
+                .Where(x => x.Id == item.Id
+                            && x.Status == ModerationSessionRevocationOutboxStatus.Processing
+                            && x.LeaseOwner == _ownerId
+                            && x.LeaseToken == item.LeaseToken)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(x => x.LeaseExpiresAt, until)
+                        .SetProperty(x => x.UpdatedAt, now),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return updated == 1
+                ? LeaseRenewalResult.Renewed
+                : LeaseRenewalResult.LeaseLost;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "审核会话撤销租约续租失败 Id={Id}", item.Id);
+            return LeaseRenewalResult.TransientFailure;
+        }
+    }
+
+    /// <summary>
+    /// Performs only the Redis side effect. The executor owns the fenced
+    /// terminal write after this method returns.
+    /// </summary>
+    public async Task ExecuteClaimedAsync(
         ModerationSessionRevocationOutboxItem item,
         CancellationToken cancellationToken = default)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
 
+        if (!await IsStillCurrentBanAsync(db, item, cancellationToken).ConfigureAwait(false))
+        {
+            item.Status = ModerationSessionRevocationOutboxStatus.Skipped;
+            item.LastError = "Superseded security version or inactive ban";
+            return;
+        }
+
+        var sessions = scope.ServiceProvider.GetRequiredService<ISessionStore>();
+        await sessions.RevokeAllSessionsAsync(
+                item.UserId.ToString(CultureInfo.InvariantCulture),
+                cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<bool> CompleteAsync(
+        ModerationSessionRevocationOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+        return item.Status == ModerationSessionRevocationOutboxStatus.Skipped
+            ? await MarkSkippedAsync(db, item, cancellationToken).ConfigureAwait(false)
+            : await MarkCompletedAsync(db, item, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> RetryAsync(
+        ModerationSessionRevocationOutboxItem item,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+        return await MarkFailedAsync(db, item, error, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> DeadLetterAsync(
+        ModerationSessionRevocationOutboxItem item,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+        var now = DateTimeOffset.UtcNow;
+        var attempts = Math.Max(item.AttemptCount + 1, _maxAttempts);
+        var updated = await db.ModerationSessionRevocationOutbox
+            .Where(x => x.Id == item.Id
+                        && x.Status == ModerationSessionRevocationOutboxStatus.Processing
+                        && x.LeaseOwner == _ownerId
+                        && x.LeaseToken == item.LeaseToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, ModerationSessionRevocationOutboxStatus.Dead)
+                .SetProperty(x => x.AttemptCount, attempts)
+                .SetProperty(x => x.LastError, Truncate(error))
+                .SetProperty(x => x.NextAttemptAt, now)
+                .SetProperty(x => x.LeaseOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
+                .SetProperty(x => x.LeaseExpiresAt, (DateTimeOffset?)null)
+                .SetProperty(x => x.CompletedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+        return updated == 1;
+    }
+
+    public async Task ProcessItemAsync(
+        ModerationSessionRevocationOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
         try
         {
-            if (!await IsStillCurrentBanAsync(db, item, cancellationToken).ConfigureAwait(false))
-            {
-                await MarkSkippedAsync(db, item, cancellationToken).ConfigureAwait(false);
-                return;
-            }
-
-            var sessions = scope.ServiceProvider.GetRequiredService<ISessionStore>();
-            await sessions.RevokeAllSessionsAsync(
-                    item.UserId.ToString(CultureInfo.InvariantCulture),
-                    cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
-
-            await MarkCompletedAsync(db, item, cancellationToken).ConfigureAwait(false);
+            await ExecuteClaimedAsync(item, cancellationToken).ConfigureAwait(false);
+            await CompleteAsync(item, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await ReleaseLeaseAsync(db, item, CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
@@ -149,7 +264,7 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
                 "审核会话撤销 Outbox 处理失败 Id={Id} UserId={UserId}",
                 item.Id,
                 item.UserId);
-            await MarkFailedAsync(db, item, ex.Message, cancellationToken).ConfigureAwait(false);
+            await RetryAsync(item, ex.Message, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -174,13 +289,13 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
             .ConfigureAwait(false);
     }
 
-    private async Task MarkCompletedAsync(
+    private async Task<bool> MarkCompletedAsync(
         UserDbContext db,
         ModerationSessionRevocationOutboxItem item,
         CancellationToken cancellationToken)
     {
         var now = DateTimeOffset.UtcNow;
-        await db.ModerationSessionRevocationOutbox
+        var updated = await db.ModerationSessionRevocationOutbox
             .Where(x => x.Id == item.Id
                         && x.Status == ModerationSessionRevocationOutboxStatus.Processing
                         && x.LeaseOwner == _ownerId
@@ -194,9 +309,10 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
                 .SetProperty(x => x.CompletedAt, now)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
+        return updated == 1;
     }
 
-    private async Task MarkSkippedAsync(
+    private async Task<bool> MarkSkippedAsync(
         UserDbContext db,
         ModerationSessionRevocationOutboxItem item,
         CancellationToken cancellationToken)
@@ -224,9 +340,11 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
                 item.Id,
                 item.UserId);
         }
+
+        return skipped == 1;
     }
 
-    private async Task MarkFailedAsync(
+    private async Task<bool> MarkFailedAsync(
         UserDbContext db,
         ModerationSessionRevocationOutboxItem item,
         string error,
@@ -238,7 +356,7 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
         var nextAttemptAt = now.Add(ComputeBackoff(attempts));
         var message = error.Length <= 1000 ? error : error[..1000];
 
-        await db.ModerationSessionRevocationOutbox
+        var updated = await db.ModerationSessionRevocationOutbox
             .Where(x => x.Id == item.Id
                         && x.Status == ModerationSessionRevocationOutboxStatus.Processing
                         && x.LeaseOwner == _ownerId
@@ -257,35 +375,21 @@ public sealed class ModerationSessionRevocationOutboxDispatcher(
                 .SetProperty(x => x.LeaseExpiresAt, (DateTimeOffset?)null)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
-    }
-
-    private async Task ReleaseLeaseAsync(
-        UserDbContext db,
-        ModerationSessionRevocationOutboxItem item,
-        CancellationToken cancellationToken)
-    {
-        var now = DateTimeOffset.UtcNow;
-        await db.ModerationSessionRevocationOutbox
-            .Where(x => x.Id == item.Id
-                        && x.Status == ModerationSessionRevocationOutboxStatus.Processing
-                        && x.LeaseOwner == _ownerId
-                        && x.LeaseToken == item.LeaseToken)
-            .ExecuteUpdateAsync(setters => setters
-                .SetProperty(x => x.Status, ModerationSessionRevocationOutboxStatus.Pending)
-                .SetProperty(x => x.NextAttemptAt, now)
-                .SetProperty(x => x.LeaseOwner, (string?)null)
-                .SetProperty(x => x.LeaseToken, (string?)null)
-                .SetProperty(x => x.LeaseExpiresAt, (DateTimeOffset?)null)
-                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-            .ConfigureAwait(false);
+        return updated == 1;
     }
 
     private static TimeSpan ComputeBackoff(int attemptCount)
-        => TimeSpan.FromSeconds(Math.Min(300, Math.Pow(2, Math.Min(attemptCount - 1, 6)) * 5));
+        => LeasedJobBackoff.ExponentialWithJitter(
+            TimeSpan.FromSeconds(5),
+            attemptCount,
+            TimeSpan.FromMinutes(5));
 
     private static string CreateOwnerId()
     {
         var value = $"{Environment.MachineName}:{Guid.NewGuid():N}";
         return value[..Math.Min(128, value.Length)];
     }
+
+    private static string Truncate(string value)
+        => value.Length <= 1000 ? value : value[..1000];
 }

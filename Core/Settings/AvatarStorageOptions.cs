@@ -34,6 +34,15 @@ public sealed class AvatarStorageOptions
     /// <summary>等待重编码闸门超时（毫秒）；0 表示一直等到有空位。</summary>
     public int ReencodeAcquireTimeoutMilliseconds { get; set; } = 5_000;
 
+    /// <summary>头像 Finalization Saga 租约时长。</summary>
+    public int FinalizationLeaseSeconds { get; set; } = 120;
+
+    /// <summary>头像 Finalization Saga 轮询退避秒数。</summary>
+    public int FinalizationBackoffSeconds { get; set; } = 5;
+
+    /// <summary>头像 Finalization Saga 最大持久尝试次数。</summary>
+    public int MaxFinalizationAttempts { get; set; } = 5;
+
     /// <summary>SSE-S3 或 SSE-KMS；Provider=S3 时必须启用。</summary>
     public string S3SseMode { get; set; } = "SSE-S3";
 

@@ -1,0 +1,30 @@
+{
+  "Rules": [
+    {
+      "ID": "delete-unconfirmed-avatar-candidates",
+      "Status": "Enabled",
+      "Filter": {
+        "Tag": {
+          "Key": "chatapp-avatar-state",
+          "Value": "unconfirmed"
+        }
+      },
+      "Expiration": {
+        "Days": 1
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    },
+    {
+      "ID": "abort-incomplete-avatar-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "avatars/"
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}

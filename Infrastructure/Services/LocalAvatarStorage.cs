@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
+using Core.Models.Token;
 using Core.Settings;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -18,7 +20,7 @@ public sealed class LocalAvatarStorage(
     ICacheValueStore cache,
     IAtomicCacheStore atomicCache,
     AvatarReencodeQueue reencodeQueue,
-    ILogger<LocalAvatarStorage> logger) : IAvatarStorage
+    ILogger<LocalAvatarStorage> logger) : IAvatarStorage, IAvatarConfirmRecovery, IAvatarPublicationStorage
 {
     private readonly AvatarStorageOptions _options = options.Value;
     private const int MaxPixels = 2048;
@@ -40,8 +42,11 @@ public sealed class LocalAvatarStorage(
         if (contentLength <= 0 || contentLength > MaxBytes)
             throw new ArgumentException($"头像大小须在 1~{MaxBytes} 字节之间");
 
-        var objectKey = $"{userId}/{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}.jpg";
-        var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+        // Keep the same candidate/final lifecycle as the S3 provider.  The
+        // local provider does not expose a public URL for the pending object;
+        // it is only a crash-cleanable staging path.
+        var objectKey = $"{userId}/pending/{Guid.NewGuid():N}.bin";
+        var ticket = TokenBufferEncoding.CreateHex(24);
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
         var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{objectKey}";
         var ttl = expires - DateTimeOffset.UtcNow;
@@ -56,72 +61,140 @@ public sealed class LocalAvatarStorage(
         return (objectKey, ticket, uploadUrl, publicUrl, expires);
     }
 
-    public async Task<(bool Ok, string? PublicUrl, string? Error)> StoreAsync(
+    public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? Error)> StoreAsync(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
     {
         var ticketKey = TicketKey(ticket);
         var info = await atomicCache.TryGetAndDeleteAsync<AvatarTicketInfo>(ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
-            return (false, null, "上传票无效或已过期");
+            return (false, null, null, "上传票无效或已过期");
         if (info.UserId != userId)
-            return (false, null, "上传票与用户不匹配");
+            return (false, null, null, "上传票与用户不匹配");
         if (!IsAllowedContentType(contentType))
         {
             await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
-            return (false, null, "不支持的头像格式");
+            return (false, null, null, "不支持的头像格式");
         }
 
-        await using var buffer = new MemoryStream();
-        await content.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
-        if (buffer.Length <= 0 || buffer.Length > MaxBytes)
-        {
-            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
-            return (false, null, "头像大小超限");
-        }
+        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
+        var pendingPath = Path.GetFullPath(
+            Path.Combine(root, info.ObjectKey.Replace('/', Path.DirectorySeparatorChar)));
+        if (!IsUnderRoot(root, pendingPath))
+            return (false, null, null, "非法对象键");
 
-        buffer.Position = 0;
-        byte[] encoded;
+        var nonce = Path.GetFileNameWithoutExtension(pendingPath);
+        var finalObjectKey = $"{userId}/confirmed/{nonce}.jpg";
+        var finalPath = Path.GetFullPath(
+            Path.Combine(root, finalObjectKey.Replace('/', Path.DirectorySeparatorChar)));
+        if (!IsUnderRoot(root, finalPath))
+            return (false, null, null, "非法对象键");
+
+        var pendingUploadPath = pendingPath + ".uploading";
+        // Keep both temporary files under pending/. A crash must not leave an
+        // untracked .uploading file below confirmed/, which is intentionally
+        // never scanned by the cleanup worker.
+        var encodedUploadPath = pendingPath + ".encoded.uploading";
         try
         {
-            encoded = await reencodeQueue.RunAsync(async ct =>
+            // Persist the raw candidate first.  A process exit during the
+            // request can therefore leave only a pending/*.bin candidate,
+            // which the bounded cleanup path is allowed to remove.
+            Directory.CreateDirectory(Path.GetDirectoryName(pendingPath)!);
+            await using (var pending = new FileStream(
+                             pendingUploadPath,
+                             FileMode.CreateNew,
+                             FileAccess.Write,
+                             FileShare.None,
+                             bufferSize: 64 * 1024,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                buffer.Position = 0;
-                return await ReencodeAsync(buffer, ct).ConfigureAwait(false);
-            }, cancellationToken).ConfigureAwait(false);
+                var bytesWritten = await CopyToFileAsync(
+                        content, pending, MaxBytes, cancellationToken)
+                    .ConfigureAwait(false);
+                if (bytesWritten <= 0 || bytesWritten > MaxBytes)
+                {
+                    TryDeleteFile(pendingUploadPath);
+                    await RestoreTicketAsync(ticketKey, info, cancellationToken)
+                        .ConfigureAwait(false);
+                    return (false, null, null, "头像大小超限");
+                }
+
+                await pending.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await reencodeQueue.RunAsync(
+                    async ct =>
+                    {
+                        await ReencodeToFileAsync(
+                                pendingUploadPath, encodedUploadPath, ct)
+                            .ConfigureAwait(false);
+                        return true;
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (UnknownImageFormatException)
         {
+            TryDeleteFile(pendingUploadPath);
+            TryDeleteFile(encodedUploadPath);
+            TryDeleteFile(pendingPath);
             await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
-            return (false, null, "无法解码为有效图片");
+            return (false, null, null, "无法解码为有效图片");
         }
         catch (Exception ex)
         {
             logger.LogWarning(ex, "头像解码失败");
+            TryDeleteFile(pendingUploadPath);
+            TryDeleteFile(encodedUploadPath);
+            TryDeleteFile(pendingPath);
             await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
-            return (false, null, "图片处理失败");
+            return (false, null, null, "图片处理失败");
         }
 
-        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
-        var fullPath = Path.GetFullPath(Path.Combine(root, info.ObjectKey.Replace('/', Path.DirectorySeparatorChar)));
-        if (!IsUnderRoot(root, fullPath))
-            return (false, null, "非法对象键");
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+            // A same-volume move is the local equivalent of an idempotent
+            // promotion. Never overwrite a different confirmed avatar.
+            File.Move(encodedUploadPath, finalPath, overwrite: false);
+            TryDeleteFile(pendingUploadPath);
+            TryDeleteFile(pendingPath);
+        }
+        catch (Exception ex)
+        {
+            TryDeleteFile(encodedUploadPath);
+            TryDeleteFile(pendingUploadPath);
+            TryDeleteFile(pendingPath);
+            logger.LogWarning(ex, "头像候选提升失败 UserId={UserId}", userId);
+            await RestoreTicketAsync(ticketKey, info, cancellationToken).ConfigureAwait(false);
+            return (false, null, null, "图片处理失败");
+        }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        await File.WriteAllBytesAsync(fullPath, encoded, cancellationToken).ConfigureAwait(false);
-
-        var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{info.ObjectKey}";
-        return (true, publicUrl, null);
+        var publicUrl = $"{_options.PublicBaseUrl.TrimEnd('/')}/{finalObjectKey}";
+        return (true, publicUrl, finalObjectKey, null);
     }
 
-    public async Task<(bool Ok, string? PublicUrl, string? Error)> ConfirmObjectAsync(
+    public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? Error)> ConfirmObjectAsync(
         long userId, string objectKey, string? ticket = null, CancellationToken cancellationToken = default)
     {
-        if (!objectKey.StartsWith($"{userId}/", StringComparison.Ordinal))
-            return (false, null, "无效的头像对象键");
+        if (!IsOwnedObjectKey(userId, objectKey))
+            return (false, null, null, "无效的头像对象键");
+        if (!objectKey.StartsWith($"{userId}/confirmed/", StringComparison.Ordinal))
+            return (false, null, null, "本地头像必须先通过上传接口完成处理");
         if (!await ObjectExistsAsync(objectKey, cancellationToken).ConfigureAwait(false))
-            return (false, null, "头像尚未上传完成");
-        return (true, GetPublicUrl(objectKey), null);
+            return (false, null, null, "头像尚未上传完成");
+        return (true, GetPublicUrl(objectKey), objectKey, null);
+    }
+
+    public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? Error)> RecoverConfirmedObjectAsync(
+        long userId,
+        string objectKey,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await ConfirmObjectAsync(userId, objectKey, ticket: null, cancellationToken)
+            .ConfigureAwait(false);
+        return result;
     }
 
     public Task<bool> ObjectExistsAsync(string objectKey, CancellationToken cancellationToken = default)
@@ -156,10 +229,16 @@ public sealed class LocalAvatarStorage(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "删除旧头像失败");
+            throw;
         }
 
         return Task.CompletedTask;
     }
+
+    // Local storage has no object tags. The durable avatar candidate row and
+    // the UserDb AvatarVersion CAS provide the same publication fence.
+    public Task PublishAsync(string objectKey, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 
     private async Task RestoreTicketAsync(
         string ticketKey, AvatarTicketInfo info, CancellationToken cancellationToken)
@@ -188,8 +267,18 @@ public sealed class LocalAvatarStorage(
         }
     }
 
-    private static async Task<byte[]> ReencodeAsync(Stream input, CancellationToken cancellationToken)
+    private static async Task ReencodeToFileAsync(
+        string inputPath,
+        string outputPath,
+        CancellationToken cancellationToken)
     {
+        await using var input = new FileStream(
+            inputPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 64 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
         using var image = await Image.LoadAsync(input, cancellationToken).ConfigureAwait(false);
         if (image.Width > MaxPixels || image.Height > MaxPixels)
             throw new InvalidOperationException("图片像素尺寸超限");
@@ -200,10 +289,52 @@ public sealed class LocalAvatarStorage(
             Mode = ResizeMode.Crop,
         }));
 
-        await using var output = new MemoryStream();
-        await image.SaveAsJpegAsync(output, new JpegEncoder { Quality = 85 }, cancellationToken)
+        await using var output = new FileStream(
+            outputPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await image.SaveAsJpegAsync(
+                output,
+                new JpegEncoder { Quality = 85 },
+                cancellationToken)
             .ConfigureAwait(false);
-        return output.ToArray();
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<long> CopyToFileAsync(
+        Stream source,
+        FileStream destination,
+        long maxBytes,
+        CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        long total = 0;
+        try
+        {
+            while (true)
+            {
+                var read = await source.ReadAsync(
+                        buffer.AsMemory(0, buffer.Length), cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                    return total;
+
+                total += read;
+                if (total > maxBytes)
+                    return total;
+
+                await destination.WriteAsync(
+                        buffer.AsMemory(0, read), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer, clearArray: false);
+        }
     }
 
     /// <summary>确保根路径以分隔符结尾，并用相对路径检测逃逸。</summary>
@@ -224,4 +355,26 @@ public sealed class LocalAvatarStorage(
     }
 
     private static string TicketKey(string ticket) => $"avatar:ticket:{ticket}";
+
+    private static bool IsOwnedObjectKey(long userId, string objectKey) =>
+        objectKey.StartsWith($"{userId}/confirmed/", StringComparison.Ordinal)
+        || objectKey.StartsWith($"{userId}/pending/", StringComparison.Ordinal)
+        // Keep already-published development objects readable during the
+        // path migration; new writes never use this legacy layout.
+        || objectKey.StartsWith($"{userId}/", StringComparison.Ordinal)
+           && objectKey.IndexOf('/', objectKey.IndexOf('/') + 1) < 0;
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // The lifecycle worker is the durable fallback for local
+            // candidates; cleanup failure must not hide the upload result.
+        }
+    }
 }

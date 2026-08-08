@@ -43,7 +43,7 @@ public sealed class ModerationController(IModerationService moderation) : BaseAp
         return result.Succeeded ? Ok(new { Message = "举报已提交" }) : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpGet("reports")]
     public async Task<IActionResult> List(
         [FromQuery] UserReportStatus? status = null,
@@ -52,7 +52,18 @@ public sealed class ModerationController(IModerationService moderation) : BaseAp
         CancellationToken cancellationToken = default)
         => Ok(await moderation.ListReportsAsync(status, cursor, limit, cancellationToken));
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
+    [HttpGet("reports/{reportId:long}/evidence")]
+    public async Task<IActionResult> Evidence(long reportId, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var adminId))
+            return Unauthorized();
+
+        var evidence = await moderation.GetEvidenceAsync(adminId, reportId, cancellationToken);
+        return evidence is null ? NotFound() : Ok(evidence);
+    }
+
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpPost("reports/{reportId:long}/review")]
     public async Task<IActionResult> Review(
         long reportId, [FromBody] ReviewRequest body, CancellationToken cancellationToken)

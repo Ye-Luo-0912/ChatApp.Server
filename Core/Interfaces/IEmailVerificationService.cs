@@ -28,6 +28,20 @@ namespace Core.Interfaces
         /// <returns>返回一个EmailResult对象，包含验证结果以及错误信息（如果有的话）。</returns>
         Task<EmailResult> VerifyEmailCodeAsync(string email, string code, EmailCodePurpose codePurpose,
             CancellationToken cancellation);
+
+        Task<(EmailResult Result, EmailVerificationClaim? Claim)> ClaimEmailCodeAsync(
+            string email,
+            string code,
+            EmailCodePurpose codePurpose,
+            CancellationToken cancellation);
+
+        Task CompleteEmailCodeAsync(
+            EmailVerificationClaim claim,
+            CancellationToken cancellation);
+
+        Task RestoreEmailCodeAsync(
+            EmailVerificationClaim claim,
+            CancellationToken cancellation);
         
     }
 }

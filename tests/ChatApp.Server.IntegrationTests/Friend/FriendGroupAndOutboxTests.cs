@@ -77,6 +77,12 @@ public sealed class FriendGroupAndOutboxTests(PostgresTestFixture postgres, Redi
             GroupId = groupId,
             CreatedAt = DateTime.UtcNow,
         });
+        db.Friendships.Add(new UserFriendEntry
+        {
+            UserId = friendId,
+            FriendId = ownerId,
+            CreatedAt = DateTime.UtcNow,
+        });
         await db.SaveChangesAsync();
 
         var page = await friendship.GetFriendsInGroupAsync(ownerId, groupId, limit: 10);

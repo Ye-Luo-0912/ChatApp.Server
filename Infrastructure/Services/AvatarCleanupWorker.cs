@@ -1,5 +1,3 @@
-using Amazon.S3;
-using Amazon.S3.Model;
 using Core.Settings;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -7,7 +5,7 @@ using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
-/// <summary>定期清理 S3 临时 .bin 对象与本地过期临时文件。</summary>
+/// <summary>定期清理 S3 临时对象与本地 pending 临时文件。</summary>
 public sealed class AvatarCleanupWorker(
     IOptions<AvatarStorageOptions> options,
     ILogger<AvatarCleanupWorker> logger) : BackgroundService
@@ -46,46 +44,13 @@ public sealed class AvatarCleanupWorker(
 
     private async Task CleanupS3Async(AvatarStorageOptions opts, TimeSpan maxAge, CancellationToken ct)
     {
-        using var s3 = S3ClientFactory.Create(
-            opts.S3Region,
-            opts.S3Endpoint,
-            opts.S3ForcePathStyle);
-
-        var cutoff = DateTime.UtcNow - maxAge;
-        string? token = null;
-        var deleted = 0;
-        do
-        {
-            var list = await s3.ListObjectsV2Async(new ListObjectsV2Request
-            {
-                BucketName = opts.S3Bucket,
-                Prefix = "avatars/",
-                ContinuationToken = token,
-            }, ct).ConfigureAwait(false);
-
-            foreach (var obj in list.S3Objects)
-            {
-                if (!obj.Key.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
-                    continue;
-                if (obj.LastModified.ToUniversalTime() > cutoff)
-                    continue;
-
-                try
-                {
-                    await s3.DeleteObjectAsync(opts.S3Bucket, obj.Key, ct).ConfigureAwait(false);
-                    deleted++;
-                }
-                catch (Exception ex)
-                {
-                    logger.LogDebug(ex, "删除临时头像失败 Key={Key}", obj.Key);
-                }
-            }
-
-            token = list.IsTruncated ? list.NextContinuationToken : null;
-        } while (token is not null && !ct.IsCancellationRequested);
-
-        if (deleted > 0)
-            logger.LogInformation("已清理 {Count} 个 S3 临时头像对象", deleted);
+        // Pending avatar candidates are tagged and isolated under the
+        // avatars/*/pending/ prefix. S3 Lifecycle owns this cleanup; listing
+        // the entire avatars/ prefix here would be O(all confirmed avatars).
+        _ = opts;
+        _ = maxAge;
+        _ = ct;
+        logger.LogDebug("S3 头像 pending 对象由 Lifecycle 清理，确认对象由 durable tombstone 删除");
     }
 
     private void CleanupLocal(AvatarStorageOptions opts, TimeSpan maxAge)
@@ -95,21 +60,44 @@ public sealed class AvatarCleanupWorker(
 
         var cutoff = DateTime.UtcNow - maxAge;
         var deleted = 0;
-        foreach (var file in Directory.EnumerateFiles(root, "*.bin", SearchOption.AllDirectories))
+        // Do not walk confirmed avatars.  Each user directory is inspected
+        // only for its bounded pending/temporary subdirectory; legacy .bin
+        // files directly below the user directory remain safe candidates.
+        foreach (var userDirectory in Directory.EnumerateDirectories(root))
         {
-            try
+            var pendingDirectory = Path.Combine(userDirectory, "pending");
+            if (Directory.Exists(pendingDirectory))
             {
-                if (File.GetLastWriteTimeUtc(file) > cutoff) continue;
-                File.Delete(file);
-                deleted++;
+                foreach (var file in Directory.EnumerateFiles(
+                             pendingDirectory, "*", SearchOption.AllDirectories))
+                {
+                    deleted += TryDeleteCandidate(file, cutoff);
+                }
             }
-            catch (Exception ex)
+
+            foreach (var legacy in Directory.EnumerateFiles(userDirectory, "*.bin", SearchOption.TopDirectoryOnly))
             {
-                logger.LogDebug(ex, "删除本地临时头像失败 Path={Path}", file);
+                deleted += TryDeleteCandidate(legacy, cutoff);
             }
         }
 
         if (deleted > 0)
             logger.LogInformation("已清理 {Count} 个本地临时头像文件", deleted);
+    }
+
+    private int TryDeleteCandidate(string file, DateTime cutoff)
+    {
+        try
+        {
+            if (File.GetLastWriteTimeUtc(file) > cutoff)
+                return 0;
+            File.Delete(file);
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "删除本地临时头像失败 Path={Path}", file);
+            return 0;
+        }
     }
 }

@@ -1,5 +1,6 @@
 using Core.Models.Auth;
 using Core.Models.Common;
+using Core.Models.Identity;
 using Core.Models.Moderation;
 
 namespace Core.Interfaces;
@@ -19,6 +20,11 @@ public interface IModerationService
         UserReportStatus? status,
         string? cursor,
         int limit,
+        CancellationToken cancellationToken = default);
+
+    Task<UserReportEvidenceDto?> GetEvidenceAsync(
+        long adminUserId,
+        long reportId,
         CancellationToken cancellationToken = default);
 
     Task<AuthOperationResult> ReviewReportAsync(
@@ -53,6 +59,19 @@ public sealed class UserReportDto
     public DateTimeOffset UpdatedAt { get; init; }
 }
 
+public sealed class UserReportEvidenceDto
+{
+    public long ReportId { get; init; }
+    public long ReporterId { get; init; }
+    public UserReportTargetType TargetType { get; init; }
+    public long? TargetUserId { get; init; }
+    public string? TargetMessageId { get; init; }
+    public string? EvidenceSnapshot { get; init; }
+    public string? BodyPreview { get; init; }
+    public string? ContentHash { get; init; }
+    public DateTimeOffset CapturedAt { get; init; }
+}
+
 public interface IAccountLifecycleService
 {
     Task<AuthOperationResult> ScheduleDeletionAsync(long userId, CancellationToken cancellationToken = default);
@@ -66,10 +85,18 @@ public interface IAccountLifecycleService
 
     Task<AuthOperationResult> CancelDeletionAsync(long userId, CancellationToken cancellationToken = default);
 
+    Task<AccountDeletionStatusDto?> GetDeletionStatusAsync(
+        long userId, CancellationToken cancellationToken = default);
+
     Task<UserDataExportDto?> ExportAsync(long userId, CancellationToken cancellationToken = default);
 
     Task<int> ProcessDueDeletionsAsync(CancellationToken cancellationToken = default);
 }
+
+public sealed record AccountDeletionStatusDto(
+    AccountState State,
+    DateTimeOffset? ScheduledAt,
+    long DeletionEpoch);
 
 public sealed class UserDataExportDto
 {
@@ -80,7 +107,6 @@ public sealed class UserDataExportDto
     public string? Region { get; init; }
     public DateTimeOffset CreatedDate { get; init; }
     public IReadOnlyList<object> SecurityEvents { get; init; } = [];
-    public IReadOnlyList<object> FriendIds { get; init; } = [];
 }
 
 public interface INotificationQuery

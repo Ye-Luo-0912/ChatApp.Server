@@ -16,6 +16,8 @@ public class GeoLocationService : IGeoLocationService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<GeoLocationService> _logger;
     private readonly IDerivedCache _cache;
+    private readonly LocalGeoLocationDatabase _localDatabase;
+    private readonly GeoLocationOptions _geoOptions;
     private readonly byte[] _cacheKeySecret;
 
     private const string HttpClientName = nameof(GeoLocationService);
@@ -28,11 +30,15 @@ public class GeoLocationService : IGeoLocationService
         IHttpClientFactory httpClientFactory,
         ILogger<GeoLocationService> logger,
         IDerivedCache cache,
-        IOptions<SecurityOptions> securityOptions)
+        IOptions<SecurityOptions> securityOptions,
+        IOptions<GeoLocationOptions> geoOptions,
+        LocalGeoLocationDatabase localDatabase)
     {
         _httpClientFactory = httpClientFactory;
         _logger = logger;
         _cache = cache;
+        _geoOptions = geoOptions.Value;
+        _localDatabase = localDatabase;
         var secret = securityOptions.Value.SecretEncryptionKey;
         _cacheKeySecret = string.IsNullOrWhiteSpace(secret)
             ? SHA256.HashData(Encoding.UTF8.GetBytes("ChatApp.GeoLocation.CacheKey.v1"))
@@ -47,12 +53,23 @@ public class GeoLocationService : IGeoLocationService
             return "未知";
         }
 
+        // Prefer the privacy-preserving local source before consulting any
+        // derived cache or external provider.
+        if (_localDatabase.TryGetLocation(clientIp, out var localLocation)
+            && !string.IsNullOrWhiteSpace(localLocation))
+        {
+            return localLocation;
+        }
+
         // 优先读缓存，避免重复调用外部 API（IDerivedCache 内置 fail-open，连接失败视为未命中）
         // 不把原始 IP 写入 Redis key；使用服务端密钥 HMAC，避免日志/缓存泄露可回溯的完整地址。
         var cacheKey = CacheKeyPrefix + ComputeIpReference(clientIp);
         var cached = await _cache.TryGetAsync<string>(cacheKey, cancellationToken).ConfigureAwait(false);
         if (cached.Found && cached.Value is not null)
             return cached.Value;
+
+        if (!_geoOptions.AllowExternalFallback)
+            return "未知";
 
         var result = await FetchWithRetryAsync(clientIp, cancellationToken).ConfigureAwait(false);
 
@@ -67,7 +84,7 @@ public class GeoLocationService : IGeoLocationService
     }
 
     /// <summary>
-    /// 带指数退避重试的 HTTP 请求，仅对网络层异常重试。
+    /// 对网络、超时、429 和 5xx 做有界重试；瞬时故障不写入负缓存。
     /// </summary>
     private async Task<string?> FetchWithRetryAsync(string clientIp, CancellationToken cancellationToken)
     {
@@ -77,23 +94,70 @@ public class GeoLocationService : IGeoLocationService
         {
             try
             {
-                var response = await httpClient
+                using var response = await httpClient
                     .GetAsync($"json/{clientIp}?fields=status,country,city", cancellationToken)
                     .ConfigureAwait(false);
+
+                // Provider throttling and server failures are transient. Do
+                // not turn them into a one-hour "未知" cache entry: doing so
+                // hides recovery and makes a provider incident persist in the
+                // risk pipeline long after the outage ends.
+                if ((int)response.StatusCode == 429
+                    || (int)response.StatusCode >= 500)
+                {
+                    _logger.LogWarning(
+                        "Geolocation provider returned transient HTTP {StatusCode} for IpRef {IpRef}",
+                        (int)response.StatusCode,
+                        SafeIpReference(clientIp));
+                    if (attempt < MaxRetries)
+                    {
+                        await DelayBeforeRetryAsync(attempt, cancellationToken)
+                            .ConfigureAwait(false);
+                        continue;
+                    }
+
+                    return null;
+                }
 
                 if (!response.IsSuccessStatusCode)
                 {
                     _logger.LogWarning("Geolocation API returned HTTP {StatusCode} for IpRef {IpRef}",
                         (int)response.StatusCode, SafeIpReference(clientIp));
-                    return "未知"; // HTTP 错误不重试
+                    return "未知"; // non-transient provider rejection
                 }
 
                 var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
                 return ParseLocation(json, clientIp);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                throw; // 尊重取消信号，不重试
+                throw; // caller cancellation is never retried
+            }
+            catch (OperationCanceledException ex)
+            {
+                // HttpClient.Timeout is surfaced as TaskCanceledException/
+                // OperationCanceledException without the caller token being
+                // cancelled. Treat that as a transient provider timeout so it
+                // follows the same bounded retry/no-cache path as a network
+                // failure.
+                if (attempt == MaxRetries)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Geolocation timed out after {MaxRetries} attempts for IpRef {IpRef}",
+                        MaxRetries,
+                        SafeIpReference(clientIp));
+                    return null;
+                }
+
+                _logger.LogWarning(
+                    ex,
+                    "Geolocation timeout attempt {Attempt}/{MaxRetries} for IpRef {IpRef}",
+                    attempt,
+                    MaxRetries,
+                    SafeIpReference(clientIp));
+                await DelayBeforeRetryAsync(attempt, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (HttpRequestException ex)
             {
@@ -104,16 +168,21 @@ public class GeoLocationService : IGeoLocationService
                     return null; // 返回 null 表示网络故障，跳过缓存
                 }
 
-                var delay = TimeSpan.FromMilliseconds(150 * attempt);
                 _logger.LogWarning(ex,
-                    "Geolocation attempt {Attempt}/{MaxRetries} failed for IpRef {IpRef}, retrying in {DelayMs}ms",
-                    attempt, MaxRetries, SafeIpReference(clientIp), (int)delay.TotalMilliseconds);
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    "Geolocation attempt {Attempt}/{MaxRetries} failed for IpRef {IpRef}, retrying",
+                    attempt, MaxRetries, SafeIpReference(clientIp));
+                await DelayBeforeRetryAsync(attempt, cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
 
         return null;
     }
+
+    private static Task DelayBeforeRetryAsync(
+        int attempt,
+        CancellationToken cancellationToken)
+        => Task.Delay(TimeSpan.FromMilliseconds(150 * attempt), cancellationToken);
 
     /// <summary>
     /// 解析 GeoIP 响应 JSON，使用 TryGetProperty 避免异常控制流。

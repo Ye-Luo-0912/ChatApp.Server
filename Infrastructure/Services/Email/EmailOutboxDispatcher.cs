@@ -1,4 +1,5 @@
 using Core.Models.Email;
+using Core.Models.Export;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -29,30 +30,55 @@ public sealed class EmailOutboxDispatcher(
 
     public string OwnerId => _ownerId;
 
+    public int MaxAttempts => _maxAttempts;
+
+    public TimeSpan ProcessingLease => _processingLease;
+
     public async Task<int> ReclaimStaleProcessingAsync(CancellationToken cancellationToken)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
         var cutoff = DateTime.UtcNow - _processingLease;
+        var now = DateTime.UtcNow;
 
+        var dead = await db.EmailOutbox
+            .Where(x => x.Status == EmailOutboxStatus.Processing
+                        && x.LockedAt != null
+                        && x.LockedAt < cutoff
+                        && x.AttemptCount + 1 >= _maxAttempts)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, EmailOutboxStatus.Dead)
+                .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1)
+                .SetProperty(x => x.NextAttemptAt, now)
+                .SetProperty(x => x.LockedAt, (DateTime?)null)
+                .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
+                .SetProperty(x => x.LastError, "Processing lease expired; retry limit reached")
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
         var reclaimed = await db.EmailOutbox
             .Where(x => x.Status == EmailOutboxStatus.Processing
                         && x.LockedAt != null
                         && x.LockedAt < cutoff)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(x => x.Status, EmailOutboxStatus.Failed)
-                .SetProperty(x => x.NextAttemptAt, DateTime.UtcNow)
+                .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1)
+                .SetProperty(x => x.NextAttemptAt, now)
                 .SetProperty(x => x.LockedAt, (DateTime?)null)
                 .SetProperty(x => x.LockOwner, (string?)null)
                 .SetProperty(x => x.LeaseToken, (string?)null)
                 .SetProperty(x => x.LastError, "Processing lease expired")
-                .SetProperty(x => x.UpdatedAt, DateTime.UtcNow), cancellationToken)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
 
+        if (dead > 0)
+            metrics.RecordDead();
         if (reclaimed > 0)
-            logger.LogWarning("回收超时 Processing 邮件 {Count} 条", reclaimed);
+            metrics.RecordFailed();
+        if (dead + reclaimed > 0)
+            logger.LogWarning("回收超时 Processing 邮件 {Count} 条，其中死信 {DeadCount} 条", dead + reclaimed, dead);
 
-        return reclaimed;
+        return dead + reclaimed;
     }
 
     public async Task<int> ArchiveSentAsync(TimeSpan retention, CancellationToken cancellationToken)
@@ -89,7 +115,7 @@ public sealed class EmailOutboxDispatcher(
                     SET "Status" = {(int)EmailOutboxStatus.Processing},
                         "LockedAt" = {now},
                         "LockOwner" = {_ownerId},
-                        "LeaseToken" = {leaseToken},
+                        "LeaseToken" = md5(random()::text || clock_timestamp()::text || o."Id"::text),
                         "UpdatedAt" = {now}
                     WHERE o."Id" IN (
                         SELECT i."Id" FROM "T_EmailOutbox" AS i
@@ -169,6 +195,139 @@ public sealed class EmailOutboxDispatcher(
             var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
             await HandleFailureAsync(db, item, ex.Message, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Shared leased-job executor hooks. The external SMTP call is kept
+    /// separate from the fenced terminal update so the common heartbeat can
+    /// cancel work as soon as ownership is lost.
+    /// </summary>
+    public async Task ExecuteClaimedAsync(
+        EmailOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
+        var sendResult = await sendEmail(
+                item.To,
+                item.Subject,
+                item.Body,
+                item.IsHtml,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!sendResult.IsSuccess)
+            throw new InvalidOperationException(sendResult.ErrorMessage ?? "邮件发送失败");
+    }
+
+    public async Task<LeaseRenewalResult> RenewAsync(
+        EmailOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            var now = DateTime.UtcNow;
+            var until = now.Add(_processingLease);
+            var updated = await db.EmailOutbox
+                .Where(x => x.Id == item.Id
+                            && x.Status == EmailOutboxStatus.Processing
+                            && x.LockOwner == _ownerId
+                            && x.LeaseToken == item.LeaseToken)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.LockedAt, until)
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+                .ConfigureAwait(false);
+            return updated == 1
+                ? LeaseRenewalResult.Renewed
+                : LeaseRenewalResult.LeaseLost;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "邮件 Outbox 租约续租失败 Id={Id}", item.Id);
+            return LeaseRenewalResult.TransientFailure;
+        }
+    }
+
+    public async Task<bool> CompleteClaimedAsync(
+        EmailOutboxItem item,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+        var now = DateTime.UtcNow;
+        var updated = await db.EmailOutbox
+            .Where(x => x.Id == item.Id
+                        && x.Status == EmailOutboxStatus.Processing
+                        && x.LockOwner == _ownerId
+                        && x.LeaseToken == item.LeaseToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, EmailOutboxStatus.Sent)
+                .SetProperty(x => x.LockedAt, (DateTime?)null)
+                .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
+                .SetProperty(x => x.UpdatedAt, now)
+                .SetProperty(x => x.LastError, (string?)null), cancellationToken)
+            .ConfigureAwait(false);
+        if (updated == 1)
+            metrics.RecordSent();
+        return updated == 1;
+    }
+
+    public Task<bool> RetryClaimedAsync(
+        EmailOutboxItem item,
+        string error,
+        CancellationToken cancellationToken = default)
+        => FinalizeFailureAsync(item, error, forceDeadLetter: false, cancellationToken);
+
+    public Task<bool> DeadLetterClaimedAsync(
+        EmailOutboxItem item,
+        string error,
+        CancellationToken cancellationToken = default)
+        => FinalizeFailureAsync(item, error, forceDeadLetter: true, cancellationToken);
+
+    private async Task<bool> FinalizeFailureAsync(
+        EmailOutboxItem item,
+        string error,
+        bool forceDeadLetter,
+        CancellationToken cancellationToken)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+        var now = DateTime.UtcNow;
+        var attemptCount = Math.Max(1, item.AttemptCount + 1);
+        var dead = forceDeadLetter || attemptCount >= _maxAttempts;
+        var message = error.Length <= 2048 ? error : error[..2048];
+        var nextAttempt = dead
+            ? now
+            : now.Add(CalculateBackoff(attemptCount));
+
+        var updated = await db.EmailOutbox
+            .Where(x => x.Id == item.Id
+                        && x.Status == EmailOutboxStatus.Processing
+                        && x.LockOwner == _ownerId
+                        && x.LeaseToken == item.LeaseToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, dead ? EmailOutboxStatus.Dead : EmailOutboxStatus.Failed)
+                .SetProperty(x => x.AttemptCount, attemptCount)
+                .SetProperty(x => x.LastError, message)
+                .SetProperty(x => x.NextAttemptAt, nextAttempt)
+                .SetProperty(x => x.LockedAt, (DateTime?)null)
+                .SetProperty(x => x.LockOwner, (string?)null)
+                .SetProperty(x => x.LeaseToken, (string?)null)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+        if (updated == 1)
+        {
+            if (dead)
+                metrics.RecordDead();
+            else
+                metrics.RecordFailed();
+        }
+
+        return updated == 1;
     }
 
     /// <summary>测试钩子：SMTP 已成功但落库前崩溃 → 条目仍为 Processing，租约回收后可重发。</summary>

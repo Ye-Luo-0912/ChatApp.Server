@@ -10,9 +10,11 @@ namespace ChatApp.Server.IntegrationTests.Auth;
 [Collection(nameof(RedisCollection))]
 public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
 {
-    [Fact]
+    [SkippableFact]
     public async Task VerifyEmailCodeAsync_ConcurrentCalls_OnlyOneSucceeds()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         const string email = "atomic-verify@example.com";
         const string code = "123456";
         var purpose = EmailCodePurpose.Register;
@@ -43,9 +45,11 @@ public sealed class EmailVerificationAtomicTests(RedisTestFixture redis)
         Assert.Null(await redis.Cache.StringGetAsync($"EmailCode:{purpose}:{email}"));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task SendEmailCodeAsync_ConcurrentCalls_OnlyOneAcquiresCooldown()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         const string email = "atomic-send@example.com";
         var purpose = EmailCodePurpose.Register;
         var sender = new CountingEmailSender();

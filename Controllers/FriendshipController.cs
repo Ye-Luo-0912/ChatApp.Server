@@ -1,12 +1,17 @@
 using System.ComponentModel.DataAnnotations;
 using System.Security.Claims;
+using ChatApp.Contracts.Http.Common;
+using ChatApp.Server.Models;
 using Core.Interfaces;
-using Core.Models.Common;
 using Core.Models.Friend;
 using Core.Models.Friend.Requests;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using HttpBlockedUserDto = ChatApp.Contracts.Http.Friends.BlockedUserDto;
+using HttpFriendDto = ChatApp.Contracts.Http.Friends.FriendDto;
+using HttpFriendRequestDto = ChatApp.Contracts.Http.Friends.FriendRequestDto;
+using SendFriendRequestRequest = ChatApp.Contracts.Http.Friends.SendFriendRequestRequest;
 
 namespace ChatApp.Server.Controllers;
 
@@ -21,16 +26,17 @@ public class FriendshipController(
     /// </summary>
     /// <returns></returns>
     [HttpGet("all")]
-    public Task<CursorPage<FriendDto>> GetAllFriends(
+    public async Task<CursorPage<HttpFriendDto>> GetAllFriends(
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetFriendsAsync(
+        var page = await friendshipService.GetFriendsAsync(
             GetCurrentUserId(),
             cursor,
             limit,
             cancellationToken);
+        return page.ToHttpContract();
     }
 
     /// <summary>
@@ -112,17 +118,18 @@ public class FriendshipController(
     /// </summary>
     /// <returns>一个包含所有入站好友请求的异步可枚举集合。</returns>
     [HttpGet("requests/incoming")] // ← 拆成两个端点
-    public Task<CursorPage<FriendRequestDto>> GetIncomingRequests(
+    public async Task<CursorPage<HttpFriendRequestDto>> GetIncomingRequests(
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetRequestsAsync(
+        var page = await friendshipService.GetRequestsAsync(
             GetCurrentUserId(),
             FriendRequestType.Incoming,
             cursor,
             limit,
             cancellationToken);
+        return page.ToHttpContract();
     }
 
     /// <summary>
@@ -130,17 +137,18 @@ public class FriendshipController(
     /// </summary>
     /// <returns>一个包含好友请求信息的异步可枚举集合。</returns>
     [HttpGet("requests/outgoing")]
-    public Task<CursorPage<FriendRequestDto>> GetOutgoingRequests(
+    public async Task<CursorPage<HttpFriendRequestDto>> GetOutgoingRequests(
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetRequestsAsync(
+        var page = await friendshipService.GetRequestsAsync(
             GetCurrentUserId(),
             FriendRequestType.Outgoing,
             cursor,
             limit,
             cancellationToken);
+        return page.ToHttpContract();
     }
 
 
@@ -177,16 +185,17 @@ public class FriendshipController(
     /// </summary>
     /// <returns>一个包含被屏蔽用户信息的异步可枚举集合。</returns>
     [HttpGet("blocked")]
-    public Task<CursorPage<BlockedUserDto>> GetBlockedUsers(
+    public async Task<CursorPage<HttpBlockedUserDto>> GetBlockedUsers(
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.GetBlockedUsersAsync(
+        var page = await friendshipService.GetBlockedUsersAsync(
             GetCurrentUserId(),
             cursor,
             limit,
             cancellationToken);
+        return page.ToHttpContract();
     }
 
     /// <summary>
@@ -277,12 +286,16 @@ public class FriendshipController(
     }
 
     [HttpGet("groups/{groupId:int}/friends")]
-    public Task<CursorPage<FriendDto>> GetFriendsInGroup(
+    public async Task<CursorPage<HttpFriendDto>> GetFriendsInGroup(
         [FromRoute] int groupId,
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
-        => friendshipService.GetFriendsInGroupAsync(GetCurrentUserId(), groupId, cursor, limit, cancellationToken);
+    {
+        var page = await friendshipService.GetFriendsInGroupAsync(
+            GetCurrentUserId(), groupId, cursor, limit, cancellationToken);
+        return page.ToHttpContract();
+    }
 
     /// <summary>
     /// 搜索好友（支持名称/备注搜索）
@@ -290,14 +303,15 @@ public class FriendshipController(
     /// <param name="searchTerm">用于搜索的好友名称或备注关键字</param>
     /// <returns>符合条件的好友搜索结果列表</returns>
     [HttpGet("search")]
-    public Task<CursorPage<FriendSearchResultDto>> SearchFriends(
+    public async Task<CursorPage<FriendSearchResultDto>> SearchFriends(
         [FromQuery] string searchTerm,
         [FromQuery] string? cursor = null,
         [FromQuery] int limit = 50,
         CancellationToken cancellationToken = default)
     {
-        return friendshipService.SearchFriendsAsync(
+        var page = await friendshipService.SearchFriendsAsync(
             GetCurrentUserId(), searchTerm, cursor, limit, cancellationToken);
+        return page.ToHttpContract();
     }
 
     #region 辅助方法
@@ -312,11 +326,41 @@ public class FriendshipController(
 
    
     private IActionResult HandleServiceResult(FriendshipOperationResult result)
-        => result.IsSuccess ? Ok(new ApiResponse(result)) : BadRequest(result);
+    {
+        var response = result.ToHttpContract();
+        return result.IsSuccess
+            ? Ok(new ApiEnvelope<ChatApp.Contracts.Http.Friends.FriendshipOperationResponse>
+            {
+                Data = response,
+            })
+            : BadRequest(response);
+    }
 
+    private IActionResult HandleServiceResult(SendFriendRequestResult result)
+    {
+        var response = result.ToHttpContract();
+        return result.IsSuccess
+            ? Ok(new ApiEnvelope<ChatApp.Contracts.Http.Friends.SendFriendRequestResponse>
+            {
+                Data = response,
+            })
+            : BadRequest(response);
+    }
 
-   
+    private IActionResult HandleServiceResult(FriendshipOperationResult<FriendDto> result)
+    {
+        var response = result.ToHttpContract();
+        return result.Succeeded
+            ? Ok(new ApiEnvelope<HttpFriendDto> { Data = response.Data })
+            : BadRequest(response);
+    }
+
     private IActionResult HandleServiceResult<T>(FriendshipOperationResult<T> result)
-        => result.Succeeded ? Ok(new ApiResponse(result.Data)) : BadRequest(result);
+    {
+        var response = result.ToHttpContract();
+        return result.Succeeded
+            ? Ok(new ApiEnvelope<T> { Data = response.Data })
+            : BadRequest(response);
+    }
     #endregion
 }

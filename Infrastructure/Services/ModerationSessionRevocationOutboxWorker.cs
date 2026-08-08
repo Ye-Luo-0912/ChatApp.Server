@@ -1,39 +1,44 @@
+using Core.Interfaces;
+using Core.Models.Security;
+using Core.Settings;
+using Infrastructure.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
 /// <summary>在 Worker 角色中消费审核封禁会话撤销 Outbox。</summary>
 public sealed class ModerationSessionRevocationOutboxWorker(
-    IServiceScopeFactory scopeFactory,
-    ILogger<ModerationSessionRevocationOutboxDispatcher> dispatcherLogger,
+    ModerationSessionRevocationOutboxDispatcher dispatcher,
+    ILeasedJobStore<ModerationSessionRevocationOutboxItem> store,
+    LeasedJobExecutor<ModerationSessionRevocationOutboxItem> executor,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
     ILogger<ModerationSessionRevocationOutboxWorker> logger) : BackgroundService
 {
-    private const int BatchSize = 16;
+    private const string WorkerName = "moderation_session_revocation";
     private static readonly TimeSpan IdlePollInterval = TimeSpan.FromSeconds(2);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var dispatcher = new ModerationSessionRevocationOutboxDispatcher(
-            scopeFactory,
-            dispatcherLogger,
-            batchSize: BatchSize);
-
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await dispatcher.ReclaimExpiredLeasesAsync(stoppingToken).ConfigureAwait(false);
-                var items = await dispatcher.ClaimDueItemsAsync(BatchSize, stoppingToken).ConfigureAwait(false);
-                if (items.Count == 0)
+                var completed = await executor.DrainAsync(
+                        WorkerName,
+                        Math.Max(1, workerConcurrencyOptions.Value.ModerationRevocation),
+                        ModerationSessionRevocationOutboxDispatcher.DefaultLeaseDuration,
+                        store,
+                        dispatcher.ExecuteClaimedAsync,
+                        item => item.AttemptCount + 1 >= dispatcher.MaxAttempts,
+                        stoppingToken)
+                    .ConfigureAwait(false);
+                if (completed == 0)
                 {
                     await Task.Delay(IdlePollInterval, stoppingToken).ConfigureAwait(false);
-                    continue;
                 }
-
-                foreach (var item in items)
-                    await dispatcher.ProcessItemAsync(item, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

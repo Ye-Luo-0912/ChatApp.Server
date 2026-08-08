@@ -25,16 +25,43 @@ public static class NotificationModuleExtensions
             config, NotificationOutboxOptions.SectionName);
 
         services.AddSingleton<NotificationOutboxMetrics>();
+        services.AddSingleton<NotificationOutboxJobStore>();
+        services.AddSingleton<ILeasedJobStore<Core.Models.Notifications.NotificationOutboxItem>>(sp =>
+            sp.GetRequiredService<NotificationOutboxJobStore>());
         services.AddScoped<INotificationQuery, NotificationQuery>();
         if (registerWorkerHostedServices)
             services.AddHostedService<NotificationDispatchWorker>();
 
         services.AddSingleton<EmailOutboxMetrics>();
+        services.AddScoped<IEmailOutboxAdminService, EmailOutboxAdminService>();
         services.AddSingleton<SmtpEmailSender>();
         services.AddSingleton<IEmailSender, QueuedEmailSender>();
+        services.AddSingleton<EmailOutboxJobStore>();
+        services.AddSingleton<ILeasedJobStore<Core.Models.Email.EmailOutboxItem>>(sp =>
+            sp.GetRequiredService<EmailOutboxJobStore>());
         if (registerWorkerHostedServices)
             services.AddHostedService<EmailDispatchWorker>();
         services.AddSingleton<IEmailVerificationService, EmailVerificationService>();
+        services.AddHttpClient("phone-verification", client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(5);
+            client.DefaultRequestHeaders.Add("Accept", "application/json");
+        });
+        services.AddOptions<PhoneVerificationOptions>()
+            .Bind(config.GetSection(PhoneVerificationOptions.SectionName))
+            .Validate(s => s.CodeLifetimeMinutes is >= 1 and <= 15,
+                "PhoneVerification:CodeLifetimeMinutes 必须在 1..15")
+            .Validate(s => s.ResendCooldownSeconds is >= 10 and <= 300,
+                "PhoneVerification:ResendCooldownSeconds 必须在 10..300")
+            .Validate<IHostEnvironment>((s, env) =>
+                env.IsDevelopment() || env.IsEnvironment("Testing") ||
+                (!string.IsNullOrWhiteSpace(s.WebhookUrl)
+                 && Uri.TryCreate(s.WebhookUrl, UriKind.Absolute, out var uri)
+                 && uri.Scheme == Uri.UriSchemeHttps),
+                "生产环境必须配置 HTTPS PhoneVerification:WebhookUrl")
+            .ValidateOnStart();
+        services.AddSingleton<IPhoneVerificationSender, PhoneVerificationSender>();
+        services.AddSingleton<IPhoneVerificationService, PhoneVerificationService>();
 
         services.Configure<EmailConfig>(config.GetSection("EmailSettings"))
             .AddOptions<EmailConfig>()

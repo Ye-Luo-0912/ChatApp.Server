@@ -18,6 +18,10 @@ public class FriendGroupConfig:IEntityTypeConfiguration<FriendGroup>
 
         builder.Property(g => g.SortOrder).HasDefaultValue(0);
         builder.Property(g => g.IsDefault).HasDefaultValue(false);
+        builder.HasIndex(g => g.UserId)
+            .IsUnique()
+            .HasFilter("\"IsDefault\" = TRUE")
+            .HasDatabaseName("UX_FriendGroup_User_Default");
         builder.HasIndex(g => new { g.UserId, g.SortOrder })
             .HasDatabaseName("IX_FriendGroup_UserId_SortOrder");
         

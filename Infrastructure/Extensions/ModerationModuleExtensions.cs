@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Integration;
 using Core.Interfaces;
+using Core.Models.Security;
 using Core.Settings;
 using Infrastructure.Services;
 using Infrastructure.Validation;
@@ -30,14 +31,20 @@ public static class ModerationModuleExtensions
                 return new RealtimeMessageEvidenceProvider(
                     sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
                     sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RealtimeMessageEvidenceProvider>>(),
-                    bus);
+                    bus,
+                    sp.GetRequiredService<RealtimePostgresDataSource>());
             }
 
             return ActivatorUtilities.CreateInstance<UnavailableMessageEvidenceProvider>(sp);
         });
         services.AddScoped<IModerationService, ModerationService>();
         if (registerWorkerHostedServices)
+        {
+            services.AddSingleton<ModerationSessionRevocationOutboxDispatcher>();
+            services.AddSingleton<ILeasedJobStore<ModerationSessionRevocationOutboxItem>>(sp =>
+                sp.GetRequiredService<ModerationSessionRevocationOutboxDispatcher>());
             services.AddHostedService<ModerationSessionRevocationOutboxWorker>();
+        }
 
         return services;
     }

@@ -52,10 +52,16 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         var report = await db.UserReports.AsNoTracking()
             .SingleAsync(r => r.ReporterId == reporter.Id && r.TargetMessageId == messageId);
         Assert.Equal(sender.Id, report.TargetUserId);
-        Assert.Contains("server-side original body", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("ReceiverUserId", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("abc123hash", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.Contains("server-side original body", report.EvidenceBodyPreview, StringComparison.Ordinal);
+        Assert.Equal("abc123hash", report.EvidenceContentHash);
+        using (var evidenceJson = System.Text.Json.JsonDocument.Parse(report.EvidenceSnapshot!))
+        {
+            Assert.Equal(messageId, evidenceJson.RootElement.GetProperty("MessageId").GetString());
+            Assert.Equal(sender.Id, evidenceJson.RootElement.GetProperty("SenderUserId").GetInt64());
+            Assert.Equal(reporter.Id, evidenceJson.RootElement.GetProperty("ReceiverUserId").GetInt64());
+        }
         Assert.DoesNotContain(forged, report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.DoesNotContain(forged, report.EvidenceBodyPreview, StringComparison.Ordinal);
         Assert.Equal(forged, report.Detail);
     }
 
@@ -171,9 +177,15 @@ public sealed class ModerationEvidenceTests(PostgresTestFixture postgres)
         var report = await db.UserReports.AsNoTracking()
             .SingleAsync(r => r.ReporterId == reporter.Id && r.TargetMessageId == messageId);
         Assert.DoesNotContain("SHOULD_NOT_LEAK", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("\"IsRecalled\":true", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("EditVersion", report.EvidenceSnapshot, StringComparison.Ordinal);
-        Assert.Contains("RecalledAtMs", report.EvidenceSnapshot, StringComparison.Ordinal);
+        Assert.NotNull(report.EvidenceBodyPreview);
+        Assert.Empty(report.EvidenceBodyPreview!);
+        using (var evidenceJson = System.Text.Json.JsonDocument.Parse(report.EvidenceSnapshot!))
+        {
+            var root = evidenceJson.RootElement;
+            Assert.True(root.GetProperty("IsRecalled").GetBoolean());
+            Assert.Equal(2, root.GetProperty("EditVersion").GetInt32());
+            Assert.Equal(1_700_000_000_200, root.GetProperty("RecalledAtMs").GetInt64());
+        }
     }
 
     private async Task<(ApplicationUser A, ApplicationUser B)> SeedPairAsync(UserDbContext db, string prefix)

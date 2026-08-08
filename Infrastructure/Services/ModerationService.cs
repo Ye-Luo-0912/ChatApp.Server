@@ -1,12 +1,15 @@
 using System.Text.Json;
 using Core.Interfaces;
+using Core.Interfaces.Auth;
 using Core.Models.Auth;
 using Core.Models.Common;
 using Core.Models.Moderation;
 using Core.Models.Security;
 using Infrastructure.Data;
+using Infrastructure.Services.Auth;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Infrastructure.Services;
 
@@ -14,10 +17,20 @@ public sealed class ModerationService(
     UserDbContext db,
     ISecurityEventStore securityEventStore,
     IMessageEvidenceProvider messageEvidence,
-    ILogger<ModerationService> logger) : IModerationService
+    ILogger<ModerationService> logger,
+    ISecurityVersionAdvancer? securityVersions = null,
+    ISecurityMutationCoordinator? securityMutations = null,
+    IAdminAuditWriter? adminAudit = null) : IModerationService
 {
+    private readonly ISecurityMutationCoordinator _securityMutationCoordinator =
+        securityMutations ?? new SecurityMutationCoordinator(
+            db,
+            securityVersions ?? new SecurityVersionAdvancer(db),
+            NullLogger<SecurityMutationCoordinator>.Instance);
+
     private static readonly HashSet<UserReportStatus> TerminalStatuses =
         [UserReportStatus.Rejected, UserReportStatus.ActionTaken];
+    private readonly IAdminAuditWriter? _adminAudit = adminAudit;
 
     public async Task<AuthOperationResult> ReportAsync(
         long reporterId,
@@ -42,6 +55,8 @@ public sealed class ModerationService(
             return AuthOperationResult.Fail("ValidationFailed", "目标消息无效");
 
         string? evidenceSnapshot = null;
+        string? evidenceBodyPreview = null;
+        string? evidenceContentHash = null;
         if (targetType == UserReportTargetType.Message)
         {
             var evidence = await messageEvidence.TryGetAsync(
@@ -66,20 +81,20 @@ public sealed class ModerationService(
             if (targetUserId == reporterId)
                 return AuthOperationResult.Fail("InvalidTarget", "不能举报自己");
 
-            evidenceSnapshot = Truncate(JsonSerializer.Serialize(new
+            evidenceBodyPreview = LimitPreview(evidence.IsRecalled ? string.Empty : evidence.BodyText, 4000);
+            evidenceContentHash = evidence.ContentHashSha256;
+            evidenceSnapshot = JsonSerializer.Serialize(new
             {
                 evidence.MessageId,
                 evidence.SenderUserId,
                 evidence.ReceiverUserId,
                 SentAtUtc = evidence.SentAtUtc,
-                evidence.ContentHashSha256,
-                Body = evidence.IsRecalled ? string.Empty : evidence.BodyText,
                 evidence.EditVersion,
                 evidence.EditedAtMs,
                 evidence.IsRecalled,
                 evidence.RecalledAtMs,
                 Source = "message-service",
-            }), 4000);
+            });
         }
         else
         {
@@ -94,7 +109,13 @@ public sealed class ModerationService(
                 return AuthOperationResult.Fail("TargetNotFound", "目标用户不存在");
         }
 
-        var since = DateTimeOffset.UtcNow.AddHours(-24);
+        var now = DateTimeOffset.UtcNow;
+        var utcBucket = now.UtcDateTime.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture);
+        var targetKey = targetType == UserReportTargetType.Message
+            ? $"message:{targetMessageId!.Trim()}"
+            : $"user:{targetUserId.GetValueOrDefault()}";
+        var dedupeKey = $"{reporterId}:{(byte)targetType}:{targetKey}:{utcBucket}";
+        var since = now.AddHours(-24);
         var duplicate = await db.UserReports.AsNoTracking().AnyAsync(
             r => r.ReporterId == reporterId
                  && r.TargetType == targetType
@@ -113,14 +134,25 @@ public sealed class ModerationService(
             TargetUserId = targetUserId,
             TargetMessageId = targetMessageId,
             EvidenceSnapshot = evidenceSnapshot,
+            EvidenceBodyPreview = evidenceBodyPreview,
+            EvidenceContentHash = evidenceContentHash,
+            DedupeKey = dedupeKey,
             Reason = reason.Trim(),
             Detail = detail,
             Status = UserReportStatus.Open,
-            CreatedAt = DateTimeOffset.UtcNow,
-            UpdatedAt = DateTimeOffset.UtcNow,
+            CreatedAt = now,
+            UpdatedAt = now,
         };
         db.UserReports.Add(report);
-        await db.SaveChangesAsync(cancellationToken);
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (PostgresDbException.IsUniqueViolation(
+                   ex, PostgresDbException.UserReportDedupeConstraint))
+        {
+            return AuthOperationResult.Fail("DuplicateReport", "当天已提交过相同举报");
+        }
 
         await securityEventStore.RecordAsync(
             reporterId, SecurityEventType.ReportSubmitted,
@@ -129,6 +161,43 @@ public sealed class ModerationService(
 
         logger.LogInformation("用户 {ReporterId} 提交举报 {ReportId}", reporterId, report.Id);
         return AuthOperationResult.Success();
+    }
+
+    public async Task<UserReportEvidenceDto?> GetEvidenceAsync(
+        long adminUserId,
+        long reportId,
+        CancellationToken cancellationToken = default)
+    {
+        var evidence = await db.UserReports.AsNoTracking()
+            .Where(r => r.Id == reportId)
+            .Select(r => new UserReportEvidenceDto
+            {
+                ReportId = r.Id,
+                ReporterId = r.ReporterId,
+                TargetType = r.TargetType,
+                TargetUserId = r.TargetUserId,
+                TargetMessageId = r.TargetMessageId,
+                EvidenceSnapshot = r.EvidenceSnapshot,
+                BodyPreview = r.EvidenceBodyPreview,
+                ContentHash = r.EvidenceContentHash,
+                CapturedAt = r.CreatedAt,
+            })
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (evidence is not null && _adminAudit is not null)
+        {
+            await _adminAudit.WriteAsync(
+                adminUserId,
+                evidence.TargetUserId,
+                "ViewReportEvidence",
+                reason: null,
+                detail: $"report={reportId}",
+                clientIp: null,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        return evidence;
     }
 
     public async Task<CursorPage<UserReportDto>> ListReportsAsync(
@@ -264,30 +333,36 @@ public sealed class ModerationService(
             var expectedBanUntil = banUntil.GetValueOrDefault();
             var securityStamp = Guid.NewGuid().ToString();
             var userUpdated = await db.Users
-                .Where(u => u.Id == targetUserId && u.SecurityVersion < long.MaxValue)
+                .Where(u => u.Id == targetUserId)
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(u => u.BanUntil, banUntil)
-                    .SetProperty(u => u.SecurityStamp, securityStamp)
-                    .SetProperty(u => u.SecurityVersion, u => u.SecurityVersion + 1), cancellationToken);
+                    .SetProperty(u => u.SecurityStamp, securityStamp), cancellationToken);
             if (userUpdated != 1)
             {
                 return AuthOperationResult.Fail(
                     "TargetNotFound",
-                    "目标用户不存在或安全版本不可再推进");
+                    "目标用户不存在");
             }
 
-            var expectedSecurityVersion = await db.Users.AsNoTracking()
-                .Where(u => u.Id == targetUserId)
-                .Select(u => (long?)u.SecurityVersion)
-                .SingleOrDefaultAsync(cancellationToken);
-            if (!expectedSecurityVersion.HasValue)
-                throw new InvalidOperationException("已更新的目标用户无法读取安全版本");
+            var mutation = await _securityMutationCoordinator.ExecuteAsync(
+                    targetUserId,
+                    SecurityEventType.AccountBanned,
+                    $"report={reportId};banUntil={expectedBanUntil:O}",
+                    static _ => Task.CompletedTask,
+                    cancellationToken,
+                    securityEvent => securityEvent.ActorUserId = adminId.ToString(),
+                    new SecurityMutationOptions(EnqueueSessionRevocation: false))
+                .ConfigureAwait(false);
+            if (!mutation.Succeeded || !mutation.SecurityVersion.HasValue)
+                return AuthOperationResult.Fail(
+                    "TargetNotFound",
+                    "目标用户不存在或安全版本不可再推进");
 
             db.ModerationSessionRevocationOutbox.Add(new ModerationSessionRevocationOutboxItem
             {
                 SourceReportId = reportId,
                 UserId = targetUserId,
-                ExpectedSecurityVersion = expectedSecurityVersion.Value,
+                ExpectedSecurityVersion = mutation.SecurityVersion.Value,
                 ExpectedBanUntil = expectedBanUntil,
                 Status = ModerationSessionRevocationOutboxStatus.Pending,
                 AttemptCount = 0,
@@ -344,6 +419,14 @@ public sealed class ModerationService(
         _ => false,
     };
 
-    private static string? Truncate(string? value, int max)
-        => string.IsNullOrEmpty(value) ? value : value.Length <= max ? value : value[..max];
+    private static string LimitPreview(string? value, int max)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= max)
+            return value ?? string.Empty;
+
+        var length = max;
+        if (length > 0 && char.IsHighSurrogate(value[length - 1]))
+            length--;
+        return value[..length];
+    }
 }

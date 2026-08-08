@@ -1,11 +1,6 @@
 ﻿using System.ComponentModel.DataAnnotations;
 
 namespace Core.Models.Friend;
-public record ApiResponse(object? Data);
-public record ApiError(FriendshipOperationResultErrorCode Code, string Message);
-public record SendFriendRequestRequest(
-    [param: Range(1, long.MaxValue)] long TargetUserId,
-    [param: StringLength(FriendshipInputLimits.FriendRequestMessageMaxLength)] string? Message);
 
 public class FriendDto
 {
@@ -24,7 +19,6 @@ public class FriendDto
     
     public DateTimeOffset? LastSeenAt { get; set; }
 }
-
 public sealed class FriendGroupDto
 {
     public int GroupId { get; init; }

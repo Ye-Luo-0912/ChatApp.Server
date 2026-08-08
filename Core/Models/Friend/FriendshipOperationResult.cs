@@ -21,7 +21,6 @@ public class FriendshipOperationResult
         Message = msg,
     };
 }
-
 public class FriendshipOperationResult<T>
 {
     public bool Succeeded { get; set; }

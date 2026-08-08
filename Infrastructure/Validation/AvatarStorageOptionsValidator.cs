@@ -47,6 +47,21 @@ public sealed class AvatarStorageOptionsValidator : IValidateOptions<AvatarStora
             failures.Add("AvatarStorage:ReencodeAcquireTimeoutMilliseconds 必须 >= 0（0 表示一直等待）。");
         }
 
+        if (options.FinalizationLeaseSeconds is < 30 or > 900)
+        {
+            failures.Add("AvatarStorage:FinalizationLeaseSeconds 必须在 30-900 之间。");
+        }
+
+        if (options.FinalizationBackoffSeconds <= 0)
+        {
+            failures.Add("AvatarStorage:FinalizationBackoffSeconds 必须大于 0。");
+        }
+
+        if (options.MaxFinalizationAttempts <= 0)
+        {
+            failures.Add("AvatarStorage:MaxFinalizationAttempts 必须大于 0。");
+        }
+
         if (string.Equals(options.Provider, "S3", StringComparison.OrdinalIgnoreCase))
         {
             if (string.IsNullOrWhiteSpace(options.S3Bucket))

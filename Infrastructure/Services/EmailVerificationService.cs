@@ -3,6 +3,8 @@ using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models;
 using Core.Models.Email;
+using Infrastructure.Caching;
+using System.Text.Json;
 
 namespace Infrastructure.Services;
 
@@ -12,13 +14,15 @@ namespace Infrastructure.Services;
 public class EmailVerificationService(
     IEmailSender emailSender,
     ICacheValueStore cache,
-    IAtomicCacheStore atomicCache)
+    IAtomicCacheStore atomicCache,
+    IOneTimeStateStore? oneTimeState = null)
     : IEmailVerificationService
 {
     private static readonly TimeSpan CodeLifetime = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ResendCooldown = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan FailWindow = TimeSpan.FromMinutes(15);
     private const int MaxVerifyFailures = 5;
+    private readonly IOneTimeStateStore? _oneTimeState = oneTimeState;
 
     /// <summary>
     /// PR3: 邮箱验证码校验单 Lua 脚本——将 4 次往返合并为 1 次。
@@ -86,9 +90,11 @@ public class EmailVerificationService(
             if (!acquiredCooldown)
                 return new EmailResult { IsSuccess = false, ErrorMessage = "操作太频繁，请稍后再试" };
 
-            var cachedCode = await cache
-                .StringGetAsync(dataKey, cancellationToken: cancellation)
-                .ConfigureAwait(false);
+            var cachedCode = _oneTimeState is null
+                ? await cache.StringGetAsync(dataKey, cancellationToken: cancellation)
+                    .ConfigureAwait(false)
+                : await _oneTimeState.PeekAsync(dataKey, cancellation).ConfigureAwait(false);
+            cachedCode = Unquote(cachedCode);
 
             string codeToSend;
             var createdNewCode = false;
@@ -100,9 +106,26 @@ public class EmailVerificationService(
             else
             {
                 codeToSend = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
-                await cache
-                    .StringSetAsync(dataKey, codeToSend, CodeLifetime, cancellation)
-                    .ConfigureAwait(false);
+                if (_oneTimeState is not null)
+                {
+                    await _oneTimeState.IssueAsync(
+                            dataKey,
+                            codeToSend,
+                            DateTimeOffset.UtcNow.Add(CodeLifetime),
+                            cancellation)
+                        .ConfigureAwait(false);
+                    await cache.StringSetAsync(
+                            GetExpiryKey(normalizedEmail, codePurpose),
+                            DateTimeOffset.UtcNow.Add(CodeLifetime).ToUnixTimeMilliseconds().ToString(),
+                            CodeLifetime,
+                            cancellation)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await cache.StringSetAsync(dataKey, codeToSend, CodeLifetime, cancellation)
+                        .ConfigureAwait(false);
+                }
                 createdNewCode = true;
             }
 
@@ -145,6 +168,35 @@ public class EmailVerificationService(
         var cacheKey = GetCacheKey(normalizedEmail, codePurpose);
         var failKey = GetFailKey(normalizedEmail, codePurpose);
 
+        if (_oneTimeState is not null)
+        {
+            var (claimedResult, claim) = await ClaimEmailCodeAsync(
+                    email, normalizedCode, codePurpose, cancellation)
+                .ConfigureAwait(false);
+            if (claimedResult.IsSuccess && claim is not null)
+            {
+                try
+                {
+                    await CompleteEmailCodeAsync(claim, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The claim remains durably present until its original
+                    // expiry; completion cleanup can be retried safely.
+                }
+
+                return claimedResult;
+            }
+
+            var failures = await atomicCache.StringIncrementAsync(
+                    failKey, FailWindow, cancellation)
+                .ConfigureAwait(false);
+            return failures >= MaxVerifyFailures
+                ? new EmailResult { IsSuccess = false, ErrorMessage = "验证失败次数过多，请稍后再试" }
+                : claimedResult;
+        }
+
         // PR3: 单次 EVAL 合并「锁定检查 + CAS-DELETE + 区分过期 + 失败递增」4 步原子操作。
         var result = await atomicCache
             .EvaluateScriptAsync(
@@ -169,6 +221,118 @@ public class EmailVerificationService(
         };
     }
 
+    public async Task<(EmailResult Result, EmailVerificationClaim? Claim)> ClaimEmailCodeAsync(
+        string email,
+        string code,
+        EmailCodePurpose codePurpose,
+        CancellationToken cancellation)
+    {
+        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(code))
+            return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码或者邮箱不能为空" }, null);
+
+        var normalizedEmail = NormalizeEmail(email);
+        var normalizedCode = code.Trim();
+        var key = GetCacheKey(normalizedEmail, codePurpose);
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = now.Add(CodeLifetime);
+
+        if (_oneTimeState is not null)
+        {
+            var peeked = Unquote(await _oneTimeState.PeekAsync(key, cancellation).ConfigureAwait(false));
+            if (!string.Equals(peeked, normalizedCode, StringComparison.Ordinal))
+                return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码无效或已过期" }, null);
+
+            var expiryRaw = await cache.StringGetAsync(
+                    GetExpiryKey(normalizedEmail, codePurpose), cancellation)
+                .ConfigureAwait(false);
+            if (long.TryParse(expiryRaw, out var expiryMs))
+                expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(expiryMs);
+            if (expiresAt <= now)
+                return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码已过期" }, null);
+
+            var claimKey = GetClaimKey(normalizedEmail, codePurpose);
+            var claimed = await _oneTimeState.TryClaimAsync<string>(
+                    key, claimKey, expiresAt, cancellation)
+                .ConfigureAwait(false);
+            var consumed = Unquote(claimed?.Payload);
+            if (claimed is null || !string.Equals(consumed, normalizedCode, StringComparison.Ordinal))
+            {
+                if (claimed is not null)
+                    await _oneTimeState.RestoreClaimAsync(
+                            key, claimKey, expiresAt, CancellationToken.None)
+                        .ConfigureAwait(false);
+                return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码无效或已过期" }, null);
+            }
+
+            return (
+                new EmailResult { IsSuccess = true },
+                new EmailVerificationClaim(email.Trim(), codePurpose, normalizedCode, expiresAt));
+        }
+
+        // Compatibility path for focused tests/legacy hosts. It still uses a
+        // compare-and-delete claim, and callers restore on business failure.
+        var current = await cache.StringGetAsync(key, cancellation).ConfigureAwait(false);
+        if (!string.Equals(current, normalizedCode, StringComparison.Ordinal))
+            return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码无效或已过期" }, null);
+        if (!await atomicCache.TryStringCompareAndDeleteAsync(key, current!, cancellation)
+                .ConfigureAwait(false))
+            return (new EmailResult { IsSuccess = false, ErrorMessage = "验证码无效或已过期" }, null);
+        return (
+            new EmailResult { IsSuccess = true },
+            new EmailVerificationClaim(email.Trim(), codePurpose, normalizedCode, expiresAt));
+    }
+
+    public async Task CompleteEmailCodeAsync(
+        EmailVerificationClaim claim,
+        CancellationToken cancellation)
+    {
+        var normalizedEmail = NormalizeEmail(claim.Email);
+        if (_oneTimeState is not null)
+        {
+            await _oneTimeState.CompleteClaimAsync(
+                    GetClaimKey(normalizedEmail, claim.Purpose), cancellation)
+                .ConfigureAwait(false);
+        }
+
+        await cache.RemoveAsync(
+                GetExpiryKey(normalizedEmail, claim.Purpose),
+                cancellation)
+            .ConfigureAwait(false);
+    }
+
+    public async Task RestoreEmailCodeAsync(
+        EmailVerificationClaim claim,
+        CancellationToken cancellation)
+    {
+        var remaining = claim.ExpiresAt - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+            return;
+
+        var normalizedEmail = NormalizeEmail(claim.Email);
+        var key = GetCacheKey(normalizedEmail, claim.Purpose);
+        if (_oneTimeState is not null)
+        {
+            await _oneTimeState.RestoreClaimAsync(
+                    key,
+                    GetClaimKey(normalizedEmail, claim.Purpose),
+                    claim.ExpiresAt,
+                    cancellation)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await cache.StringSetAsync(key, claim.Code, remaining, cancellation)
+                .ConfigureAwait(false);
+        }
+
+        await cache.StringSetAsync(
+                GetExpiryKey(normalizedEmail, claim.Purpose),
+                claim.ExpiresAt.ToUnixTimeMilliseconds().ToString(),
+                remaining,
+                cancellation)
+            .ConfigureAwait(false);
+    }
+
     private static string GetCacheKey(string normalizedEmail, EmailCodePurpose purpose)
         => $"EmailCode:{purpose}:{normalizedEmail}";
 
@@ -178,7 +342,25 @@ public class EmailVerificationService(
     private static string GetFailKey(string normalizedEmail, EmailCodePurpose purpose)
         => $"EmailCodeFail:{purpose}:{normalizedEmail}";
 
+    private static string GetExpiryKey(string normalizedEmail, EmailCodePurpose purpose)
+        => $"EmailCodeExpiry:{purpose}:{normalizedEmail}";
+
+    private static string GetClaimKey(string normalizedEmail, EmailCodePurpose purpose)
+        => $"EmailCodeClaim:{purpose}:{normalizedEmail}";
+
     private static string NormalizeEmail(string email) => email.Trim().ToLowerInvariant();
+
+    private static string? Unquote(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return value;
+        if (value.Length >= 2 && value[0] == '"' && value[^1] == '"')
+        {
+            try { return JsonSerializer.Deserialize<string>(value); }
+            catch (JsonException) { }
+        }
+        return value;
+    }
 
     private async Task<EmailResult> SendVerificationEmailAsync(
         string email, string code, EmailCodePurpose codePurpose, CancellationToken cancellation)

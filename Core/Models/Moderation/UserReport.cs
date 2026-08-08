@@ -22,8 +22,14 @@ public sealed class UserReport
     public UserReportTargetType TargetType { get; set; }
     public long? TargetUserId { get; set; }
     public string? TargetMessageId { get; set; }
-    /// <summary>消息证据快照（仅服务端消息原文/发送人/时间/内容哈希；禁止使用举报人 detail）。</summary>
+    /// <summary>消息证据元数据快照，必须始终是完整合法 JSON。</summary>
     public string? EvidenceSnapshot { get; set; }
+    /// <summary>证据正文的有界预览；不把可变正文拼接进截断 JSON。</summary>
+    public string? EvidenceBodyPreview { get; set; }
+    /// <summary>获取证据时服务端返回的正文哈希。</summary>
+    public string? EvidenceContentHash { get; set; }
+    /// <summary>举报去重键：举报人、目标、UTC 日桶。</summary>
+    public string? DedupeKey { get; set; }
     public string Reason { get; set; } = string.Empty;
     public string? Detail { get; set; }
     public UserReportStatus Status { get; set; } = UserReportStatus.Open;
