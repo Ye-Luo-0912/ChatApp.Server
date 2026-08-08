@@ -69,6 +69,13 @@ public sealed class AttachmentSignedDownloadTests
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+            CreateDedupTicketAsync(
+                long userId, string sourceObjectKey, string contentType, long contentLength,
+                string sha256, string? originalName = null, string? clientAttachmentId = null,
+                CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
         public Task CancelUploadTicketAsync(string ticket, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 

@@ -16,6 +16,21 @@ public interface IAttachmentStorage
             CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 秒传去重票：复制已确认内容 <paramref name="sourceObjectKey"/> 到新对象键。
+    /// 返回的 UploadUrl 恒为空字符串——客户端命中去重时跳过上传直接确认。
+    /// </summary>
+    Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+        CreateDedupTicketAsync(
+            long userId,
+            string sourceObjectKey,
+            string contentType,
+            long contentLength,
+            string sha256,
+            string? originalName = null,
+            string? clientAttachmentId = null,
+            CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 撤销尚未返回给客户端的上传票。用于元数据预留失败后的编排补偿；幂等。
     /// </summary>
     Task CancelUploadTicketAsync(

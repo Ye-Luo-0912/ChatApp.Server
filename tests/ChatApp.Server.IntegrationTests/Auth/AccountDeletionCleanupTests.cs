@@ -2,7 +2,6 @@ using ChatApp.Server.IntegrationTests.Support;
 using Core.Interfaces;
 using Core.Models.Attachment;
 using Core.Models.Export;
-using Core.Models.Friend;
 using Core.Models.Identity;
 using Core.Models.Moderation;
 using Core.Models.Security;
@@ -35,7 +34,6 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         Assert.True(processed >= 1);
 
         Assert.False(await db.Users.AnyAsync(u => u.Id == victim.Id));
-        Assert.False(await db.Friendships.AnyAsync(f => f.UserId == victim.Id || f.FriendId == victim.Id));
         Assert.False(await db.InAppNotifications.AnyAsync(n => n.UserId == victim.Id));
         Assert.False(await db.SecurityEvents.AnyAsync(e => e.UserId == victim.Id));
         Assert.False(await db.UserReports.AnyAsync(r => r.TargetUserId == victim.Id || r.ReporterId == victim.Id));
@@ -103,7 +101,6 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
 
         Assert.True(await db.Users.AsNoTracking().AnyAsync(u => u.Id == victim.Id));
         Assert.Null((await db.Users.AsNoTracking().FirstAsync(u => u.Id == victim.Id)).DeletionScheduledAt);
-        Assert.True(await db.Friendships.AsNoTracking().AnyAsync(f => f.UserId == victim.Id));
         Assert.True(await db.InAppNotifications.AsNoTracking().AnyAsync(n => n.UserId == victim.Id));
         Assert.True(await db.SecurityEvents.AsNoTracking().AnyAsync(e => e.UserId == victim.Id));
         Assert.True(await db.TrustedDevices.AsNoTracking().AnyAsync(d => d.UserId == victim.Id));
@@ -276,13 +273,6 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
 
     private static void SeedRelated(UserDbContext db, long victimId, long peerId)
     {
-        var tsid = new TsidGeneratorService();
-        db.Friendships.Add(new UserFriendEntry
-        {
-            FriendshipId = tsid.GenerateTsid(),
-            UserId = victimId,
-            FriendId = peerId,
-        });
         db.InAppNotifications.Add(new InAppNotification
         {
             UserId = victimId,
@@ -352,6 +342,10 @@ public sealed class AccountDeletionCleanupTests(PostgresTestFixture postgres, Re
         public IReadOnlyList<string> ObjectKeys { get; init; } = [];
         public bool IsAvailable => true;
         public string UnavailableReason => string.Empty;
+
+        public Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+            long uploaderUserId, string sha256Hex, CancellationToken cancellationToken = default)
+            => Task.FromResult<AttachmentDedupCandidate?>(null);
 
         public Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,

@@ -14,6 +14,21 @@ namespace ChatApp.Server.IntegrationTests.Auth;
 public sealed class AttachmentScanRetryTests
 {
     [Fact]
+    public async Task NonSeekableContent_IsNotAllowedWithoutACompletePolicyScan()
+    {
+        var scanner = new DenyListAttachmentContentScanner();
+        await using var content = new NonSeekableStream();
+
+        var result = await scanner.ScanAsync(
+            content,
+            "application/octet-stream",
+            "safe.bin");
+
+        Assert.False(result.Allowed);
+        Assert.True(result.IsTransient);
+    }
+
+    [Fact]
     public async Task TransientFail_Retries_ThenConfirms()
     {
         await using var db = CreateDb();
@@ -320,6 +335,13 @@ public sealed class AttachmentScanRetryTests
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+            CreateDedupTicketAsync(
+                long userId, string sourceObjectKey, string contentType, long contentLength,
+                string sha256, string? originalName = null, string? clientAttachmentId = null,
+                CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
         public Task CancelUploadTicketAsync(string ticket, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
@@ -408,6 +430,10 @@ public sealed class AttachmentScanRetryTests
         public int RemainingConfirmFailures { get; set; }
         public bool IsAvailable => true;
         public string UnavailableReason => "";
+
+        public Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+            long uploaderUserId, string sha256Hex, CancellationToken cancellationToken = default)
+            => Task.FromResult<AttachmentDedupCandidate?>(null);
 
         public Task<Core.Models.Attachment.AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
@@ -500,5 +526,22 @@ public sealed class AttachmentScanRetryTests
                 WorstConfirmedUnbound: [],
                 WorstUploading: [],
                 WorstStuckScanning: []));
+    }
+
+    private sealed class NonSeekableStream() : MemoryStream(Array.Empty<byte>())
+    {
+        public override bool CanSeek => false;
+
+        public override long Seek(long offset, SeekOrigin origin)
+            => throw new NotSupportedException();
+
+        public override void SetLength(long value)
+            => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => base.Position;
+            set => throw new NotSupportedException();
+        }
     }
 }

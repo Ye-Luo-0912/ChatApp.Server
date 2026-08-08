@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ChatApp.Server.IntegrationTests.Support;
@@ -235,6 +236,198 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
         Assert.Equal("https://cdn.example/legacy.png", items[0].Url);
     }
 
+    [SkippableFact]
+    public async Task Presign_Sha256Dedup_Hit_ReturnsDeduplicated_SkipsUpload_Confirms()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
+
+        var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-waf-dedup", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(attachmentRoot);
+
+        await using var factory = new ChatAppWebApplicationFactory(
+            postgres.ConnectionString,
+            redis.ConnectionString,
+            extraConfig: new Dictionary<string, string?>
+            {
+                ["AttachmentStorage:Provider"] = "Local",
+                ["AttachmentStorage:LocalRootPath"] = attachmentRoot,
+                ["AttachmentStorage:PublicBaseUrl"] = "/static/attachments",
+                ["AttachmentStorage:MaxBytes"] = "26214400",
+                ["AttachmentStorage:TicketMinutes"] = "15",
+                ["AttachmentStorage:AllowedContentTypes:0"] = "image/png",
+                ["AttachmentStorage:AllowedContentTypes:1"] = "application/octet-stream",
+                ["MessageEvidence:RealtimeConnectionString"] = postgres.ConnectionString,
+                ["MessageEvidence:Schema"] = "realtime",
+            });
+
+        using var client = factory.CreateClientWithDevice($"dev-dedup-{Guid.NewGuid():N}"[..24]);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        await using (var db = postgres.CreateContext())
+        {
+            await WafTestHelpers.SeedUserAsync(db, $"dedup-{suffix}", $"dedup-{suffix}@ex.com", "Passw0rd!");
+        }
+
+        var login = await WafTestHelpers.LoginAsync(client, $"dedup-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+
+        var payload = Encoding.UTF8.GetBytes("dedup-me-please-bytes");
+        var sha256 = Convert.ToHexStringLower(SHA256.HashData(payload));
+
+        // 第一步：普通上传建立已确认候选（content_hash 由扫描管线写回）。
+        var first = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = payload.Length,
+            originalName = "first.bin",
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        var firstTicket = await first.Content.ReadFromJsonAsync<PresignDto>(WafTestHelpers.Json);
+        Assert.False(firstTicket!.Deduplicated);
+
+        using (var content = new ByteArrayContent(payload))
+        {
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+            var upload = await client.PutAsync(
+                $"/api/attachments/upload?ticket={Uri.EscapeDataString(firstTicket.Ticket)}", content);
+            Assert.Equal(HttpStatusCode.OK, upload.StatusCode);
+        }
+
+        var firstConfirm = await client.PostAsJsonAsync("/api/attachments/confirm", new
+        {
+            objectKey = firstTicket.ObjectKey,
+            ticket = firstTicket.Ticket,
+            attachmentId = firstTicket.AttachmentId,
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.Accepted, firstConfirm.StatusCode);
+
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var scans = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+            Assert.True(await scans.ProcessDueAsync() >= 1);
+        }
+
+        // 候选就绪：第二次 Presign 带 Sha256 必须命中 → Deduplicated、无上传 URL。
+        var second = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = payload.Length,
+            originalName = "second.bin",
+            sha256,
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        var secondTicket = await second.Content.ReadFromJsonAsync<PresignDto>(WafTestHelpers.Json);
+        Assert.True(secondTicket!.Deduplicated);
+        Assert.True(string.IsNullOrEmpty(secondTicket.UploadUrl));
+        Assert.False(string.IsNullOrWhiteSpace(secondTicket.Ticket));
+        Assert.False(string.IsNullOrWhiteSpace(secondTicket.ObjectKey));
+
+        // 秒传命中后不 PUT：直接 Confirm，服务端从源对象复制。
+        var secondConfirm = await client.PostAsJsonAsync("/api/attachments/confirm", new
+        {
+            objectKey = secondTicket.ObjectKey,
+            ticket = secondTicket.Ticket,
+            attachmentId = secondTicket.AttachmentId,
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.Accepted, secondConfirm.StatusCode);
+        var secondBody = await secondConfirm.Content.ReadFromJsonAsync<ConfirmDto>(WafTestHelpers.Json);
+        Assert.Equal(secondTicket.AttachmentId, secondBody?.AttachmentId);
+        Assert.Equal("Scanning", secondBody!.Status);
+
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var scans = scope.ServiceProvider.GetRequiredService<IAttachmentScanService>();
+            Assert.True(await scans.ProcessDueAsync() >= 1);
+        }
+
+        // 两个附件最终 Confirmed，且 content_hash 一致（同一内容）。
+        await using var conn = new NpgsqlConnection(postgres.ConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT status, content_hash, object_key
+            FROM realtime.attachments
+            WHERE attachment_id = ANY(@ids)
+            ORDER BY attachment_id
+            """, conn);
+        cmd.Parameters.AddWithValue("ids", new[] { firstTicket.AttachmentId, secondTicket.AttachmentId });
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<(short Status, string? Hash, string Key)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt16(0), reader.IsDBNull(1) ? null : reader.GetString(1), reader.GetString(2)));
+        Assert.Equal(2, rows.Count);
+        Assert.All(rows, r => Assert.Equal((short)AttachmentStatus.Confirmed, r.Status));
+        Assert.All(rows, r => Assert.Equal(sha256, r.Hash));
+        Assert.NotEqual(rows[0].Key, rows[1].Key);
+
+        // 秒传目标对象已实际落盘（服务端复制，非客户端上传）。
+        var secondFilePath = Path.Combine(attachmentRoot, secondTicket.ObjectKey.Replace('/', Path.DirectorySeparatorChar));
+        Assert.True(File.Exists(secondFilePath));
+        Assert.Equal(payload, File.ReadAllBytes(secondFilePath));
+    }
+
+    [SkippableFact]
+    public async Task Presign_Sha256Dedup_Miss_FallsBackToRegularTicket()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await RealtimeAttachmentTestSchema.EnsureAsync(postgres.ConnectionString);
+
+        var attachmentRoot = Path.Combine(Path.GetTempPath(), "chatapp-waf-dedupmiss", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(attachmentRoot);
+
+        await using var factory = new ChatAppWebApplicationFactory(
+            postgres.ConnectionString,
+            redis.ConnectionString,
+            extraConfig: new Dictionary<string, string?>
+            {
+                ["AttachmentStorage:Provider"] = "Local",
+                ["AttachmentStorage:LocalRootPath"] = attachmentRoot,
+                ["AttachmentStorage:MaxBytes"] = "26214400",
+                ["AttachmentStorage:TicketMinutes"] = "15",
+                ["AttachmentStorage:AllowedContentTypes:0"] = "application/octet-stream",
+                ["MessageEvidence:RealtimeConnectionString"] = postgres.ConnectionString,
+                ["MessageEvidence:Schema"] = "realtime",
+            });
+
+        using var client = factory.CreateClientWithDevice($"dev-dedupm-{Guid.NewGuid():N}"[..24]);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        await using (var db = postgres.CreateContext())
+        {
+            await WafTestHelpers.SeedUserAsync(db, $"dedupm-{suffix}", $"dedupm-{suffix}@ex.com", "Passw0rd!");
+        }
+
+        var login = await WafTestHelpers.LoginAsync(client, $"dedupm-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+
+        // 无匹配候选：Sha256 合法但库中无此内容 → 必须回退普通上传票。
+        var miss = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = 4,
+            sha256 = new string('b', 64),
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+        var ticket = await miss.Content.ReadFromJsonAsync<PresignDto>(WafTestHelpers.Json);
+        Assert.False(ticket!.Deduplicated);
+        Assert.False(string.IsNullOrWhiteSpace(ticket.UploadUrl));
+        Assert.False(string.IsNullOrWhiteSpace(ticket.Ticket));
+
+        // 非法 Sha256（大写/短 hash）也必须回退普通票，不得命中。
+        var invalid = await client.PostAsJsonAsync("/api/attachments/presign", new
+        {
+            contentType = "application/octet-stream",
+            contentLength = 4,
+            sha256 = "NOTHEX",
+        }, WafTestHelpers.Json);
+        Assert.Equal(HttpStatusCode.OK, invalid.StatusCode);
+        var invalidTicket = await invalid.Content.ReadFromJsonAsync<PresignDto>(WafTestHelpers.Json);
+        Assert.False(invalidTicket!.Deduplicated);
+    }
+
     private static string? GetString(JsonElement el, params string[] names)
     {
         foreach (var n in names)
@@ -247,7 +440,7 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
     }
 
     private sealed record PresignDto(
-        string AttachmentId, string UploadUrl, string DownloadPath, string PublicUrl, string ObjectKey, string Ticket, DateTimeOffset ExpiresAt);
+        string AttachmentId, string UploadUrl, string DownloadPath, string PublicUrl, string ObjectKey, string Ticket, DateTimeOffset ExpiresAt, bool Deduplicated);
 
     private sealed record ConfirmDto(
         string AttachmentId, string DownloadPath, string PublicUrl, string ObjectKey, string Status);
@@ -256,6 +449,10 @@ public sealed class FormalAttachmentsTests(PostgresTestFixture postgres, RedisTe
     {
         public bool IsAvailable => true;
         public string UnavailableReason => string.Empty;
+
+        public Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+            long uploaderUserId, string sha256Hex, CancellationToken cancellationToken = default)
+            => Task.FromResult<AttachmentDedupCandidate?>(null);
 
         public Task<Core.Models.Attachment.AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,

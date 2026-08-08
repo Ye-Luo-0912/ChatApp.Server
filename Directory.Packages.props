@@ -4,6 +4,13 @@
     <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
   <ItemGroup>
+    <!-- ChatApp shared contracts -->
+    <PackageVersion Include="ChatApp.Auth.Contracts" Version="0.3.0" />
+    <PackageVersion Include="ChatApp.Contracts.Http" Version="0.3.0" />
+    <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.3.0" />
+    <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.0.0" />
+    <PackageVersion Include="ChatApp.Realtime.Outbox.EntityFrameworkCore" Version="1.0.0" />
+
     <!-- ASP.NET Core / Framework -->
     <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.5" />
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.5" />

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Buffers;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
+using Core.Models.Token;
 using Core.Settings;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -51,7 +52,7 @@ public sealed class LocalAttachmentStorage(
         // Keep the final key stable from presign through confirm. The MIME type
         // lives in the attachment metadata row, not in the file name.
         var objectKey = $"{userId}/{attachmentId}";
-        var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+        var ticket = TokenBufferEncoding.CreateHex(24);
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
         // PublicUrl 仅作内部/遗留字段；聊天 API 使用 DownloadPath，不暴露永久静态 URL。
         var publicUrl = string.Empty;
@@ -71,10 +72,54 @@ public sealed class LocalAttachmentStorage(
 
     public Task CancelUploadTicketAsync(
         string ticket,
-        CancellationToken cancellationToken = default) =>
-        string.IsNullOrWhiteSpace(ticket)
-            ? Task.CompletedTask
-            : cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(ticket))
+            return Task.CompletedTask;
+        // 普通票与去重票都可能存在：两键皆清（幂等）。
+        return Task.WhenAll(
+            cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken),
+            cache.RemoveAsync(AttachmentUploadTicketKeys.CreateDedup(ticket), cancellationToken));
+    }
+
+    public async Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+        CreateDedupTicketAsync(
+            long userId,
+            string sourceObjectKey,
+            string contentType,
+            long contentLength,
+            string sha256,
+            string? originalName = null,
+            string? clientAttachmentId = null,
+            CancellationToken cancellationToken = default)
+    {
+        if (!IsAllowedContentType(contentType))
+            throw new ArgumentException("不支持的附件格式");
+        if (contentLength <= 0 || contentLength > MaxBytes)
+            throw new ArgumentException($"附件大小须在 1~{MaxBytes} 字节之间");
+        if (string.IsNullOrWhiteSpace(sourceObjectKey))
+            throw new ArgumentException("缺少秒传源对象键");
+        if (!IsContentAddress(sha256))
+            throw new ArgumentException("秒传 SHA-256 格式无效");
+
+        var attachmentId = Guid.NewGuid().ToString("N");
+        var objectKey = $"{userId}/{attachmentId}";
+        var ticket = TokenBufferEncoding.CreateHex(24);
+        var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
+        var ttl = expires - DateTimeOffset.UtcNow;
+
+        await cache.SetAsync(
+            AttachmentUploadTicketKeys.CreateDedup(ticket),
+            new AttachmentDedupUploadTicket(
+                userId, attachmentId, objectKey, sourceObjectKey, sha256,
+                contentType, contentLength, originalName, clientAttachmentId,
+                expires.ToUnixTimeMilliseconds()),
+            ttl,
+            cancellationToken).ConfigureAwait(false);
+
+        // 去重票无 PUT：UploadUrl 恒为空，客户端直接确认。
+        return (attachmentId, objectKey, ticket, string.Empty, string.Empty, expires);
+    }
 
     public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, long SizeBytes, string? Sha256Hex, string? Error)> StoreAsync(
         long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
@@ -138,7 +183,8 @@ public sealed class LocalAttachmentStorage(
                     if (!oversized)
                     {
                         await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
-                        shaHex = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
+                        shaHex = GetHashHex(hasher)
+                                 ?? throw new CryptographicException("附件哈希计算失败");
                     }
                 }
                 finally
@@ -211,6 +257,15 @@ public sealed class LocalAttachmentStorage(
         }
     }
 
+    private static string? GetHashHex(IncrementalHash hasher)
+    {
+        Span<byte> hash = stackalloc byte[32];
+        return hasher.TryGetHashAndReset(hash, out var hashLength)
+               && hashLength == hash.Length
+            ? Convert.ToHexStringLower(hash)
+            : null;
+    }
+
     public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
         ConfirmObjectAsync(
             long userId,
@@ -229,7 +284,16 @@ public sealed class LocalAttachmentStorage(
             info = await atomicCache.TryGetAndDeleteAsync<AttachmentUploadTicket>(ticketKey, cancellationToken)
                 .ConfigureAwait(false);
             if (info is null)
+            {
+                // 普通上传票不存在：尝试秒传去重票（Presign 命中已确认内容时签发）。
+                var dedup = await atomicCache.TryGetAndDeleteAsync<AttachmentDedupUploadTicket>(
+                        AttachmentUploadTicketKeys.CreateDedup(ticket), cancellationToken)
+                    .ConfigureAwait(false);
+                if (dedup is not null)
+                    return await ConfirmDedupObjectAsync(userId, objectKey, dedup, cancellationToken)
+                        .ConfigureAwait(false);
                 return (false, null, null, null, null, 0, null, "上传票无效或已过期");
+            }
             if (info.UserId != userId)
                 return (false, null, null, null, null, 0, null, "上传票与用户不匹配");
             if (!string.Equals(info.ObjectKey, objectKey, StringComparison.Ordinal))
@@ -332,6 +396,56 @@ public sealed class LocalAttachmentStorage(
             logger.LogWarning(ex, "删除附件失败 Key={Key}", objectKeyOrUrl);
         }
     }
+
+    private async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
+        ConfirmDedupObjectAsync(
+            long userId,
+            string objectKey,
+            AttachmentDedupUploadTicket dedup,
+            CancellationToken cancellationToken)
+    {
+        if (dedup.UserId != userId)
+            return (false, null, null, null, null, 0, null, "上传票与用户不匹配");
+        if (!string.Equals(dedup.ObjectKey, objectKey, StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "对象键与上传票不匹配");
+        if (!objectKey.StartsWith($"{userId}/", StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "无效的附件对象键");
+
+        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
+        var sourcePath = Path.GetFullPath(
+            Path.Combine(root, dedup.SourceObjectKey.Replace('/', Path.DirectorySeparatorChar)));
+        var targetPath = Path.GetFullPath(
+            Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar)));
+        if (!IsUnderRoot(root, sourcePath) || !IsUnderRoot(root, targetPath))
+            return (false, null, null, null, null, 0, null, "非法对象键");
+        if (!File.Exists(sourcePath))
+            return (false, null, null, null, null, 0, null, "内容源对象不存在，秒传失效");
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+            File.Copy(sourcePath, targetPath, overwrite: true);
+            var size = new FileInfo(targetPath).Length;
+            if (size <= 0 || size > MaxBytes)
+            {
+                TryDeleteFile(targetPath);
+                return (false, null, null, null, null, 0, null, "附件大小超限");
+            }
+
+            return (true, string.Empty, objectKey, dedup.AttachmentId,
+                dedup.ContentType, size, dedup.OriginalName, null);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "本地秒传复制失败 AttachmentId={AttachmentId}", dedup.AttachmentId);
+            TryDeleteFile(targetPath);
+            return (false, null, null, null, null, 0, null, "附件秒传复制失败");
+        }
+    }
+
+    private static bool IsContentAddress(string sha256Hex) =>
+        sha256Hex.Length == 64
+        && sha256Hex.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private Task<bool> ObjectExistsAsync(string objectKey, CancellationToken cancellationToken = default)
     {

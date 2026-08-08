@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Core.Models.Export;
 
 namespace Core.Models.Attachment;
 
@@ -8,6 +9,13 @@ public sealed class AttachmentPresignRequest
     public long ContentLength { get; set; }
     public string? OriginalName { get; set; }
     public string? ClientAttachmentId { get; set; }
+
+    /// <summary>
+    /// 文件 SHA-256（64 位小写 hex）。合法时服务端先做内容寻址去重查找：
+    /// 命中已确认/已绑定内容则返回 <see cref="AttachmentPresignResponse.Deduplicated"/>，
+    /// 客户端跳过上传直接确认。
+    /// </summary>
+    public string? Sha256 { get; set; }
 }
 
 public sealed class AttachmentPresignResponse
@@ -23,6 +31,12 @@ public sealed class AttachmentPresignResponse
 
     public string Ticket { get; init; } = string.Empty;
     public DateTimeOffset ExpiresAt { get; init; }
+
+    /// <summary>
+    /// True 表示服务端已持有相同 SHA-256 内容：客户端必须跳过 PUT 上传，
+    /// 直接以本响应的 ObjectKey/Ticket/AttachmentId 调用确认。
+    /// </summary>
+    public bool Deduplicated { get; init; }
 
     /// <summary>
     /// S3 presigned PUT headers (Content-Type, SSE and initial quarantine tag).
@@ -63,6 +77,7 @@ public sealed class ConfirmAttachmentRequest
 
 public sealed class ConfirmAttachmentResponse
 {
+    public long SagaId { get; init; }
     public string AttachmentId { get; init; } = string.Empty;
 
     /// <summary>鉴权下载路径，例如 /api/attachments/{id}/download。</summary>
@@ -76,10 +91,26 @@ public sealed class ConfirmAttachmentResponse
     /// </summary>
     public string Status { get; init; } = "Scanning";
 
+    /// <summary>Durable Server-side confirmation Saga state.</summary>
+    public string SagaStatus { get; init; } = "Requested";
+
     /// <summary>已废弃：永久公开 URL。始终为空。</summary>
     [Obsolete("Use DownloadPath. Permanent PublicUrl is no longer returned.")]
     public string PublicUrl { get; init; } = string.Empty;
 }
+
+/// <summary>附件生命周期查询结果；仅返回上传者可见的元数据。</summary>
+public sealed record AttachmentLifecycleStatusDto(
+    string AttachmentId,
+    AttachmentStatus Status,
+    string StatusName,
+    long SizeBytes,
+    string ContentType,
+    string? OriginalName,
+    long CreatedAtMs,
+    long? ConfirmedAtMs,
+    long? BoundAtMs,
+    string DownloadPath);
 
 public sealed class AttachmentSignedDownloadResponse
 {
@@ -87,7 +118,10 @@ public sealed class AttachmentSignedDownloadResponse
     public DateTimeOffset ExpiresAt { get; init; }
 }
 
-/// <summary>短时下载票：绑定 userId+attachmentId，Redis TTL 内单次消费。</summary>
+/// <summary>
+/// 短时下载票：绑定 userId+attachmentId，Redis TTL 内单次消费。
+/// 服务端通过鉴权并接受下载响应即消费；传输中断需重新签发。
+/// </summary>
 public sealed class AttachmentDownloadTicketResponse
 {
     public string AttachmentId { get; init; } = string.Empty;

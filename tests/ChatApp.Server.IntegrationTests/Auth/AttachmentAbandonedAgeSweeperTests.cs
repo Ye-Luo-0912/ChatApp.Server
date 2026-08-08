@@ -81,6 +81,10 @@ public sealed class AttachmentAbandonedAgeSweeperTests
         public bool IsAvailable => true;
         public string UnavailableReason => "";
 
+        public Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+            long uploaderUserId, string sha256Hex, CancellationToken cancellationToken = default)
+            => Task.FromResult<AttachmentDedupCandidate?>(null);
+
         public Task<Core.Models.Attachment.AttachmentUploadReservationStatus> ReserveTicketedAsync(
             string attachmentId, long uploaderUserId, string objectKey, string? publicUrl,
             string contentType, long sizeBytes, string? originalName, string? clientAttachmentId = null,

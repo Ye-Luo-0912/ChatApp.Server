@@ -13,7 +13,10 @@ namespace Infrastructure.Services;
 /// 直连 Realtime Postgres <c>{schema}.attachments</c>（Migration012 契约）。
 /// Realtime 未落地时测试可自行 CREATE TABLE 匹配本 SQL。
 /// </summary>
-public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
+public sealed class RealtimeAttachmentMetadataStore :
+    IAttachmentMetadataStore,
+    IAttachmentScanProjectionMetadataStore,
+    IAttachmentMetadataHealthProbe
 {
     private const long AttachmentQuotaLockNamespace = 0x4154545100000000L;
 
@@ -21,17 +24,20 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
     private readonly DataExportStorageOptions _export;
     private readonly AttachmentStorageOptions _attachments;
     private readonly ILogger<RealtimeAttachmentMetadataStore> _logger;
+    private readonly NpgsqlDataSource? _dataSource;
 
     public RealtimeAttachmentMetadataStore(
         IOptions<MessageEvidenceOptions> evidence,
         IOptions<DataExportStorageOptions> export,
         IOptions<AttachmentStorageOptions> attachments,
-        ILogger<RealtimeAttachmentMetadataStore> logger)
+        ILogger<RealtimeAttachmentMetadataStore> logger,
+        RealtimePostgresDataSource? sharedDataSource = null)
     {
         _evidence = evidence.Value;
         _export = export.Value;
         _attachments = attachments.Value;
         _logger = logger;
+        _dataSource = sharedDataSource?.DataSource;
     }
 
     public bool IsAvailable => !string.IsNullOrWhiteSpace(ResolveConnectionString());
@@ -40,6 +46,68 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         IsAvailable
             ? string.Empty
             : "未配置 MessageEvidence:RealtimeConnectionString / DataExport:RealtimeConnectionString";
+
+    public async Task ProbeAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand("SELECT 1", connection);
+        await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+        long uploaderUserId,
+        string sha256Hex,
+        CancellationToken cancellationToken = default)
+    {
+        if (uploaderUserId <= 0
+            || string.IsNullOrWhiteSpace(sha256Hex)
+            || sha256Hex.Length != 64)
+            return null;
+
+        var cs = ResolveConnectionString();
+        if (string.IsNullOrWhiteSpace(cs))
+            return null;
+
+        var table = TableSql();
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT attachment_id, object_key, content_type, size_bytes
+             FROM {table}
+             WHERE uploader_user_id = @uid
+               AND content_hash = lower(@hash)
+               AND status IN (@confirmed, @bound)
+             ORDER BY COALESCE(confirmed_at_ms, created_at_ms) DESC, attachment_id DESC
+             LIMIT 1
+             """, conn);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+        cmd.Parameters.AddWithValue("hash", sha256Hex);
+        cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+        cmd.Parameters.AddWithValue("bound", (short)AttachmentStatus.Bound);
+
+        try
+        {
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                return null;
+
+            var attachmentId = reader.GetString(0);
+            var objectKey = reader.GetString(1);
+            var contentType = reader.GetString(2);
+            var sizeBytes = reader.GetInt64(3);
+            return string.IsNullOrWhiteSpace(attachmentId) || string.IsNullOrWhiteSpace(objectKey)
+                ? null
+                : new AttachmentDedupCandidate(attachmentId, objectKey, contentType, sizeBytes);
+        }
+        catch (PostgresException ex) when (ex.SqlState is "42P01" or "42703")
+        {
+            // 老表无 content_hash 列或 attachments 表不可用：秒传降级为普通上传。
+            _logger.LogDebug(ex, "content_hash 列不可用，秒传降级为普通上传");
+            return null;
+        }
+    }
 
     public async Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
         string attachmentId,
@@ -62,7 +130,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         // 上传后再收敛为实际大小，避免客户端用小声明绕过总字节配额。
         var reservationBytes = _attachments.MaxBytes;
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await conn.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -175,7 +243,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         var table = TableSql();
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         // Upsert：Local 可能已 InsertTicketed；若元数据不可用时跳过了 ticketed，则在此插入。
@@ -236,7 +304,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
     {
         var cs = RequireConnectionString();
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         // Ticketed → Uploaded → Scanning for upload confirmation. A durable scan
@@ -284,7 +352,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
     {
         var cs = RequireConnectionString();
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         await using var cmd = new NpgsqlCommand(
@@ -313,6 +381,246 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
                 attachmentId, uploaderUserId, reason);
     }
 
+    public async Task<AttachmentProjectionWriteResult> MarkUploadedScanningAsync(
+        string attachmentId,
+        long uploaderUserId,
+        long sizeBytes,
+        long projectionId,
+        long scanVersion,
+        string? sha256Hex = null,
+        CancellationToken cancellationToken = default)
+    {
+        var cs = RequireConnectionString();
+        var table = TableSql();
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             UPDATE {table} AS a
+             SET status = CASE
+                     WHEN a.status IN (@ticketed, @uploaded, @scanning)
+                         THEN @scanning
+                     ELSE a.status
+                 END,
+                 size_bytes = CASE WHEN @size > 0 THEN @size ELSE a.size_bytes END,
+                 content_hash = CASE
+                     WHEN @hash IS NOT NULL AND length(@hash) > 0 THEN lower(@hash)
+                     ELSE a.content_hash
+                 END,
+                 scan_projection_id = @projection_id,
+                 scan_version = @scan_version
+             WHERE a.attachment_id = @id
+               AND a.uploader_user_id = @uid
+               AND a.status IN (@ticketed, @uploaded, @scanning, @confirmed, @rejected, @bound)
+               AND (
+                   a.scan_version < @scan_version
+                   OR (
+                       a.scan_version = @scan_version
+                       AND (a.scan_projection_id IS NULL OR a.scan_projection_id = @projection_id)
+                   )
+               )
+             """, conn);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+        cmd.Parameters.AddWithValue("size", sizeBytes);
+        cmd.Parameters.Add("hash", NpgsqlDbType.Varchar).Value =
+            string.IsNullOrWhiteSpace(sha256Hex) ? DBNull.Value : sha256Hex.Trim();
+        cmd.Parameters.AddWithValue("projection_id", projectionId);
+        cmd.Parameters.AddWithValue("scan_version", scanVersion);
+        cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+        cmd.Parameters.AddWithValue("rejected", (short)AttachmentStatus.Rejected);
+        cmd.Parameters.AddWithValue("bound", (short)AttachmentStatus.Bound);
+
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return rows == 1
+            ? AttachmentProjectionWriteResult.Applied
+            : await ResolveProjectionWriteResultAsync(
+                    conn,
+                    table,
+                    attachmentId,
+                    uploaderUserId,
+                    projectionId,
+                    scanVersion,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    public async Task<AttachmentProjectionWriteResult> ConfirmAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string objectKey,
+        string? publicUrl,
+        string contentType,
+        long sizeBytes,
+        string? originalName,
+        long projectionId,
+        long scanVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var cs = RequireConnectionString();
+        var table = TableSql();
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             UPDATE {table} AS a
+             SET object_key = @key,
+                 public_url = @url,
+                 content_type = @ct,
+                 size_bytes = CASE WHEN @size > 0 THEN @size ELSE a.size_bytes END,
+                 original_name = COALESCE(@name, a.original_name),
+                 status = @confirmed,
+                 confirmed_at_ms = COALESCE(a.confirmed_at_ms, @confirmed_at),
+                 scan_projection_id = @projection_id,
+                 scan_version = @scan_version
+             WHERE a.attachment_id = @id
+               AND a.uploader_user_id = @uid
+               AND a.status IN (@ticketed, @uploaded, @scanning, @confirmed)
+               AND (
+                   a.scan_version < @scan_version
+                   OR (
+                       a.scan_version = @scan_version
+                       AND (a.scan_projection_id IS NULL OR a.scan_projection_id = @projection_id)
+                   )
+               )
+             """, conn);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+        cmd.Parameters.AddWithValue("key", objectKey);
+        cmd.Parameters.AddWithValue("url", (object?)publicUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ct", contentType);
+        cmd.Parameters.AddWithValue("size", sizeBytes);
+        cmd.Parameters.AddWithValue("name", (object?)originalName ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+        cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        cmd.Parameters.AddWithValue("confirmed_at", nowMs);
+        cmd.Parameters.AddWithValue("projection_id", projectionId);
+        cmd.Parameters.AddWithValue("scan_version", scanVersion);
+
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return rows == 1
+            ? AttachmentProjectionWriteResult.Applied
+            : await ResolveProjectionWriteResultAsync(
+                    conn,
+                    table,
+                    attachmentId,
+                    uploaderUserId,
+                    projectionId,
+                    scanVersion,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    public async Task<AttachmentProjectionWriteResult> MarkRejectedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        string? reason,
+        long projectionId,
+        long scanVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var cs = RequireConnectionString();
+        var table = TableSql();
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             UPDATE {table} AS a
+             SET status = @rejected,
+                 scan_projection_id = @projection_id,
+                 scan_version = @scan_version
+             WHERE a.attachment_id = @id
+               AND a.uploader_user_id = @uid
+               AND a.status IN (@ticketed, @uploaded, @scanning, @rejected)
+               AND (
+                   a.scan_version < @scan_version
+                   OR (
+                       a.scan_version = @scan_version
+                       AND (a.scan_projection_id IS NULL OR a.scan_projection_id = @projection_id)
+                   )
+               )
+             """, conn);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+        cmd.Parameters.AddWithValue("rejected", (short)AttachmentStatus.Rejected);
+        cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        cmd.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        cmd.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        cmd.Parameters.AddWithValue("projection_id", projectionId);
+        cmd.Parameters.AddWithValue("scan_version", scanVersion);
+
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return rows == 1
+            ? AttachmentProjectionWriteResult.Applied
+            : await ResolveProjectionWriteResultAsync(
+                    conn,
+                    table,
+                    attachmentId,
+                    uploaderUserId,
+                    projectionId,
+                    scanVersion,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    public async Task<AttachmentProjectionWriteResult> MarkAbandonedAsync(
+        string attachmentId,
+        long uploaderUserId,
+        long projectionId,
+        long scanVersion,
+        CancellationToken cancellationToken = default)
+    {
+        var cs = RequireConnectionString();
+        var table = TableSql();
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             UPDATE {table} AS a
+             SET status = @abandoned,
+                 scan_projection_id = @projection_id,
+                 scan_version = @scan_version
+             WHERE a.attachment_id = @id
+               AND a.uploader_user_id = @uid
+               AND a.status <> @abandoned
+               AND (
+                   a.scan_version < @scan_version
+                   OR (
+                       a.scan_version = @scan_version
+                       AND (a.scan_projection_id IS NULL OR a.scan_projection_id = @projection_id)
+                   )
+               )
+             """, conn);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+        cmd.Parameters.AddWithValue("abandoned", (short)AttachmentStatus.Abandoned);
+        cmd.Parameters.AddWithValue("projection_id", projectionId);
+        cmd.Parameters.AddWithValue("scan_version", scanVersion);
+
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return rows == 1
+            ? AttachmentProjectionWriteResult.Applied
+            : await ResolveProjectionWriteResultAsync(
+                    conn,
+                    table,
+                    attachmentId,
+                    uploaderUserId,
+                    projectionId,
+                    scanVersion,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
     public async Task<AttachmentDownloadAccess> ResolveDownloadAccessAsync(
         string attachmentId,
         long userId,
@@ -330,7 +638,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         var members = MembersTableSql();
         var messages = MessagesTableSql();
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         try
@@ -417,6 +725,37 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         }
     }
 
+    public async Task<AttachmentRecord?> GetStatusForUploaderAsync(
+        string attachmentId,
+        long uploaderUserId,
+        CancellationToken cancellationToken = default)
+    {
+        var cs = ResolveConnectionString();
+        if (string.IsNullOrWhiteSpace(cs)
+            || string.IsNullOrWhiteSpace(attachmentId)
+            || uploaderUserId <= 0)
+            return null;
+
+        await using var conn = CreateConnection(cs);
+        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT attachment_id, uploader_user_id, object_key, public_url,
+                    content_type, size_bytes, original_name, status,
+                    message_id, conversation_id, client_attachment_id,
+                    created_at_ms, confirmed_at_ms, bound_at_ms
+             FROM {TableSql()}
+             WHERE attachment_id = @id AND uploader_user_id = @uid
+             """, conn);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? ReadRecord(reader)
+            : null;
+    }
+
     private async Task<AttachmentDownloadAccess> ResolveDownloadAccessUploaderFallbackAsync(
         string connectionString,
         string attachmentId,
@@ -424,7 +763,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         CancellationToken cancellationToken)
     {
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(connectionString);
+        await using var conn = CreateConnection(connectionString);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
@@ -488,7 +827,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         var table = TableSql();
         var messages = MessagesTableSql();
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         // 上传者本人的 Confirmed/Bound，或绑定到其参与消息的附件。
@@ -546,7 +885,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         CancellationToken cancellationToken)
     {
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(connectionString);
+        await using var conn = CreateConnection(connectionString);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
@@ -591,7 +930,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             return [];
 
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
@@ -626,7 +965,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             return new HashSet<string>(StringComparer.Ordinal);
 
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
@@ -661,12 +1000,20 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         if (string.IsNullOrWhiteSpace(cs)) return;
 
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
              UPDATE {table}
-             SET status = @abandoned
+             SET status = @abandoned,
+                 scan_version = CASE
+                     WHEN status <> @abandoned THEN scan_version + 1
+                     ELSE scan_version
+                 END,
+                 scan_projection_id = CASE
+                     WHEN status <> @abandoned THEN NULL
+                     ELSE scan_projection_id
+                 END
              WHERE attachment_id = ANY(@ids)
              """, conn);
         cmd.Parameters.AddWithValue("abandoned", (short)AttachmentStatus.Abandoned);
@@ -693,12 +1040,20 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         if (string.IsNullOrWhiteSpace(cs)) return;
 
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
              UPDATE {table}
-             SET status = @abandoned
+             SET status = @abandoned,
+                 scan_version = CASE
+                     WHEN status <> @abandoned THEN scan_version + 1
+                     ELSE scan_version
+                 END,
+                 scan_projection_id = CASE
+                     WHEN status <> @abandoned THEN NULL
+                     ELSE scan_projection_id
+                 END
              WHERE uploader_user_id = @uid
                AND status <> @abandoned
              """, conn);
@@ -728,12 +1083,14 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             return null;
 
         var table = TableSql();
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
              UPDATE {table}
-             SET status = @abandoned
+             SET status = @abandoned,
+                 scan_version = scan_version + 1,
+                 scan_projection_id = NULL
              WHERE attachment_id = @aid
                AND uploader_user_id = @uid
                AND message_id IS NULL
@@ -777,7 +1134,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             - (long)Math.Max(0, maxAge.TotalMilliseconds);
         var table = TableSql();
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var tx = await conn.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -786,12 +1143,20 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             await using var cmd = new NpgsqlCommand(
                 $"""
                  UPDATE {table} AS a
-                 SET status = @abandoned
+                 SET status = @abandoned,
+                     scan_version = CASE
+                         WHEN a.status <> @abandoned THEN a.scan_version + 1
+                         ELSE a.scan_version
+                     END,
+                     scan_projection_id = CASE
+                         WHEN a.status <> @abandoned THEN NULL
+                         ELSE a.scan_projection_id
+                     END
                  FROM (
                      SELECT attachment_id
                      FROM {table}
-                     WHERE status IN (@ticketed, @confirmed)
-                       AND message_id IS NULL
+                      WHERE status IN (@ticketed, @confirmed, @abandoned)
+                        AND message_id IS NULL
                        AND created_at_ms <= @cutoff_ms
                      ORDER BY created_at_ms
                      LIMIT @batch
@@ -802,10 +1167,10 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
                  """,
                 conn,
                 tx);
-            cmd.Parameters.AddWithValue("abandoned", (short)AttachmentStatus.Abandoned);
-            cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
-            cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
-            cmd.Parameters.AddWithValue("cutoff_ms", cutoffMs);
+             cmd.Parameters.AddWithValue("abandoned", (short)AttachmentStatus.Abandoned);
+             cmd.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+             cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
+             cmd.Parameters.AddWithValue("cutoff_ms", cutoffMs);
             cmd.Parameters.AddWithValue("batch", batchSize);
 
             var items = new List<AttachmentAbandonBatchItem>(batchSize);
@@ -855,7 +1220,7 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
         var stuckCutoffMs = nowMs - (long)Math.Max(0, stuckScanningAge.TotalMilliseconds);
         var table = TableSql();
 
-        await using var conn = new NpgsqlConnection(cs);
+        await using var conn = CreateConnection(cs);
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         try
@@ -975,6 +1340,40 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
             WorstUploading: [],
             WorstStuckScanning: []);
 
+    private static async Task<AttachmentProjectionWriteResult> ResolveProjectionWriteResultAsync(
+        NpgsqlConnection connection,
+        string table,
+        string attachmentId,
+        long uploaderUserId,
+        long projectionId,
+        long scanVersion,
+        CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT scan_version, scan_projection_id
+             FROM {table}
+             WHERE attachment_id = @id
+               AND uploader_user_id = @uid
+             """,
+            connection);
+        cmd.Parameters.AddWithValue("id", attachmentId);
+        cmd.Parameters.AddWithValue("uid", uploaderUserId);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return AttachmentProjectionWriteResult.NotFound;
+
+        // A zero-row CAS means another generation already owns the target (or
+        // the row is in a terminal state that this projection must not replace).
+        // Treat it as an idempotent supersession, never as permission to retry a
+        // stale write indefinitely.
+        _ = scanVersion;
+        _ = projectionId;
+        return AttachmentProjectionWriteResult.AlreadySuperseded;
+    }
+
     private static void AddOrphanParams(NpgsqlCommand cmd, long orphanCutoffMs, long stuckCutoffMs)
     {
         cmd.Parameters.AddWithValue("confirmed", (short)AttachmentStatus.Confirmed);
@@ -1041,6 +1440,10 @@ public sealed class RealtimeAttachmentMetadataStore : IAttachmentMetadataStore
     private string RequireConnectionString() =>
         ResolveConnectionString()
         ?? throw new InvalidOperationException(UnavailableReason);
+
+    private NpgsqlConnection CreateConnection(string? connectionString = null) =>
+        _dataSource?.CreateConnection()
+        ?? new NpgsqlConnection(connectionString ?? RequireConnectionString());
 
     private string? ResolveConnectionString()
     {

@@ -141,6 +141,28 @@ public sealed class AttachmentBlobDeleteTests
             (await db.AttachmentBlobDeleteJobs.SingleAsync()).Status);
     }
 
+    [Fact]
+    public async Task RepeatedAbandonedSweep_DoesNotCreateNewJobAfterTerminalDelete()
+    {
+        await using var db = CreateDb();
+        var storage = new FlakyAttachmentStorage(failUntilAttempt: 0);
+        var svc = CreateService(db, storage);
+
+        await svc.EnqueueAsync(
+            [("user/1/aged.bin", "attachment-1")],
+            userId: 1);
+        Assert.Equal(1, await svc.ProcessDueAsync());
+
+        await svc.EnqueueAsync(
+            [("user/1/aged.bin", "attachment-1")],
+            userId: 1);
+
+        Assert.Equal(1, await db.AttachmentBlobDeleteJobs.CountAsync());
+        Assert.Equal(
+            AttachmentBlobDeleteJobStatus.Done,
+            (await db.AttachmentBlobDeleteJobs.SingleAsync()).Status);
+    }
+
     private static AttachmentBlobDeleteService CreateService(
         UserDbContext db,
         IAttachmentStorage storage,
@@ -176,6 +198,13 @@ public sealed class AttachmentBlobDeleteTests
             CreateUploadTicketAsync(
                 long userId, string contentType, long contentLength,
                 string? originalName = null, string? clientAttachmentId = null,
+                CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+            CreateDedupTicketAsync(
+                long userId, string sourceObjectKey, string contentType, long contentLength,
+                string sha256, string? originalName = null, string? clientAttachmentId = null,
                 CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 

@@ -3,6 +3,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
+using Core.Models.Token;
 using Core.Settings;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -10,7 +11,7 @@ using Microsoft.Extensions.Options;
 namespace Infrastructure.Services;
 
 /// <summary>S3/MinIO 预签名附件上传；扫描通过后以 ETag fencing 提升到不可变最终键。</summary>
-public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadHeadersProvider, IAttachmentScanStateMarker, IAttachmentScanFinalizer, IObjectStoreHealthProbe, IDisposable
+public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadHeadersProvider, IAttachmentScanStateMarker, IAttachmentScanFinalizer, IAttachmentConfirmRecovery, IObjectStoreHealthProbe, IS3LifecycleHealthProbe, IDisposable
 {
     private readonly AttachmentStorageOptions _options;
     private readonly ICacheValueStore _cache;
@@ -59,6 +60,16 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         }
     }
 
+    public Task ValidateLifecycleAsync(CancellationToken cancellationToken = default) =>
+        S3LifecycleConfigurationValidator.RequireAsync(
+            _s3,
+            _options.S3Bucket!,
+            [
+                S3LifecycleRequirement.Tag("chatapp-scan-state", "unconfirmed"),
+                S3LifecycleRequirement.Tag("chatapp-scan-state", "quarantine"),
+            ],
+            cancellationToken);
+
     public bool IsAllowedContentType(string contentType) =>
         _options.AllowedContentTypes.Any(t =>
             string.Equals(t, contentType, StringComparison.OrdinalIgnoreCase));
@@ -80,7 +91,7 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         var attachmentId = Guid.NewGuid().ToString("N");
         // Client-writable URLs only ever target quarantine/staging objects.
         var objectKey = $"attachments/{userId}/staging/{attachmentId}";
-        var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
+        var ticket = TokenBufferEncoding.CreateHex(24);
         var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
 
         await _cache.SetAsync(
@@ -108,10 +119,53 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
 
     public Task CancelUploadTicketAsync(
         string ticket,
-        CancellationToken cancellationToken = default) =>
-        string.IsNullOrWhiteSpace(ticket)
-            ? Task.CompletedTask
-            : _cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(ticket))
+            return Task.CompletedTask;
+        // 普通票与去重票都可能存在：两键皆清（幂等）。
+        return Task.WhenAll(
+            _cache.RemoveAsync(AttachmentUploadTicketKeys.Create(ticket), cancellationToken),
+            _cache.RemoveAsync(AttachmentUploadTicketKeys.CreateDedup(ticket), cancellationToken));
+    }
+
+    public async Task<(string AttachmentId, string ObjectKey, string Ticket, string UploadUrl, string PublicUrl, DateTimeOffset ExpiresAt)>
+        CreateDedupTicketAsync(
+            long userId,
+            string sourceObjectKey,
+            string contentType,
+            long contentLength,
+            string sha256,
+            string? originalName = null,
+            string? clientAttachmentId = null,
+            CancellationToken cancellationToken = default)
+    {
+        if (!IsAllowedContentType(contentType))
+            throw new ArgumentException("不支持的附件格式");
+        if (contentLength <= 0 || contentLength > MaxBytes)
+            throw new ArgumentException($"附件大小须在 1~{MaxBytes} 字节之间");
+        if (string.IsNullOrWhiteSpace(sourceObjectKey))
+            throw new ArgumentException("缺少秒传源对象键");
+        if (!IsContentAddress(sha256))
+            throw new ArgumentException("秒传 SHA-256 格式无效");
+
+        var attachmentId = Guid.NewGuid().ToString("N");
+        // 与普通票一致：确认后经扫描阶段提升到不可变最终键。
+        var objectKey = $"attachments/{userId}/staging/{attachmentId}";
+        var ticket = TokenBufferEncoding.CreateHex(24);
+        var expires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
+
+        await _cache.SetAsync(
+            AttachmentUploadTicketKeys.CreateDedup(ticket),
+            new AttachmentDedupUploadTicket(
+                userId, attachmentId, objectKey, sourceObjectKey, sha256,
+                contentType, contentLength, originalName, clientAttachmentId,
+                expires.ToUnixTimeMilliseconds()),
+            expires - DateTimeOffset.UtcNow,
+            cancellationToken).ConfigureAwait(false);
+
+        return (attachmentId, objectKey, ticket, string.Empty, string.Empty, expires);
+    }
 
     public IReadOnlyDictionary<string, string> GetRequiredUploadHeaders(string contentType)
     {
@@ -157,7 +211,17 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
                 ticketKey, cancellationToken)
             .ConfigureAwait(false);
         if (info is null)
+        {
+            // 普通上传票不存在：尝试秒传去重票（Presign 命中已确认内容时签发）。
+            var dedup = await _atomicCache.TryGetAndDeleteAsync<AttachmentDedupUploadTicket>(
+                    AttachmentUploadTicketKeys.CreateDedup(ticket), cancellationToken)
+                .ConfigureAwait(false);
+            if (dedup is not null)
+                return await ConfirmDedupObjectAsync(
+                        userId, objectKey, dedup, cancellationToken)
+                    .ConfigureAwait(false);
             return (false, null, null, null, null, 0, null, "上传票无效或已过期");
+        }
         if (info.UserId != userId)
             return (false, null, null, null, null, 0, null, "上传票与用户不匹配");
         if (!string.Equals(info.ObjectKey, objectKey, StringComparison.Ordinal))
@@ -239,7 +303,147 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         }
     }
 
+    private async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
+        ConfirmDedupObjectAsync(
+            long userId,
+            string objectKey,
+            AttachmentDedupUploadTicket dedup,
+            CancellationToken cancellationToken)
+    {
+        if (dedup.UserId != userId)
+            return (false, null, null, null, null, 0, null, "上传票与用户不匹配");
+        if (!string.Equals(dedup.ObjectKey, objectKey, StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "对象键与上传票不匹配");
+        if (!objectKey.StartsWith($"attachments/{userId}/", StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "对象键与用户不匹配");
+
+        var sourceKey = NormalizeKey(dedup.SourceObjectKey);
+        if (!sourceKey.StartsWith($"attachments/{userId}/", StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "秒传源对象与用户不匹配");
+
+        try
+        {
+            // 服务端复制已扫描验证的内容，不经网络传输客户端字节。
+            var copyRequest = new CopyObjectRequest
+            {
+                SourceBucket = _options.S3Bucket,
+                SourceKey = sourceKey,
+                DestinationBucket = _options.S3Bucket,
+                DestinationKey = objectKey,
+            };
+            S3ClientFactory.ApplyServerSideEncryption(
+                copyRequest, _options.S3SseMode, _options.S3KmsKeyId);
+            await _s3.CopyObjectAsync(copyRequest, cancellationToken).ConfigureAwait(false);
+
+            var meta = await _s3.GetObjectMetadataAsync(_options.S3Bucket, objectKey, cancellationToken)
+                .ConfigureAwait(false);
+            if (meta.ContentLength <= 0 || meta.ContentLength > MaxBytes)
+            {
+                try
+                {
+                    await _blobDeletes.EnqueueAsync(
+                            [(objectKey, dedup.AttachmentId)], userId, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "秒传复制超限对象删除任务入队失败 AttachmentId={AttachmentId} Key={Key}",
+                        dedup.AttachmentId,
+                        objectKey);
+                }
+
+                return (false, null, null, null, null, 0, null, "附件大小超限");
+            }
+
+            await MarkScanStateAsync(objectKey, "quarantine", cancellationToken)
+                .ConfigureAwait(false);
+
+            var contentType = string.IsNullOrWhiteSpace(meta.Headers.ContentType)
+                ? dedup.ContentType
+                : meta.Headers.ContentType;
+            return (true, string.Empty, objectKey, dedup.AttachmentId,
+                contentType, meta.ContentLength, dedup.OriginalName, null);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return (false, null, null, null, null, 0, null, "内容源对象不存在，秒传失效");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "S3 秒传复制失败 AttachmentId={AttachmentId}", dedup.AttachmentId);
+            return (false, null, null, null, null, 0, null, "附件秒传复制失败");
+        }
+    }
+
     public string? TryResolveLocalPhysicalPath(string objectKey) => null;
+
+    public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
+        RecoverConfirmedObjectAsync(
+            long userId,
+            string objectKey,
+            string attachmentId,
+            CancellationToken cancellationToken = default)
+    {
+        if (!Guid.TryParseExact(attachmentId, "N", out _))
+            return (false, null, null, null, null, 0, null, "附件标识格式无效");
+
+        var sourceKey = NormalizeKey(objectKey);
+        var stagingKey = $"attachments/{userId}/staging/{attachmentId}";
+        var legacyKey = $"attachments/{userId}/{attachmentId}";
+        if (!string.Equals(sourceKey, stagingKey, StringComparison.Ordinal)
+            && !string.Equals(sourceKey, legacyKey, StringComparison.Ordinal))
+            return (false, null, null, null, null, 0, null, "附件暂存键与用户或附件标识不匹配");
+
+        try
+        {
+            var metadata = await _s3.GetObjectMetadataAsync(
+                    _options.S3Bucket,
+                    sourceKey,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (metadata.ContentLength <= 0 || metadata.ContentLength > MaxBytes)
+            {
+                await _blobDeletes.EnqueueAsync(
+                        [(sourceKey, attachmentId)], userId, cancellationToken)
+                    .ConfigureAwait(false);
+                return (false, null, null, null, null, 0, null, "附件大小超限");
+            }
+
+            // The first ticketed confirm tags the object as quarantine after
+            // consuming the one-shot ticket. Requiring that tag distinguishes
+            // an ambiguous retry from a ticket that expired before storage
+            // confirmation began.
+            var tags = await _s3.GetObjectTaggingAsync(
+                    new GetObjectTaggingRequest
+                    {
+                        BucketName = _options.S3Bucket,
+                        Key = sourceKey,
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var quarantined = tags.Tagging.Any(tag =>
+                string.Equals(tag.Key, "chatapp-scan-state", StringComparison.Ordinal)
+                && string.Equals(tag.Value, "quarantine", StringComparison.Ordinal));
+            if (!quarantined)
+            {
+                return (false, null, null, null, null, 0, null,
+                    "上传票未完成确认或对象隔离状态缺失");
+            }
+
+            var contentType = string.IsNullOrWhiteSpace(metadata.Headers.ContentType)
+                ? "application/octet-stream"
+                : metadata.Headers.ContentType;
+            return (true, string.Empty, sourceKey, attachmentId, contentType,
+                metadata.ContentLength, null, null);
+        }
+        catch (AmazonS3Exception ex)
+            when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return (false, null, null, null, null, 0, null, "附件对象不存在");
+        }
+    }
 
     public async Task<AttachmentReadResult?> OpenReadAsync(
         string objectKey,
@@ -365,8 +569,23 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
             throw new InvalidOperationException("附件暂存键与用户或附件标识不匹配");
 
         var finalKey = $"attachments/{userId}/confirmed/{attachmentId}";
-        if (!await ObjectHasEntityTagAsync(finalKey, expectedEntityTag, cancellationToken)
-                .ConfigureAwait(false))
+        var existingFinalTag = await TryGetEntityTagAsync(finalKey, cancellationToken)
+            .ConfigureAwait(false);
+        if (existingFinalTag is not null)
+        {
+            // The destination key is the idempotency key. A retry with the
+            // same scanned ETag is already complete; a different ETag must
+            // never overwrite a result produced by another scan generation.
+            if (!string.Equals(
+                    existingFinalTag,
+                    expectedEntityTag.Trim(),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "附件最终对象已存在但 ETag 不匹配，拒绝覆盖");
+            }
+        }
+        else
         {
             var request = new CopyObjectRequest
             {
@@ -389,8 +608,13 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
                 // The source changed after its stream was scanned. An earlier
                 // ambiguous copy is safe only when the destination proves that it
                 // already contains the scanned ETag.
-                if (!await ObjectHasEntityTagAsync(
-                        finalKey, expectedEntityTag, cancellationToken).ConfigureAwait(false))
+                var copiedFinalTag = await TryGetEntityTagAsync(
+                        finalKey, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!string.Equals(
+                        copiedFinalTag,
+                        expectedEntityTag.Trim(),
+                        StringComparison.Ordinal))
                     throw new InvalidOperationException(
                         "附件对象在扫描后发生变化，拒绝确认", ex);
             }
@@ -401,9 +625,8 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         return new AttachmentFinalizedObject(finalKey, sourceKey);
     }
 
-    private async Task<bool> ObjectHasEntityTagAsync(
+    private async Task<string?> TryGetEntityTagAsync(
         string objectKey,
-        string expectedEntityTag,
         CancellationToken cancellationToken)
     {
         try
@@ -411,16 +634,17 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
             var metadata = await _s3.GetObjectMetadataAsync(
                     _options.S3Bucket, objectKey, cancellationToken)
                 .ConfigureAwait(false);
-            return string.Equals(
-                metadata.ETag?.Trim(),
-                expectedEntityTag.Trim(),
-                StringComparison.Ordinal);
+            return metadata.ETag?.Trim();
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            return false;
+            return null;
         }
     }
+
+    private static bool IsContentAddress(string sha256Hex) =>
+        sha256Hex.Length == 64
+        && sha256Hex.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private string NormalizeKey(string objectKeyOrUrl)
     {

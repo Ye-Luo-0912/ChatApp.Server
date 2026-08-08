@@ -13,6 +13,15 @@ public interface IAttachmentMetadataStore
     string UnavailableReason { get; }
 
     /// <summary>
+    /// 秒传去重候选：上传者已确认/已绑定的内容中，content_hash 匹配的最新一条。
+    /// 命中时 Presign 返回 Deduplicated，客户端免上传。列缺失/表不可用返回 null。
+    /// </summary>
+    Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+        long uploaderUserId,
+        string sha256Hex,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 在用户级串行化边界内检查未确认对象数和总存储字节，并预留 Ticketed 行。
     /// 配额检查与插入必须原子完成。
     /// </summary>
@@ -61,6 +70,13 @@ public interface IAttachmentMetadataStore
         long userId,
         CancellationToken cancellationToken = default);
 
+    /// <summary>读取上传者自己的生命周期状态，不返回未授权用户的存在性。</summary>
+    Task<AttachmentRecord?> GetStatusForUploaderAsync(
+        string attachmentId,
+        long uploaderUserId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<AttachmentRecord?>(null);
+
     /// <summary>导出优先：用户上传的 Confirmed/Bound，或已绑定到其消息的附件。</summary>
     Task<IReadOnlyList<AttachmentRecord>> ListForExportAsync(
         long userId,
@@ -93,7 +109,8 @@ public interface IAttachmentMetadataStore
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 批量放弃过期未绑定 Ticketed/Confirmed（message_id 为空），供年龄清扫入队 blob 删除。
+    /// 批量放弃过期未绑定 Ticketed/Confirmed（message_id 为空），并重复返回
+    /// 已 Abandoned 但尚未成功建立 blob 删除墓碑的候选。
     /// </summary>
     Task<IReadOnlyList<AttachmentAbandonBatchItem>> AbandonAgedUnboundAsync(
         TimeSpan maxAge,
@@ -115,6 +132,13 @@ public sealed record AttachmentAbandonBatchItem(
     string AttachmentId,
     string ObjectKey,
     long UploaderUserId);
+
+/// <summary>秒传去重命中结果：源对象键与展示信息。</summary>
+public sealed record AttachmentDedupCandidate(
+    string AttachmentId,
+    string ObjectKey,
+    string ContentType,
+    long SizeBytes);
 
 /// <summary>元数据侧孤儿/卡住扫描聚合（供 Admin ops）。</summary>
 public sealed record AttachmentOpsOrphanQueryResult(
@@ -148,6 +172,12 @@ public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStor
     public bool IsAvailable => false;
     public string UnavailableReason =>
         "未配置 MessageEvidence:RealtimeConnectionString / DataExport:RealtimeConnectionString";
+
+    public Task<AttachmentDedupCandidate?> TryFindDedupCandidateAsync(
+        long uploaderUserId,
+        string sha256Hex,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<AttachmentDedupCandidate?>(null);
 
     public Task<AttachmentUploadReservationStatus> ReserveTicketedAsync(
         string attachmentId,
@@ -194,6 +224,12 @@ public sealed class UnavailableAttachmentMetadataStore : IAttachmentMetadataStor
         => Task.FromResult(new AttachmentDownloadAccess(
             attachmentId, string.Empty, "application/octet-stream", null,
             AttachmentDownloadDecision.Unavailable));
+
+    public Task<AttachmentRecord?> GetStatusForUploaderAsync(
+        string attachmentId,
+        long uploaderUserId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<AttachmentRecord?>(null);
 
     public Task<IReadOnlyList<AttachmentRecord>> ListForExportAsync(
         long userId, int maxRows = 50_000, CancellationToken cancellationToken = default)
