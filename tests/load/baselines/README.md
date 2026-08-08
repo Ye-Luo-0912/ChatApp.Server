@@ -27,7 +27,7 @@ k6 run -e PROFILE=steady -e RATE=20 -e DURATION=15m \
 node tests/load/extract-summary.mjs \
   --input steady-15m.json \
   --output tests/load/baselines/baseline-steady-rate20.json \
-  --runner ubuntu-24.04 \
+  --runner "$PERF_RUNNER_ID" \
   --runtime "steady 15m RATE=20"
 git add tests/load/baselines/baseline-steady-rate20.json
 git commit -m "perf: refresh steady baseline"
@@ -49,6 +49,7 @@ allocations/request ≤ +10%、Redis commands/request 不得增加、DB queries/
 
 ## 注意
 
-- 基线仅在固定 runner（`ubuntu-24.04`）上有效；自托管 runner 需重新校准。
+- `ubuntu-24.04` 只固定 runner 镜像，不是物理硬件身份；正式基线必须使用实际
+  `PERF_RUNNER_ID`。runner 不匹配时 Stage Gate 会自动执行同机 paired baseline。
 - 硬件变更后必须重新生成基线，并在 commit message 中注明硬件配置。
 - 不要手工编辑基线 JSON——它应由 `extract-summary.mjs` 从原始事件流生成。

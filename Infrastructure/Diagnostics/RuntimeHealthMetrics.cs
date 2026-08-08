@@ -1,6 +1,8 @@
 using System.Diagnostics.Metrics;
+using Core.Settings;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
 namespace Infrastructure.Diagnostics;
@@ -12,6 +14,7 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
     private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<RuntimeHealthMetrics> _logger;
     private readonly WorkerConcurrencyManager _concurrencyManager;
+    private readonly RuntimeHealthMetricsOptions _options;
     private readonly ObservableGauge<long> _workingSet;
     private readonly ObservableGauge<long> _gcHeap;
     private readonly Histogram<double> _redisPingMs;
@@ -20,11 +23,13 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
     public RuntimeHealthMetrics(
         IConnectionMultiplexer redis,
         WorkerConcurrencyManager concurrencyManager,
-        ILogger<RuntimeHealthMetrics> logger)
+        ILogger<RuntimeHealthMetrics> logger,
+        IOptions<RuntimeHealthMetricsOptions> options)
     {
         _redis = redis;
         _concurrencyManager = concurrencyManager;
         _logger = logger;
+        _options = options.Value;
         _workingSet = Meter.CreateObservableGauge(
             "process.memory.working_set",
             () => Environment.WorkingSet,
@@ -60,6 +65,16 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
             () => _concurrencyManager.GetOldestPendingJobMeasurements(),
             "ms",
             "按 Worker 分类的最老待处理任务年龄");
+        _ = Meter.CreateObservableGauge(
+            "worker.backlog.by_worker",
+            () => _concurrencyManager.GetBacklogMeasurements(),
+            "jobs",
+            "按 Worker 分类的待处理作业数");
+        _ = Meter.CreateObservableGauge(
+            "worker.effective_global_concurrency",
+            () => _concurrencyManager.EffectiveGlobalMaxConcurrency,
+            "jobs",
+            "按数据库连接池预算收敛后的 Worker 全局并发");
         _redisPingMs = Meter.CreateHistogram<double>("redis.ping.duration", "ms", "Redis PING 延迟");
         // 保留引用，避免被优化掉
         _ = _workingSet;
@@ -68,8 +83,13 @@ public sealed class RuntimeHealthMetrics : IHostedService, IDisposable
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        if (!_options.RedisPingEnabled)
+            return Task.CompletedTask;
+
         _timer = new Timer(async _ => await PingRedisAsync().ConfigureAwait(false),
-            null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30));
+            null,
+            TimeSpan.FromSeconds(Math.Max(1, _options.RedisPingIntervalSeconds / 2)),
+            TimeSpan.FromSeconds(_options.RedisPingIntervalSeconds));
         return Task.CompletedTask;
     }
 

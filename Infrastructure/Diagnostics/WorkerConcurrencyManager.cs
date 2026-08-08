@@ -24,9 +24,15 @@ public sealed class WorkerConcurrencyManager : IDisposable
     private static readonly Histogram<double> WaitHistogram =
         WorkerMeter.CreateHistogram<double>("worker.wait", "ms", "按 Worker 分类的并发槽等待时间");
     private static readonly Counter<long> Throughput =
-        WorkerMeter.CreateCounter<long>("worker.throughput", "jobs", "获取并发槽并完成释放的作业数");
+        WorkerMeter.CreateCounter<long>("worker.throughput", "jobs", "真正落终态的作业数");
     private static readonly Counter<long> LeaseLost =
         WorkerMeter.CreateCounter<long>("worker.lease_lost", "jobs", "租约丢失作业数");
+    private static readonly Counter<long> LeaseUncertain =
+        WorkerMeter.CreateCounter<long>("worker.lease_uncertain", "jobs", "无法确认租约仍归属本实例的作业数");
+    private static readonly Counter<long> HeartbeatFailure =
+        WorkerMeter.CreateCounter<long>("worker.heartbeat_failure", "events", "租约心跳续租失败次数");
+    private static readonly Counter<long> Reclaimed =
+        WorkerMeter.CreateCounter<long>("worker.reclaim", "jobs", "租约过期后回收的作业数");
 
     private readonly SemaphoreSlim _globalSemaphore;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _perWorker = new();
@@ -34,6 +40,8 @@ public sealed class WorkerConcurrencyManager : IDisposable
     private long _totalWaitTicks;
     private long _waitCount;
     private readonly ConcurrentDictionary<string, long> _oldestPendingByWorker = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _backlogByWorker = new(StringComparer.Ordinal);
+    public int EffectiveGlobalMaxConcurrency { get; }
 
     /// <summary>平均等待获取并发槽的时间。</summary>
     public TimeSpan AverageWaitTime
@@ -46,12 +54,21 @@ public sealed class WorkerConcurrencyManager : IDisposable
         }
     }
 
-    public WorkerConcurrencyManager(IOptions<WorkerConcurrencyOptions> options)
+    public WorkerConcurrencyManager(
+        IOptions<WorkerConcurrencyOptions> options,
+        IOptions<DatabasePoolOptions>? databasePoolOptions = null)
     {
         var opts = options.Value;
+        var poolBudget = Math.Max(
+            1,
+            databasePoolOptions?.Value.EffectiveMaximumPoolSize
+            ?? checked(opts.GlobalMaxConcurrency));
+        EffectiveGlobalMaxConcurrency = Math.Max(
+            1,
+            Math.Min(opts.GlobalMaxConcurrency, poolBudget));
         _globalSemaphore = new SemaphoreSlim(
-            Math.Max(1, opts.GlobalMaxConcurrency),
-            Math.Max(1, opts.GlobalMaxConcurrency));
+            EffectiveGlobalMaxConcurrency,
+            EffectiveGlobalMaxConcurrency);
     }
 
     /// <summary>
@@ -91,7 +108,7 @@ public sealed class WorkerConcurrencyManager : IDisposable
         WaitHistogram.Record(elapsed.TotalMilliseconds,
             new KeyValuePair<string, object?>("worker", workerName));
 
-        return new ConcurrencyScope(_globalSemaphore, workerSemaphore, workerName);
+        return new ConcurrencyScope(_globalSemaphore, workerSemaphore);
     }
 
     /// <summary>
@@ -122,7 +139,7 @@ public sealed class WorkerConcurrencyManager : IDisposable
 
         WaitHistogram.Record(0,
             new KeyValuePair<string, object?>("worker", workerName));
-        scope = new ConcurrencyScope(_globalSemaphore, workerSemaphore, workerName);
+        scope = new ConcurrencyScope(_globalSemaphore, workerSemaphore);
         return true;
     }
 
@@ -154,8 +171,40 @@ public sealed class WorkerConcurrencyManager : IDisposable
         }
     }
 
+    public void RecordBacklog(string workerName, long count)
+        => _backlogByWorker[workerName] = Math.Max(0, count);
+
+    public IEnumerable<Measurement<long>> GetBacklogMeasurements()
+    {
+        foreach (var pair in _backlogByWorker)
+        {
+            yield return new Measurement<long>(
+                pair.Value,
+                new KeyValuePair<string, object?>("worker", pair.Key));
+        }
+    }
+
     public void RecordLeaseLost(string workerName)
         => LeaseLost.Add(1, new KeyValuePair<string, object?>("worker", workerName));
+
+    public void RecordLeaseUncertain(string workerName)
+        => LeaseUncertain.Add(1, new KeyValuePair<string, object?>("worker", workerName));
+
+    public void RecordHeartbeatFailure(string workerName)
+        => HeartbeatFailure.Add(1, new KeyValuePair<string, object?>("worker", workerName));
+
+    public void RecordReclaimed(string workerName, int count = 1)
+    {
+        if (count > 0)
+            Reclaimed.Add(count, new KeyValuePair<string, object?>("worker", workerName));
+    }
+
+    /// <summary>
+    /// 记录一个作业确实落入 Done/DeadLetter 等终态。并发 reservation 的
+    /// 释放不代表作业完成，空队列与 claim 失败路径不得调用此方法。
+    /// </summary>
+    public void RecordCompleted(string workerName)
+        => Throughput.Add(1, new KeyValuePair<string, object?>("worker", workerName));
 
     public void Dispose()
     {
@@ -166,14 +215,12 @@ public sealed class WorkerConcurrencyManager : IDisposable
 
     private sealed class ConcurrencyScope(
         SemaphoreSlim global,
-        SemaphoreSlim worker,
-        string workerName) : IAsyncDisposable
+        SemaphoreSlim worker) : IAsyncDisposable
     {
         public ValueTask DisposeAsync()
         {
             worker.Release();
             global.Release();
-            Throughput.Add(1, new KeyValuePair<string, object?>("worker", workerName));
             return ValueTask.CompletedTask;
         }
     }

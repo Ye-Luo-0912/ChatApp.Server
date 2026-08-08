@@ -1,9 +1,11 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using ChatApp.Server.IntegrationTests.Support;
+using Core.Interfaces.Auth;
 using Core.Models.Identity;
 using Core.Models.Security;
 using Infrastructure.Data;
@@ -85,15 +87,13 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
         client.UseBearer(login.AccessToken!);
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/users/me")).StatusCode);
 
-        // Deliberately change only PostgreSQL. The access token remains in Redis
-        // and in the in-process L1 cache, reproducing a failed revoke dual-write.
-        await using (var db = postgres.CreateContext())
+        // Advance the durable fence through the single security-version
+        // primitive. This deliberately does not delete the access-token row;
+        // the cached token must fail on the Auth Fence version mismatch.
+        await using (var scope = factory.Services.CreateAsyncScope())
         {
-            await db.Users
-                .Where(user => user.Id == userId)
-                .ExecuteUpdateAsync(update => update
-                    .SetProperty(user => user.SecurityVersion, user => user.SecurityVersion + 1)
-                    .SetProperty(user => user.SecurityStamp, Guid.NewGuid().ToString()));
+            var versions = scope.ServiceProvider.GetRequiredService<ISecurityVersionAdvancer>();
+            Assert.NotNull(await versions.AdvanceSecurityVersionAsync(userId));
         }
 
         Assert.Equal(
@@ -102,89 +102,102 @@ public sealed class WebPipelineTests(PostgresTestFixture postgres, RedisTestFixt
     }
 
     [SkippableFact]
-    public async Task Idempotent_FriendRequest_Concurrent_OnlyOneCreatesPending()
+    public async Task WarmedAuthenticatedRead_HasZeroAuthFencePostgresQueries()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        var sharedPrefix = $"waf-idem:{Guid.NewGuid():N}:";
-        var avatarRoot = Path.Combine(Path.GetTempPath(), "chatapp-waf-avatars", Guid.NewGuid().ToString("N"));
-        await using var factoryA = CreateFactory(sharedPrefix, avatarRoot);
-        await using var factoryB = CreateFactory(sharedPrefix, avatarRoot);
+        await using var factory = CreateFactory();
+        using var client = factory.CreateClientWithDevice($"dev-auth-warm-{Guid.NewGuid():N}"[..24]);
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        await using (var db = postgres.CreateContext())
+            await WafTestHelpers.SeedUserAsync(
+                db, $"auth-warm-{suffix}", $"auth-warm-{suffix}@ex.com", "Passw0rd!");
+
+        var login = await WafTestHelpers.LoginAsync(client, $"auth-warm-{suffix}", "Passw0rd!");
+        client.UseBearer(login.AccessToken!);
+
+        // The first request is allowed to establish the process-local token
+        // and authorization-fence entries. The assertion targets a later
+        // ordinary read, after both L1 caches are definitely warm.
+        using var warmup = await client.GetAsync("/api/users/me");
+        Assert.Equal(HttpStatusCode.OK, warmup.StatusCode);
+
+        using var response = await client.GetAsync("/api/users/me");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(
+            "0",
+            response.Headers.GetValues("X-ChatApp-Auth-Db-Commands").Single());
+    }
+
+    [SkippableFact]
+    public async Task SecurityVersionInvalidation_ReachesSecondInstanceWithinSla()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        var sharedPrefix = $"waf-fence-sla:{Guid.NewGuid():N}:";
+        var extra = new Dictionary<string, string?>
+        {
+            ["JwtSettings:AuthFenceL1CacheTtlMilliseconds"] = "1000",
+        };
+        await using var factoryA = CreateFactory(sharedPrefix, extra: extra);
+        await using var factoryB = CreateFactory(sharedPrefix, extra: extra);
 
         var suffix = Guid.NewGuid().ToString("N")[..8];
-        long requesterId, targetId, otherTargetId;
         await using (var db = postgres.CreateContext())
-        {
-            var requester = await WafTestHelpers.SeedUserAsync(db, $"req-{suffix}", $"req-{suffix}@ex.com", "Passw0rd!");
-            var target = await WafTestHelpers.SeedUserAsync(db, $"tar-{suffix}", $"tar-{suffix}@ex.com", "Passw0rd!");
-            var otherTarget = await WafTestHelpers.SeedUserAsync(
-                db, $"tar2-{suffix}", $"tar2-{suffix}@ex.com", "Passw0rd!");
-            requesterId = requester.Id;
-            targetId = target.Id;
-            otherTargetId = otherTarget.Id;
-        }
+            await WafTestHelpers.SeedUserAsync(
+                db, $"fence-sla-{suffix}", $"fence-sla-{suffix}@ex.com", "Passw0rd!");
 
-        using var clientA = factoryA.CreateClientWithDevice($"dev-idem-a-{Guid.NewGuid():N}"[..28]);
-        using var clientB = factoryB.CreateClientWithDevice($"dev-idem-b-{Guid.NewGuid():N}"[..28]);
-        // 同一用户、同一设备指纹前缀会导致不同会话；幂等按 userId，需同一用户 token。
-        // 用同一客户端登录拿 token，再复制到两个实例的 HttpClient。
-        var login = await WafTestHelpers.LoginAsync(clientA, $"req-{suffix}", "Passw0rd!");
-        clientA.UseBearer(login.AccessToken!);
+        using var clientA = factoryA.CreateClientWithDevice($"dev-fence-a-{Guid.NewGuid():N}"[..24]);
+        using var clientB = factoryB.CreateClientWithDevice($"dev-fence-b-{Guid.NewGuid():N}"[..24]);
+        var login = await WafTestHelpers.LoginAsync(clientA, $"fence-sla-{suffix}", "Passw0rd!");
         clientB.UseBearer(login.AccessToken!);
 
-        var idemKey = $"idem-{Guid.NewGuid():N}";
-        var payload = JsonSerializer.Serialize(new { targetUserId = targetId, message = "hi" }, WafTestHelpers.Json);
+        // Warm the second instance's token and auth-fence L1 entries first.
+        Assert.Equal(HttpStatusCode.OK, (await clientB.GetAsync("/api/users/me")).StatusCode);
 
-        async Task<HttpResponseMessage> SendAsync(HttpClient c)
+        await using (var scope = factoryA.Services.CreateAsyncScope())
         {
-            var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var req = new HttpRequestMessage(HttpMethod.Post, "/api/Friendship/requests") { Content = content };
-            req.Headers.Add("X-Idempotency-Key", idemKey);
-            return await c.SendAsync(req);
+            var versions = scope.ServiceProvider.GetRequiredService<ISecurityVersionAdvancer>();
+            Assert.NotNull(await versions.AdvanceSecurityVersionAsync(login.UserId!.Value));
         }
 
-        var tasks = new[] { SendAsync(clientA), SendAsync(clientB) };
-        var results = await Task.WhenAll(tasks);
-        var bodies = await Task.WhenAll(results.Select(async r =>
-            $"{(int)r.StatusCode} replay={r.Headers.Contains("X-Idempotent-Replay")} body={await r.Content.ReadAsStringAsync()}"));
-
-        // 若并发均落到 processing Conflict，短暂等待后由任一实例重放完成态。
-        if (results.All(r => r.StatusCode == HttpStatusCode.Conflict))
+        var stopwatch = Stopwatch.StartNew();
+        var status = HttpStatusCode.OK;
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(2))
         {
-            await Task.Delay(200);
-            var retry = await SendAsync(clientA);
-            results = [.. results, retry];
-            bodies = [.. bodies, $"{(int)retry.StatusCode} replay={retry.Headers.Contains("X-Idempotent-Replay")} body={await retry.Content.ReadAsStringAsync()}"];
+            using var response = await clientB.GetAsync("/api/users/me");
+            status = response.StatusCode;
+            if (status == HttpStatusCode.Unauthorized)
+                break;
+
+            await Task.Delay(25);
         }
 
-        var okOrReplay = results.Count(r =>
-            r.StatusCode == HttpStatusCode.OK
-            || r.Headers.Contains("X-Idempotent-Replay"));
-        Assert.True(okOrReplay >= 1, string.Join(" | ", bodies));
-        Assert.True(results.Count(r => r.StatusCode == HttpStatusCode.OK && !r.Headers.Contains("X-Idempotent-Replay")) <= 1,
-            string.Join(" | ", bodies));
+        Assert.Equal(HttpStatusCode.Unauthorized, status);
+        Assert.True(
+            stopwatch.Elapsed <= TimeSpan.FromSeconds(2),
+            $"跨实例认证 Fence 未在 SLA 内失效，耗时 {stopwatch.Elapsed.TotalMilliseconds:F0}ms");
+    }
 
-        await using var check = postgres.CreateContext();
-        var pending = await check.FriendRequests.CountAsync(r =>
-            r.RequesterId == requesterId && r.TargetUserId == targetId);
-        Assert.True(pending == 1, $"pending={pending}; {string.Join(" | ", bodies)}");
+    [SkippableFact]
+    public async Task AuthenticationDependencyFailure_Returns503InsteadOf401()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
 
-        var differentPayload = JsonSerializer.Serialize(
-            new { targetUserId = otherTargetId, message = "different" }, WafTestHelpers.Json);
-        using var differentRequest = new HttpRequestMessage(HttpMethod.Post, "/api/Friendship/requests")
+        await using var factory = CreateFactory(extra: new Dictionary<string, string?>
         {
-            Content = new StringContent(differentPayload, Encoding.UTF8, "application/json"),
-        };
-        differentRequest.Headers.Add("X-Idempotency-Key", idemKey);
-        var different = await clientA.SendAsync(differentRequest);
-        Assert.Equal(HttpStatusCode.Conflict, different.StatusCode);
-        Assert.Contains(
-            "不同请求体",
-            await different.Content.ReadAsStringAsync(),
-            StringComparison.Ordinal);
-        Assert.False(await check.FriendRequests.AnyAsync(r =>
-            r.RequesterId == requesterId && r.TargetUserId == otherTargetId));
+            ["Tests:ThrowAccessTokenStore"] = "true",
+        });
+        using var client = factory.CreateClientWithDevice($"dev-auth-outage-{Guid.NewGuid():N}"[..24]);
+        client.UseBearer("A234567890123456789012");
+
+        using var response = await client.GetAsync("/api/users/me");
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal("1", response.Headers.RetryAfter?.Delta?.TotalSeconds.ToString());
     }
 
     [SkippableFact]

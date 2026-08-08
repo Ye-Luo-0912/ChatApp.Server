@@ -1,18 +1,16 @@
-# 构建上下文为 CHAT 仓库根（含 ChatApp.Server 与 ChatApp.RealtimeServices）
-# docker compose build 使用 context: ..
+# 构建上下文为 ChatApp.Server 仓库根；版本化本地包使构建不依赖兄弟源码仓库。
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY ChatApp.Server/ChatApp.Server.csproj ChatApp.Server/
-COPY ChatApp.Server/Core/Core.csproj ChatApp.Server/Core/
-COPY ChatApp.Server/Infrastructure/Infrastructure.csproj ChatApp.Server/Infrastructure/
-COPY ChatApp.Server/Directory.Build.props ChatApp.Server/
-COPY ChatApp.Server/Directory.Packages.props ChatApp.Server/
-COPY ChatApp.RealtimeServices/ChatApp.Realtime.Abstractions/ChatApp.Realtime.Abstractions.csproj ChatApp.RealtimeServices/ChatApp.Realtime.Abstractions/
-COPY ChatApp.RealtimeServices/ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj ChatApp.RealtimeServices/ChatApp.Realtime.Integration/
-RUN dotnet restore ChatApp.Server/ChatApp.Server.csproj
-COPY ChatApp.Server/ ChatApp.Server/
-COPY ChatApp.RealtimeServices/ ChatApp.RealtimeServices/
-RUN dotnet publish ChatApp.Server/ChatApp.Server.csproj \
+COPY ChatApp.Server.csproj ./
+COPY Core/Core.csproj Core/
+COPY Infrastructure/Infrastructure.csproj Infrastructure/
+COPY Directory.Build.props Directory.Packages.props NuGet.Config packages.lock.json ./
+COPY Core/packages.lock.json Core/
+COPY Infrastructure/packages.lock.json Infrastructure/
+COPY packages/ packages/
+RUN dotnet restore ChatApp.Server.csproj --locked-mode
+COPY . .
+RUN dotnet publish ChatApp.Server.csproj \
     -c Release -o /app/publish --no-restore -m:1
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final

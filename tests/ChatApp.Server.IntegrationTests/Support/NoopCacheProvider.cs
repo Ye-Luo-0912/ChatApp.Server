@@ -163,6 +163,25 @@ internal sealed class NoopCacheProvider
         CancellationToken cancellationToken = default)
         => Task.FromResult<T?>(default);
 
+    public Task<OneTimeStateClaim<T>?> TryClaimAsync<T>(
+        string key,
+        string claimKey,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<OneTimeStateClaim<T>?>(null);
+
+    public Task<bool> CompleteClaimAsync(
+        string claimKey,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
+    public Task<bool> RestoreClaimAsync(
+        string key,
+        string claimKey,
+        DateTimeOffset originalExpiresAt,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
     public Task RestoreAsync<T>(
         string key,
         T payload,

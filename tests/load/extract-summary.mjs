@@ -64,6 +64,15 @@ function percentile(sortedValues, p) {
     return sortedValues[lo] * (1 - frac) + sortedValues[hi] * frac;
 }
 
+function isMetricPoint(evt) {
+    if (!evt || !evt.metric || !evt.data || typeof evt.data !== 'object') return false;
+
+    // k6 1.x emitted { type: "Metric", ... }, while k6 2.x emits
+    // { metric: "...", type: "Point", data: { value, time, ... } }.
+    // Some intermediate versions put the point type under data.type.
+    return evt.type === 'Metric' || evt.type === 'Point' || evt.data.type === 'Point';
+}
+
 function main() {
     const args = parseArgs(process.argv);
 
@@ -83,12 +92,12 @@ function main() {
     for (const line of lines) {
         let evt;
         try { evt = JSON.parse(line); } catch { continue; }
-        if (!evt || evt.type !== 'Metric' || !evt.metric || !evt.data) continue;
+        if (!isMetricPoint(evt)) continue;
 
         const m = metrics[evt.metric] || (metrics[evt.metric] = { count: 0, sum: 0, values: [] });
         const v = evt.data.value;
         const t = evt.data.time;
-        if (typeof v === 'number') {
+        if (Number.isFinite(v)) {
             m.count++;
             m.sum += v;
             m.values.push(v);

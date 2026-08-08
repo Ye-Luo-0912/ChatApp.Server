@@ -1,4 +1,7 @@
 using Core.Interfaces;
+using Core.Interfaces.Auth;
+using Core.Models.Token;
+using Core.Exceptions;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -111,6 +114,14 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
             // 避免登录安全通知写入 EmailOutbox，污染 Outbox 集成测试。
             services.RemoveAll<ISecurityNotificationService>();
             services.AddSingleton<ISecurityNotificationService, NoopSecurityNotificationService>();
+
+            if (_extra.TryGetValue("Tests:ThrowAccessTokenStore", out var throwAccessTokenStore)
+                && bool.TryParse(throwAccessTokenStore, out var enabled)
+                && enabled)
+            {
+                services.RemoveAll<IAccessTokenStore>();
+                services.AddSingleton<IAccessTokenStore, ThrowingAccessTokenStore>();
+            }
         });
     }
 
@@ -138,4 +149,27 @@ internal sealed class NoopSecurityNotificationService : ISecurityNotificationSer
         long userId, string type, string title, string body, bool preferEmail,
         CancellationToken cancellationToken = default, string? idempotencyKey = null)
         => Task.CompletedTask;
+}
+
+internal sealed class ThrowingAccessTokenStore : IAccessTokenStore
+{
+    public Task StoreAccessTokenAsync(
+        string token,
+        AccessTokenData data,
+        TimeSpan expiry,
+        CancellationToken cancellationToken = default)
+        => throw Unavailable();
+
+    public Task<AccessTokenData?> GetAccessTokenAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+        => throw Unavailable();
+
+    public Task RevokeAccessTokenAsync(
+        string token,
+        CancellationToken cancellationToken = default)
+        => throw Unavailable();
+
+    private static CacheUnavailableException Unavailable()
+        => new("test access-token dependency outage", new InvalidOperationException("test outage"));
 }

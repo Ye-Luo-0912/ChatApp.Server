@@ -5,8 +5,8 @@ using Infrastructure.Caching;
 using Infrastructure.Data;
 using Infrastructure.Diagnostics;
 using Infrastructure.Serialization;
-using Infrastructure.Messaging;
 using Infrastructure.Services.Utilities;
+using Infrastructure.Services.Auth;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -39,11 +39,23 @@ public static class InfrastructureExtensions
                 .Validate(o => o.MinimumPoolSize >= 0, "DatabasePool:MinimumPoolSize 必须 >= 0")
                 .Validate(o => o.MinimumPoolSize <= o.EffectiveMaximumPoolSize,
                     "DatabasePool:MinimumPoolSize 不能大于当前进程最大连接数")
+                .Validate(o => o.ApiCommandTimeoutSeconds is >= 3 and <= 5,
+                    "DatabasePool:ApiCommandTimeoutSeconds 必须在 3..5")
+                .Validate(o => o.WorkerCommandTimeoutSeconds is >= 30 and <= 120,
+                    "DatabasePool:WorkerCommandTimeoutSeconds 必须在 30..120")
+                .Validate(o => o.AllCommandTimeoutSeconds is >= 1 and <= 120,
+                    "DatabasePool:AllCommandTimeoutSeconds 必须在 1..120")
+                .Validate(o => o.MigrationCommandTimeoutSeconds is >= 30 and <= 600,
+                    "DatabasePool:MigrationCommandTimeoutSeconds 必须在 30..600")
+                .Validate(o => o.EffectiveCommandTimeoutSeconds > 0,
+                    "DatabasePool 当前 command timeout 必须 > 0")
                 .ValidateOnStart();
 
             services.AddSingleton<ITsidGenerator, TsidGeneratorService>();
-            services.AddSingleton<RealtimeDomainOutboxInterceptor>();
             services.AddSingleton<DbCommandCounterInterceptor>();
+            services.AddSingleton<DbConnectionPoolWaitInterceptor>();
+            services.AddSingleton<SecurityVersionInvalidationDispatcher>();
+            services.AddSingleton<SecurityVersionInvalidationInterceptor>();
             services.AddDbContextPool<UserDbContext>((serviceProvider, options) =>
             {
                 var connectionString = serviceProvider
@@ -61,10 +73,11 @@ public static class InfrastructureExtensions
 
                 options.UseNpgsql(connectionBuilder.ConnectionString, npgsql =>
                 {
-                    npgsql.CommandTimeout(15);
+                    npgsql.CommandTimeout(pool.EffectiveCommandTimeoutSeconds);
                 }).AddInterceptors(
-                    serviceProvider.GetRequiredService<RealtimeDomainOutboxInterceptor>(),
-                    serviceProvider.GetRequiredService<DbCommandCounterInterceptor>());
+                    serviceProvider.GetRequiredService<DbCommandCounterInterceptor>(),
+                    serviceProvider.GetRequiredService<DbConnectionPoolWaitInterceptor>(),
+                    serviceProvider.GetRequiredService<SecurityVersionInvalidationInterceptor>());
             });
 
             return services;

@@ -4,6 +4,7 @@
         <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
     <ItemGroup>
@@ -15,6 +16,10 @@
     </ItemGroup>
 
     <ItemGroup>
+      <PackageReference Include="ChatApp.Auth.Contracts" />
+      <PackageReference Include="ChatApp.Realtime.Contracts" />
+      <PackageReference Include="ChatApp.Realtime.Integration" />
+      <PackageReference Include="ChatApp.Realtime.Outbox.EntityFrameworkCore" />
       <PackageReference Include="AWSSDK.S3" />
       <PackageReference Include="BCrypt.Net-Next" />
       <PackageReference Include="MailKit" />
@@ -37,10 +42,6 @@
 
     <ItemGroup>
       <ProjectReference Include="..\Core\Core.csproj" />
-      <ProjectReference Include="$(RealtimeSourcePath)\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj">
-        <SetConfiguration>Configuration=$(Configuration)</SetConfiguration>
-        <SetPlatform>Platform=AnyCPU</SetPlatform>
-      </ProjectReference>
     </ItemGroup>
 
     <ItemGroup>

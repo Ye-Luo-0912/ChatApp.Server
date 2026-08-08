@@ -1,0 +1,150 @@
+name: Worker Performance Stage Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      notification_count:
+        description: "要 drain 的 notification jobs 数量"
+        default: "1000"
+      duration_seconds:
+        description: "Worker drain 超时时间"
+        default: "180"
+  schedule:
+    - cron: "45 2 * * 1"
+
+concurrency:
+  group: perf-worker-stage
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    # Worker throughput artifacts are only comparable on the same physical
+    # host as well; use the same optional dedicated runner as the API gate.
+    runs-on: ${{ vars.PERF_RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      ConnectionStrings__DefaultConnection: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres;Pooling=true"
+      ConnectionStrings__Garnet: "127.0.0.1:6379,abortConnect=false"
+      JwtSettings__Issuer: ChatApp
+      JwtSettings__Audience: ChatApp
+      JwtSettings__Secret: perf-worker-secret-please-change-32chars
+      Security__SecretEncryptionKey: "perf-worker-encryption-key-32-chars!!"
+      EmailSettings__Host: "localhost"
+      EmailSettings__SenderEmail: "noreply@localhost"
+      EmailSettings__Password: "dummy"
+      ASPNETCORE_ENVIRONMENT: "Performance"
+      DatabasePool__Role: "Worker"
+      # The worker must be able to process durable risk rows created by a
+      # full-system run; API-only regression sets this to false separately.
+      LoginRisk__Enabled: "true"
+      GeoLocation__AllowExternalFallback: "false"
+      PERF_RUNNER_ID: ${{ vars.PERF_RUNNER_ID || 'unverified-hosted-runner' }}
+      ASPNETCORE_URLS: "http://127.0.0.1:5090"
+      TEST_USER_PREFIX: "workerload"
+      NOTIFICATION_COUNT: "${{ github.event.inputs.notification_count || '1000' }}"
+      DURATION_SECONDS: "${{ github.event.inputs.duration_seconds || '180' }}"
+
+    services:
+      postgres:
+        image: postgres:16.8
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ChatAppDatabase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ChatAppDatabase"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout Server
+        uses: actions/checkout@v4
+        with:
+          path: ChatApp.Server
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Start Garnet with Lua scripting
+        run: |
+          docker run -d --name garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 --bind 0.0.0.0 --port 6379 --lua
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Locked restore
+        working-directory: ChatApp.Server
+        run: dotnet restore ChatApp.Server.sln --locked-mode
+
+      - name: Release build
+        working-directory: ChatApp.Server
+        run: dotnet build ChatApp.Server.sln -c Release --no-restore
+
+      - name: Apply migrations
+        working-directory: ChatApp.Server
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.* || true
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          dotnet ef database update --project Infrastructure --startup-project Infrastructure --context UserDbContext
+
+      - name: Seed worker users
+        working-directory: ChatApp.Server
+        env:
+          USE_DOCKER: "1"
+          SEED_COUNT: "100"
+          TEST_USER_PREFIX: "workerload"
+          PGUSER: "postgres"
+          PGDATABASE: "ChatAppDatabase"
+        run: bash tests/load/seed-users.sh
+
+      - name: Start Worker
+        working-directory: ChatApp.Server
+        run: |
+          DatabasePool__Role=Worker ASPNETCORE_URLS="http://127.0.0.1:5090" \
+            dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile > /tmp/worker.log 2>&1 &
+          echo $! > /tmp/worker.pid
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:5090/health/ready" > /dev/null 2>&1; then
+              echo "Worker ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/worker.log || true
+          exit 1
+
+      - name: Run Worker load stage
+        working-directory: ChatApp.Server/tests/load
+        env:
+          USE_DOCKER: "1"
+          PGUSER: "postgres"
+          PGDATABASE: "ChatAppDatabase"
+          WORKER_BASE_URL: "http://127.0.0.1:5090"
+        run: bash worker-stage.sh
+
+      - name: Stop Worker
+        if: always()
+        run: |
+          if [ -f /tmp/worker.pid ]; then kill "$(cat /tmp/worker.pid)" 2>/dev/null || true; fi
+
+      - name: Upload Worker artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-worker-${{ github.run_id }}
+          path: |
+            ChatApp.Server/tests/load/worker-stage.csv
+            ChatApp.Server/tests/load/worker-metrics.json
+            /tmp/worker.log
+          if-no-files-found: ignore
+          retention-days: 30

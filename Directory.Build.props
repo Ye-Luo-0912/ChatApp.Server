@@ -3,10 +3,6 @@
     <!-- 统一解决方案配置，避免 Release 引用到依赖项目的 Debug 产物 -->
     <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-
-    <!-- P0-7: Realtime 源码路径可通过环境变量/MSBuild 属性覆盖，默认指向兄弟仓库。
-         CI 中 checkout 固定 commit 后通过 RealtimeSourcePath 指向检出目录。
-         commit 通过 Realtime.version 锁定，CI 中有独立步骤校验。 -->
-    <RealtimeSourcePath Condition="'$(RealtimeSourcePath)' == ''">..\..\ChatApp.RealtimeServices</RealtimeSourcePath>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 </Project>

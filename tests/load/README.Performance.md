@@ -5,6 +5,7 @@
 依赖（Postgres + Garnet；可选 NATS 给 Realtime / AccountCleanup E2E）：
 
 ```powershell
+$env:DatabasePool__Role = "Api" # API 性能阶段；Worker 必须使用独立 Worker 进程
 $env:POSTGRES_PASSWORD = "your-local-password"
 docker compose -f docker-compose.yaml up -d postgres_db garnet_cache
 # 需要 Realtime Outbox / AccountCleanup 回传时再起单节点 NATS（本地默认）：
@@ -22,6 +23,10 @@ dotnet run --project ChatApp.Server.csproj --no-launch-profile
 ```
 
 `appsettings.Performance.json` 将登录/刷新等限流放宽到约 10000/min，并提高 BCrypt / 通知 Outbox / 头像重编码并发。
+API 性能阶段还显式设置 `DatabasePool__Role=Api`、`LoginRisk__Enabled=false`、
+`GeoLocation__AllowExternalFallback=false`，并关闭 Redis 主动 PING；风险分析、清理和其余
+业务 Worker 必须在独立的 `DatabasePool__Role=Worker` 进程中运行。该 LoginRisk 开关只用于
+API benchmark，不改变默认生产语义。
 
 导出 OTEL（可选）：
 
@@ -88,8 +93,9 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 
 | 门禁 | workflow | 触发 | 场景 | 用途 |
 |------|----------|------|------|------|
-| 快速阶段门禁 | `.github/workflows/performance-regression.yml` | 手动 `workflow_dispatch` | steady 3m + 比对已审核基线 | 一组热路径改造完成后执行 |
-| 完整阶段门禁 | `.github/workflows/performance-nightly.yml` | 手动 `workflow_dispatch` | steady 15m、auth capacity、device churn、双实例限流、重启恢复、可选 2h soak | 里程碑验收并生成候选基线 artifact |
+| 快速阶段门禁 | `.github/workflows/performance-regression.yml` | 手动 `workflow_dispatch` | API role、3 轮 steady 3m + 中位数/噪声 + 已审核基线 | 一组热路径改造完成后执行 |
+| Worker 阶段门禁 | `.github/workflows/performance-worker.yml` | 手动/每周 schedule | Worker role drain notification jobs + backlog/oldest-age/metrics | 独立测 Worker 吞吐、重试和连接池，不启动 API |
+| 全系统浸泡 | `.github/workflows/performance-nightly.yml` | 手动/每周 schedule | API role + 独立 Worker role，同时执行业务负载 | API 与 Worker 进程/连接池/指标隔离 |
 
 阶段回归阈值（相对基线，[compare-baseline.mjs](compare-baseline.mjs) 实现）：
 
@@ -98,9 +104,9 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 | p95 | ≤ +8% |
 | p99 | ≤ +12% |
 | 错误率 | < 0.1%（绝对目标） |
-| allocations/request | ≤ +10%（待 `/debug/metrics` 上线，当前 info-only） |
-| Redis commands/request | 不得增加（待上线，info-only） |
-| DB queries/request | 不得增加（待上线，info-only） |
+| allocations/request | ≤ +10%（`/debug/metrics` 宿主 delta） |
+| Redis commands/request | 不得增加（API 角色进程） |
+| DB queries/request | 不得增加（API 角色进程） |
 
 初始绝对目标（[absolute-goals.json](absolute-goals.json)，按固定硬件校准后调整）：
 
@@ -109,21 +115,46 @@ docker compose -f ..\ChatApp.RealtimeServices\docker-compose.nats.yaml stop nats
 | warmed authenticated read | p95 ≤ 50 ms，p99 ≤ 150 ms |
 | refresh | p95 ≤ 100 ms，p99 ≤ 250 ms |
 | steady 错误率 | < 0.1% |
-| 简单读取分配 | ≤ 8 KB/request（待上线） |
-| L1 上线后 Redis | ≤ 0.2 command/request（待上线） |
+| 简单读取分配 | ≤ 8 KB/request（候选目标，完成分配归因/微基准后启用） |
+| L1 上线后 Redis | ≤ 0.2 command/request（候选目标，完成分层计数后启用） |
 | soak | 预热后内存无持续单调增长 |
 | Worker | backlog 和 oldest age 不持续增长 |
 
 基线文件存放于 [baselines/](baselines/) 目录，命名 `baseline-<PROFILE>-rate<RATE>.json`。
 完整阶段门禁跑完 steady 15m 后上传候选 summary 和原始事件流，不直接写入 master。
-审阅候选结果并通过普通提交更新基线后，快速阶段门禁才执行 3m 比对；缺少基线会明确失败。
+审阅候选结果并通过普通提交更新基线后，快速阶段门禁才执行 3m 比对。
+
+严格门禁优先使用 repository variables `PERF_RUNNER_LABEL` 与 `PERF_RUNNER_ID`：前者选择专用
+self-hosted runner，后者必须与基线 JSON 的 `runner` 完全一致。`ubuntu-24.04` 只固定镜像，
+不能证明物理硬件一致；旧的 `local-windows-docker` 基线不会被直接比较。若 runner provenance
+不匹配（或基线文件没有可用 commit），`performance-regression.yml` 会在同一个 job 中检出
+基线 commit、重置数据库、运行三轮基线，再用同样的进程角色和负载运行候选；比较的是这份
+`baseline-paired.json`。这使得没有专用 runner 时仍然是有效的同机比较，而不是伪造 runner 字段。
+每次门禁运行三轮，`aggregate-runs.mjs` 取各指标的 run-level median，并在 `noise_intervals`
+保存 min/max/MAD。
+
+### 独立端点场景
+
+不要用混合 steady 结果推断单个路由。使用 `endpoint-workload.k6.js` 分别运行：
+
+```bash
+for scenario in auth-read friends-read search notifications sessions refresh attachment-ticket; do
+  k6 run -e SCENARIO="$scenario" -e TOKENS_FILE=./tokens.json \
+    -e BASE_URL=http://127.0.0.1:5088 -e RATE=20 -e DURATION=3m \
+    endpoint-workload.k6.js
+done
+```
+
+每次独立运行输出 `<scenario>_ms`、DB/Garnet/认证 DB 命令、分配、连接池等待和 GC delta。
+Presence 没有 Server HTTP 路由，而是 Realtime NATS request/reply；测量时必须提供实际的
+`PRESENCE_URL`/协议适配器和 `PRESENCE_BODY`，脚本不会把 Friendship 路由伪装成 Presence。
 
 完整阶段门禁的重启恢复场景：在 steady 压测中段 `docker restart` Postgres + Garnet，轮询 `/health/ready` 恢复后继续压测 30s，
 断言重启后错误率 ≤ 5%。覆盖 AGENTS.md 的恢复语义。
 
 ### steady（固定设备基线）
 
-固定 `X-Installation-Id`（`k6-steady-installation-{vu-padded}`，符合服务端长度校验），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/friends/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
+固定 `X-Installation-Id`（`k6-steady-installation-{vu-padded}`，符合服务端长度校验），默认 `LOGIN_RATIO=0.1`（≤10% 登录，≥90% me/search/notifications/sessions/refresh）。登录响应中的 `DeviceCredential` 只用于后续 refresh，禁止把它写入基线或日志。优先配合预置 Token，避免登录限流污染业务基线：
 
 ```bash
 k6 run -e BASE_URL=http://localhost:8080 -e TOKENS_FILE=./tokens.json -e PROFILE=steady \
@@ -195,18 +226,18 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 
 ### 基线记录表（每次跑完填一行；未跑勿填造数据）
 
-`extract-summary.mjs` 同时输出 `iterations_per_second` 和 `http_requests_per_second`。前者是业务迭代速率，后者是 HTTP 请求速率；steady 的一次迭代包含多个请求，不能混用。
+`extract-summary.mjs` 同时输出 `iterations_per_second` 和 `http_requests_per_second`。前者是业务迭代速率，后者是 HTTP 请求速率；steady 的一次迭代包含多个请求，不能混用。Performance/Testing 响应还会返回 `X-ChatApp-Auth-Db-Commands`，用于单独证明认证 Fence 查询数为零；`X-ChatApp-Db-Commands` 仍表示整个 endpoint 的数据库命令数。
 
 | 日期 | 硬件 | PROFILE | RATE | 时长 | login p95/p99 | refresh p95 | errors | 503 overload | 备注 |
 |------|------|--------|------|------|---------------|-------------|--------|--------------|------|
 | 2026-07-21 | local (Win11 + Docker Desktop) | steady | 5 | 1m | 82ms / 92ms | 20ms | 0% | 0 | **HTTP smoke 实测**：301 iters / 2107 HTTP reqs，~34.9 req/s，checks 100%；login p95/p99=82/92ms，refresh p95=20ms；Garnet 需 --lua；k6 脚本已修 /api/auth/refresh-token + snowflake userId 精度；原始输出 `tests/load/k6-smoke-2026-07-21.txt` |
 | 2026-07-21 | local (Win11 + Docker Desktop) | realtime-pipeline | 4 ops/s · c=4 | 5s+30s | n/a（管道） | n/a | 0% | n/a | **Realtime smoke 实测**：单节点 `chatapp_nats` + Realtime `/ready`；124/124 完整链路，4.09 pipeline/s；complete p50/p95/p99=50/68/82.5ms；NATS ping 1.17ms；原始输出 `tests/load/realtime-pipeline-smoke-2026-07-21.txt` + `tests/load/realtime-pipeline-smoke-2026-07-21/`；非正式 30m 容量基线 |
 
-### 已知缺口（不阻塞基线）
+### 已知外部验收项
 
 | 项 | 状态 |
 |----|------|
-| S3 导出对象加密（SSE/KMS） | Local AES-GCM 已落地；切 S3 时仍需 SSE-S3/KMS |
+| S3 导出对象加密（SSE/KMS） | 由 S3 provider 的 SSE-S3/KMS 配置与 IAM 验收 |
 | DB 重启后 Outbox/Saga E2E | 未自动化；依赖 RealtimeIntegration:Url + NATS |
 | AccountCleanup DLQ 专用流 | 无；超时 Failed（`pending_timeout`）作对账兜底 |
 
@@ -252,4 +283,3 @@ k6 run -e BASE_URL=http://localhost:8080 -e CREDS_FILE=./creds.json -e PROFILE=s
 ## 后续
 
 - 十万用户、百万好友关系种子数据
-- FriendshipService 显式事务优化前先用查询与事务指标确认收益

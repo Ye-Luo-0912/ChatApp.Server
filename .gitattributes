@@ -1,0 +1,2 @@
+# POSIX load/CI scripts are executed by bash on Linux runners.
+tests/load/*.sh text eol=lf

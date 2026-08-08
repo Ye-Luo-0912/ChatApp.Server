@@ -19,7 +19,6 @@ const errorRate = new Rate('errors');
 const loginDuration = new Trend('login_duration', true);
 const refreshDuration = new Trend('refresh_duration', true);
 const authzDuration = new Trend('authz_duration', true);
-const friendsDuration = new Trend('friends_duration', true);
 const searchDuration = new Trend('search_duration', true);
 
 const PROFILE = __ENV.PROFILE || 'smoke';
@@ -92,7 +91,6 @@ export const options = {
           login_duration: ['p(95)<500'],
           refresh_duration: ['p(95)<100', 'p(99)<250'],
           authz_duration: ['p(95)<100', 'p(99)<250'],
-          friends_duration: ['p(95)<100', 'p(99)<250'],
           search_duration: ['p(95)<150', 'p(99)<300'],
         },
 };
@@ -206,17 +204,10 @@ export default function (data) {
     errorRate.add(!ok);
   });
 
-  group('friends page', () => {
-    const start = Date.now();
-    const res = http.get(`${BASE_URL}/api/Friendship/all?limit=50`, { headers: authHeaders });
-    friendsDuration.add(Date.now() - start);
-    const ok = check(res, { 'friends page ok': (r) => r.status === 200 });
-    errorRate.add(!ok);
-  });
 
   group('search', () => {
     const start = Date.now();
-    const res = http.get(`${BASE_URL}/api/Friendship/search?searchTerm=te&limit=20`, {
+    const res = http.get(`${BASE_URL}/api/users/search?q=te&limit=20`, {
       headers: authHeaders,
     });
     searchDuration.add(Date.now() - start);

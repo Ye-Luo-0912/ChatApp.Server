@@ -51,8 +51,8 @@ services:
 
   migrate:
     build:
-      context: ..
-      dockerfile: ChatApp.Server/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     container_name: chatapp_migrate
     env_file:
       - .env
@@ -77,12 +77,12 @@ services:
 
   api:
     build:
-      context: ..
-      dockerfile: ChatApp.Server/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:size=128m
     volumes:
       - avatar_data:/app/App_Data/avatars
       - attachment_data:/app/App_Data/attachments
@@ -124,12 +124,12 @@ services:
 
   worker:
     build:
-      context: ..
-      dockerfile: ChatApp.Server/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:size=128m
     volumes:
       - avatar_data:/app/App_Data/avatars
       - attachment_data:/app/App_Data/attachments

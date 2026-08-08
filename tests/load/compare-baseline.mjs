@@ -27,7 +27,7 @@
 import fs from 'node:fs';
 
 function parseArgs(argv) {
-    const args = { strict: false, baseline: null, current: null, absolute: null, minSamples: 30 };
+    const args = { strict: false, baseline: null, current: null, absolute: null, minSamples: 30, runner: null };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--strict') args.strict = true;
@@ -35,8 +35,9 @@ function parseArgs(argv) {
         else if (a === '--current') args.current = argv[++i];
         else if (a === '--absolute') args.absolute = argv[++i];
         else if (a === '--min-samples') args.minSamples = Number(argv[++i]);
+        else if (a === '--runner') args.runner = argv[++i];
         else if (a === '--help' || a === '-h') {
-            console.log('用法: compare-baseline.mjs --baseline <path> --current <path> [--absolute <path>] [--strict] [--min-samples <n>]');
+            console.log('用法: compare-baseline.mjs --baseline <path> --current <path> [--absolute <path>] [--runner <id>] [--strict] [--min-samples <n>]');
             process.exit(0);
         }
     }
@@ -49,6 +50,15 @@ function parseArgs(argv) {
         process.exit(2);
     }
     return args;
+}
+
+function isMetricPoint(evt) {
+    if (!evt || !evt.metric || !evt.data || typeof evt.data !== 'object') return false;
+
+    // k6 1.x emitted { type: "Metric", ... }, while k6 2.x emits
+    // { metric: "...", type: "Point", data: { value, time, ... } }.
+    // Some intermediate versions put the point type under data.type.
+    return evt.type === 'Metric' || evt.type === 'Point' || evt.data.type === 'Point';
 }
 
 // 加载指标数据：支持 summary JSON 和 k6 原始事件流两种格式。
@@ -67,6 +77,7 @@ function loadMetrics(filePath) {
             if (obj.version && obj.metrics) {
                 const metrics = obj.metrics;
                 if (obj.rates) metrics.__rates = obj.rates;
+                if (obj.runner) metrics.__runner = obj.runner;
                 return metrics;
             }
         } catch { /* 不是单行 JSON，按原始事件流处理 */ }
@@ -80,9 +91,10 @@ function loadMetrics(filePath) {
     for (const line of lines) {
         let evt;
         try { evt = JSON.parse(line); } catch { continue; }
-        if (evt.type !== 'Metric' || !evt.metric || !evt.data) continue;
+        if (!isMetricPoint(evt)) continue;
         const m = metrics[evt.metric] || (metrics[evt.metric] = { count: 0, sum: 0, values: [] });
         const v = evt.data.value;
+        if (!Number.isFinite(v)) continue;
         m.count++;
         m.sum += v;
         m.values.push(v);
@@ -133,6 +145,7 @@ const TREND_MAP = {
     notifications_ms: 'notifications',
     sessions_ms: 'sessions',
     me_ms: 'me',
+    me_db_queries: 'warmed me DB queries',
     login_duration: 'login_cap',
 };
 
@@ -160,6 +173,24 @@ const ABSOLUTE_MAP = {
     refresh_p99_ms: { metric: 'refresh_ms', stat: 'p99', label: 'refresh p99' },
 };
 
+// Numeric goals are enforced for backward compatibility. New goals may use
+// { "target": number, "enforced": boolean } so an aspirational optimization
+// remains visible in reports without making an uncalibrated machine-specific
+// threshold block every Stage Gate run.
+function normalizeAbsoluteGoal(raw) {
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return { value: raw, enforced: true };
+    }
+    if (!raw || typeof raw !== 'object') return null;
+
+    const value = Number(raw.target ?? raw.value);
+    if (!Number.isFinite(value)) return null;
+    return {
+        value,
+        enforced: raw.enforced !== false,
+    };
+}
+
 function emitError(file, line, message) {
     if (process.env.GITHUB_ACTIONS === 'true') {
         console.log(`::error file=${file},line=${line}::${message}`);
@@ -185,9 +216,25 @@ function main() {
     console.log('=== 性能基线比对 ===\n');
 
     const regressions = [];
+    const baseRunner = baseMetrics.__runner;
+    const currentRunner = curMetrics.__runner;
+    if (args.strict) {
+        if (!baseRunner || !currentRunner) {
+            regressions.push('严格模式需要基线和当前结果都包含 runner provenance；请使用 extract-summary/aggregate-runs');
+        } else if (baseRunner !== currentRunner) {
+            regressions.push(`runner 不一致：基线=${baseRunner} 当前=${currentRunner}；禁止跨硬件直接比较`);
+        }
+        if (args.runner && currentRunner && args.runner !== currentRunner)
+            regressions.push(`当前 runner 与期望不一致：expected=${args.runner} actual=${currentRunner}`);
+    }
     const RECENT_THRESHOLDS = { p95: 0.08, p99: 0.12 };
     // login_duration 来自独立 login-capacity 脚本，不能要求 steady 基线包含它。
-    const strictTrendMetrics = Object.keys(TREND_MAP).filter((name) => name !== 'login_duration');
+    // steady 使用预置 token，登录只会偶尔发生（通常只有 setup/失效恢复的
+    // 少量样本）。登录容量由独立 auth_capacity/login-capacity 场景验证，不能
+    // 因此把 steady 的 3 个登录样本误判成 schema 不完整。login_ms 仍会在
+    // 下方输出并在有足够样本时参与相对比较。
+    const strictTrendMetrics = Object.keys(TREND_MAP).filter((name) =>
+        name !== 'login_duration' && name !== 'login_ms');
 
     function requireMetric(source, name, metric, requiredStats, minimumSamples) {
         if (!metric || typeof metric !== 'object') {
@@ -232,8 +279,14 @@ function main() {
     for (const [metric, label] of Object.entries(TREND_MAP)) {
         const b = baseMetrics[metric];
         const c = curMetrics[metric];
-        if (!b || !c) {
-            console.log(`${label.padEnd(20)} ${(b?.p95 ?? 'n/a').toString().padStart(10)} ${(c?.p95 ?? 'n/a').toString().padStart(10)}    n/a        ${(b?.p99 ?? 'n/a').toString().padStart(10)} ${(c?.p99 ?? 'n/a').toString().padStart(10)}    n/a        跳过（缺数据）`);
+        const isOptionalSteadyMetric = metric === 'login_ms' || metric === 'login_duration';
+        const hasEnoughSamples = Number(b?.count) >= args.minSamples
+            && Number(c?.count) >= args.minSamples;
+        if (!b || !c || (args.strict && isOptionalSteadyMetric && !hasEnoughSamples)) {
+            const reason = !b || !c
+                ? '缺数据'
+                : '样本不足；由独立容量场景验证';
+            console.log(`${label.padEnd(20)} ${(b?.p95 ?? 'n/a').toString().padStart(10)} ${(c?.p95 ?? 'n/a').toString().padStart(10)}    n/a        ${(b?.p99 ?? 'n/a').toString().padStart(10)} ${(c?.p99 ?? 'n/a').toString().padStart(10)}    n/a        跳过（${reason}）`);
             continue;
         }
         const d95 = pctDelta(b.p95, c.p95);
@@ -277,16 +330,29 @@ function main() {
             if (goalName.startsWith('_')) continue;
             const mapping = ABSOLUTE_MAP[goalName];
             if (!mapping) continue;
+            const goal = normalizeAbsoluteGoal(target);
+            if (!goal) {
+                const message = `绝对目标 ${goalName} 格式无效`;
+                console.log(message);
+                if (args.strict) regressions.push(message);
+                continue;
+            }
             const actual = curMetrics[mapping.metric]?.[mapping.stat];
             if (!Number.isFinite(Number(actual))) {
                 console.log(mapping.label.padEnd(28) + ' n/a（无数据）');
                 if (args.strict) regressions.push(mapping.label + ' 缺少当前绝对目标指标');
                 continue;
             }
-            const ok = actual <= target;
+            const ok = actual <= goal.value;
             const unit = goalName.endsWith('_ms') ? 'ms' : '';
-            console.log(`${mapping.label.padEnd(28)} ${actual.toFixed(1)}${unit}  目标 ≤ ${target}${unit}  ${ok ? '✓' : '❌'}`);
-            if (!ok) regressions.push(`${mapping.label} ${actual.toFixed(1)}${unit} 超过绝对目标 ${target}${unit}`);
+            const status = goal.enforced ? (ok ? '✓' : '❌') : '候选';
+            console.log(`${mapping.label.padEnd(28)} ${actual.toFixed(1)}${unit}  目标 ≤ ${goal.value}${unit}  ${status}`);
+            if (goal.enforced && !ok) {
+                regressions.push(`${mapping.label} ${actual.toFixed(1)}${unit} 超过绝对目标 ${goal.value}${unit}`);
+            }
+            if (!goal.enforced) {
+                emitNotice(`${mapping.label} 绝对目标仍为候选值（未阻塞门禁）`);
+            }
         }
     }
 
@@ -347,15 +413,28 @@ function main() {
     }
 
     if (args.absolute && hostAvailable) {
-        if (allocPerReqKbCur != null && absGoals?.alloc_per_req_kb != null) {
-            const ok = allocPerReqKbCur <= absGoals.alloc_per_req_kb;
-            console.log(`${'  [abs] allocations/req'.padEnd(28)} ${allocPerReqKbCur.toFixed(3)} KB  目标 ≤ ${absGoals.alloc_per_req_kb} KB  ${ok ? '✓' : '❌'}`);
-            if (!ok) regressions.push(`allocations/request ${allocPerReqKbCur.toFixed(3)} KB 超过绝对目标 ${absGoals.alloc_per_req_kb} KB`);
-        }
-        if (redisPerReqCur != null && absGoals?.redis_cmds_per_req != null) {
-            const ok = redisPerReqCur <= absGoals.redis_cmds_per_req;
-            console.log(`${'  [abs] redis cmds/req'.padEnd(28)} ${redisPerReqCur.toFixed(3)}  目标 ≤ ${absGoals.redis_cmds_per_req}  ${ok ? '✓' : '❌'}`);
-            if (!ok) regressions.push(`Redis commands/request ${redisPerReqCur.toFixed(3)} 超过绝对目标 ${absGoals.redis_cmds_per_req}`);
+        const hostGoals = [
+            ['alloc_per_req_kb', '  [abs] allocations/req', allocPerReqKbCur, 'KB', 'allocations/request'],
+            ['redis_cmds_per_req', '  [abs] redis cmds/req', redisPerReqCur, '', 'Redis commands/request'],
+        ];
+        for (const [goalName, label, actual, unit, errorLabel] of hostGoals) {
+            const goal = normalizeAbsoluteGoal(absGoals?.[goalName]);
+            if (actual == null) continue;
+            if (!goal) {
+                const message = `绝对目标 ${goalName} 格式无效`;
+                console.log(message);
+                if (args.strict) regressions.push(message);
+                continue;
+            }
+            const ok = actual <= goal.value;
+            const status = goal.enforced ? (ok ? '✓' : '❌') : '候选';
+            console.log(`${label.padEnd(28)} ${actual.toFixed(3)}${unit ? ` ${unit}` : ''}  目标 ≤ ${goal.value}${unit ? ` ${unit}` : ''}  ${status}`);
+            if (goal.enforced && !ok) {
+                regressions.push(`${errorLabel} ${actual.toFixed(3)}${unit ? ` ${unit}` : ''} 超过绝对目标 ${goal.value}${unit ? ` ${unit}` : ''}`);
+            }
+            if (!goal.enforced) {
+                emitNotice(`${errorLabel} 绝对目标仍为候选值（未阻塞门禁）`);
+            }
         }
     }
 

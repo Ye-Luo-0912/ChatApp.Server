@@ -3,41 +3,13 @@ using System.Data.Common;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Integration.Outbox;
+using Core.Interfaces;
 using Core.Models.Export;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
 namespace Infrastructure.Services;
-
-public interface IRealtimeOutboxAdminService
-{
-    Task<RealtimeOutboxSummaryDto> GetSummaryAsync(CancellationToken cancellationToken = default);
-
-    Task<RealtimeOutboxListResponse> ListAsync(
-        string? status = null,
-        long? targetUserId = null,
-        short? eventType = null,
-        int offset = 0,
-        int limit = 50,
-        CancellationToken cancellationToken = default);
-
-    Task<RealtimeOutboxItemDto?> GetAsync(string eventId, CancellationToken cancellationToken = default);
-
-    /// <summary>仅 Dead → Pending；Published/Pending 拒绝。</summary>
-    Task<(bool Ok, string? Error)> ReplayDeadAsync(
-        string eventId,
-        CancellationToken cancellationToken = default);
-
-    Task<RealtimeOutboxBatchReplayResult> ReplayDeadBatchAsync(
-        IReadOnlyList<string> eventIds,
-        CancellationToken cancellationToken = default);
-}
-
-public sealed record RealtimeOutboxBatchReplayResult(
-    int Requested,
-    int Replayed,
-    IReadOnlyList<string> Skipped);
 
 public sealed class RealtimeOutboxAdminService(UserDbContext db) : IRealtimeOutboxAdminService
 {

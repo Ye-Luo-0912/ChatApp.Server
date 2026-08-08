@@ -7,6 +7,7 @@ using Infrastructure.RateLimiting;
 using Infrastructure.Extensions;
 using Infrastructure.Validation;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -41,6 +42,18 @@ public static class ApiModuleExtensions
         services.AddAuthentication("Bearer")
             .AddScheme<AuthenticationSchemeOptions, OpaqueTokenAuthHandler>("Bearer", _ => { });
 
+        services.AddAuthorization(options =>
+        {
+            options.AddPolicy(
+                ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName,
+                policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.AddRequirements(new ChatApp.Server.Authorization.AuthoritativeAdminRequirement());
+                });
+        });
+        services.AddScoped<IAuthorizationHandler, ChatApp.Server.Authorization.AuthoritativeAdminAuthorizationHandler>();
+
         services.AddCors(options =>
         {
             options.AddPolicy("AllowSpecific", policy =>
@@ -62,21 +75,31 @@ public static class ApiModuleExtensions
             options.AddPolicy("email", TimeSpan.FromSeconds(10));
             // 大附件上传需要更长超时；端点级标注，不影响普通 API。
             options.AddPolicy("attachment-upload", TimeSpan.FromMinutes(2));
+            options.AddPolicy("avatar-upload", TimeSpan.FromMinutes(2));
         });
 
-        AddApplicationHealthChecks(services);
+        AddApplicationHealthChecks(services, config, DatabaseProcessRole.Api);
 
         return services;
     }
     /// <summary>注册 Worker 的依赖健康检查；不注册认证、限流或 HTTP API 策略。</summary>
-    public static IServiceCollection AddWorkerHealthChecks(this IServiceCollection services)
+    public static IServiceCollection AddWorkerHealthChecks(
+        this IServiceCollection services,
+        IConfiguration config)
     {
-        AddApplicationHealthChecks(services);
+        AddApplicationHealthChecks(services, config, DatabaseProcessRole.Worker);
         return services;
     }
 
-    private static void AddApplicationHealthChecks(IServiceCollection services)
+    private static void AddApplicationHealthChecks(
+        IServiceCollection services,
+        IConfiguration config,
+        DatabaseProcessRole processRole)
     {
+        services.AddOptions<HealthDependencyOptions>()
+            .Bind(config.GetSection(HealthDependencyOptions.SectionName))
+            .Configure(options => options.ProcessRole = processRole.ToString())
+            .ValidateOnStart();
         services.AddHealthChecks()
             .AddRedis(
                 sp => sp.GetRequiredService<IConfiguration>().GetConnectionString("Garnet")

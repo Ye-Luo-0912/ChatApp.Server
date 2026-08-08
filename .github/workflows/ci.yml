@@ -25,34 +25,6 @@ jobs:
         with:
           path: ChatApp.Server
 
-      # P0-7: 从 Realtime.version 读取固定 commit，确保同一 Server commit 编译到相同版本的 Realtime 代码。
-      - name: Read pinned Realtime version
-        id: realtime-version
-        run: |
-          commit=$(grep "^Commit=" ChatApp.Server/Realtime.version | cut -d= -f2)
-          repo_raw=$(grep "^Repo=" ChatApp.Server/Realtime.version | cut -d= -f2)
-          # actions/checkout 需要 owner/repo 格式；Realtime.version 可能存完整 URL
-          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout RealtimeServices at pinned commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.realtime-version.outputs.repo }}
-          path: ChatApp.RealtimeServices
-          ref: ${{ steps.realtime-version.outputs.commit }}
-
-      - name: Verify Realtime commit matches lock file
-        run: |
-          actual=$(git -C ChatApp.RealtimeServices rev-parse HEAD)
-          expected="${{ steps.realtime-version.outputs.commit }}"
-          if [ "$actual" != "$expected" ]; then
-            echo "Realtime commit mismatch: expected $expected, got $actual" >&2
-            exit 1
-          fi
-          echo "OK: Realtime at pinned commit $expected"
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -85,26 +57,45 @@ jobs:
             sleep 1
           done
 
+      - name: Start ClamAV integration dependency
+        run: |
+          docker rm -f chatapp_clamav 2>/dev/null || true
+          docker run -d --name chatapp_clamav -p 3310:3310 clamav/clamav:1.4
+          for i in $(seq 1 120); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/3310' 2>/dev/null; then
+              echo "ClamAV is accepting connections"
+              break
+            fi
+            sleep 2
+          done
+          bash -c 'echo > /dev/tcp/127.0.0.1/3310' 2>/dev/null
+
+      - name: Start MinIO S3 integration dependency
+        run: |
+          docker rm -f chatapp_minio 2>/dev/null || true
+          docker run -d --name chatapp_minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin123 \
+            -e MINIO_KMS_SECRET_KEY=minio-key:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            minio/minio:RELEASE.2024-12-18T13-15-44Z \
+            server /data --console-address :9001
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null
+
+      - name: Locked restore
+        working-directory: ChatApp.Server
+        run: dotnet restore ChatApp.Server.sln --locked-mode
+
       - name: Release build
         working-directory: ChatApp.Server
-        run: dotnet build ChatApp.Server.sln -c Release
-
-      - name: Verify Realtime Release DLLs
-        working-directory: ChatApp.Server
-        run: |
-          set -e
-          integration_dll=$(find ../ChatApp.RealtimeServices -path '*/bin/Release/*/ChatApp.Realtime.Integration.dll' | head -n 1)
-          abstractions_dll=$(find ../ChatApp.RealtimeServices -path '*/bin/Release/*/ChatApp.Realtime.Abstractions.dll' | head -n 1)
-          test -n "$integration_dll" && test -f "$integration_dll"
-          test -n "$abstractions_dll" && test -f "$abstractions_dll"
-          # Release 构建不得只留下 Debug 产物作为最终引用
-          debug_integration=$(find ../ChatApp.RealtimeServices -path '*/bin/Debug/*/ChatApp.Realtime.Integration.dll' -newer "$integration_dll" 2>/dev/null | head -n 1 || true)
-          if [ -n "$debug_integration" ]; then
-            echo "Release build updated Debug Realtime DLL: $debug_integration" >&2
-            exit 1
-          fi
-          echo "OK: $integration_dll"
-          echo "OK: $abstractions_dll"
+        run: dotnet build ChatApp.Server.sln -c Release --no-restore
 
       - name: Apply migrations
         working-directory: ChatApp.Server
@@ -148,7 +139,28 @@ jobs:
         working-directory: ChatApp.Server
         timeout-minutes: 5
         run: |
-          dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
+          dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj \
+            -c Release --no-build --no-restore
+
+      - name: ClamAV integration gate
+        working-directory: ChatApp.Server
+        env:
+          CHATAPP_TEST_CLAMAV: "127.0.0.1:3310"
+        run: |
+          dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj \
+            -c Release --no-build --filter "Category=ClamAV"
+
+      - name: MinIO S3 failure-injection gate
+        working-directory: ChatApp.Server
+        env:
+          CHATAPP_TEST_MINIO_ENDPOINT: "http://127.0.0.1:9000"
+          CHATAPP_TEST_MINIO_BUCKET: "chatapp-integration"
+          CHATAPP_TEST_MINIO_DOCKER_RESTART: "1"
+          AWS_ACCESS_KEY_ID: "minioadmin"
+          AWS_SECRET_ACCESS_KEY: "minioadmin123"
+        run: |
+          dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj \
+            -c Release --no-build --filter "Category=MinIO"
 
       - name: Compose ready gate
         working-directory: ChatApp.Server
@@ -195,7 +207,7 @@ jobs:
 
       - name: Docker build
         working-directory: ChatApp.Server
-        run: docker build -f Dockerfile -t chatapp-server:ci ..
+        run: docker build -f Dockerfile -t chatapp-server:ci .
 
       - name: Dependency vulnerability check
         working-directory: ChatApp.Server
@@ -232,6 +244,10 @@ jobs:
             exit 1
           fi
 
+      - name: Cleanup external integration dependencies
+        if: always()
+        run: docker rm -f chatapp_clamav chatapp_minio 2>/dev/null || true
+
   garnet-compatibility:
     name: Garnet compatibility contracts
     runs-on: ubuntu-latest
@@ -246,23 +262,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: ChatApp.Server
-
-      - name: Read pinned Realtime version
-        id: realtime-version
-        working-directory: ChatApp.Server
-        run: |
-          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
-          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
-          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout pinned RealtimeServices
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.realtime-version.outputs.repo }}
-          path: ChatApp.RealtimeServices
-          ref: ${{ steps.realtime-version.outputs.commit }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -298,9 +297,19 @@ jobs:
           docker logs chatapp_postgres || true
           exit 1
 
+      - name: Locked restore
+        working-directory: ChatApp.Server
+        run: dotnet restore ChatApp.Server.sln --locked-mode
+
+      - name: Release build
+        working-directory: ChatApp.Server
+        run: dotnet build ChatApp.Server.sln -c Release --no-restore
+
       - name: Run full integration suite against Garnet
         working-directory: ChatApp.Server
-        run: dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj -c Release
+        run: |
+          dotnet test tests/ChatApp.Server.IntegrationTests/ChatApp.Server.IntegrationTests.csproj \
+            -c Release --no-build --no-restore
 
       # This test deliberately restarts the shared Garnet container. Keep it in a
       # separate test process so it cannot sever another contract's Redis transaction.

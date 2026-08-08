@@ -12,7 +12,6 @@ import { Rate, Trend } from 'k6/metrics';
 
 const errorRate = new Rate('errors');
 const meDuration = new Trend('me_duration', true);
-const friendsDuration = new Trend('friends_duration', true);
 const searchDuration = new Trend('search_duration', true);
 const userSearchDuration = new Trend('user_search_duration', true);
 const refreshDuration = new Trend('refresh_duration', true);
@@ -50,7 +49,6 @@ export const options = {
   thresholds: {
     http_req_failed: ['rate<0.01'],
     me_duration: ['p(95)<100'],
-    friends_duration: ['p(95)<100'],
     errors: ['rate<0.01'],
   },
 };
@@ -124,19 +122,7 @@ export default function (data) {
     errorRate.add(!check(res, { me: (r) => r.status === 200 }));
   });
 
-  group('friends', () => {
-    const start = Date.now();
-    const res = http.get(`${BASE_URL}/api/Friendship/all?limit=50`, { headers });
-    friendsDuration.add(Date.now() - start);
-    errorRate.add(!check(res, { friends: (r) => r.status === 200 }));
-  });
 
-  group('friend search', () => {
-    const start = Date.now();
-    const res = http.get(`${BASE_URL}/api/Friendship/search?searchTerm=a&limit=20`, { headers });
-    searchDuration.add(Date.now() - start);
-    check(res, { search: (r) => r.status === 200 || r.status === 400 });
-  });
 
   group('user search', () => {
     const start = Date.now();

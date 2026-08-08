@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Keep this fixture LF-encoded: it is executed by Ubuntu runners with bash.
 # 预置性能测试用户到 Postgres。
 # 用法：
 #   直连模式：SEED_COUNT=50 bash seed-users.sh  （依赖本地 psql + PG* 环境变量）

@@ -1,4 +1,4 @@
-name: Performance Soak (Manual)
+name: Full-system Performance Soak
 
 on:
   workflow_dispatch:
@@ -10,6 +10,8 @@ on:
         description: "跳过 2h soak"
         type: boolean
         default: false
+  schedule:
+    - cron: "30 2 * * 0"
 
 # 同一时刻只跑一个阶段长测
 concurrency:
@@ -18,8 +20,10 @@ concurrency:
 
 jobs:
   soak:
-    # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
-    runs-on: ubuntu-24.04
+    # Full-system soak is an artifact-producing run.  Strict comparisons use
+    # the dedicated runner configured by PERF_RUNNER_LABEL; this fallback is
+    # intentionally marked unverified in the candidate metadata.
+    runs-on: ${{ vars.PERF_RUNNER_LABEL || 'ubuntu-24.04' }}
     timeout-minutes: 240
     permissions:
       contents: read
@@ -38,6 +42,9 @@ jobs:
       EmailSettings__SenderEmail: "noreply@localhost"
       EmailSettings__Password: "dummy"
       ASPNETCORE_ENVIRONMENT: "Performance"
+      # Keep API measurements independent from background polling and job I/O.
+      DatabasePool__Role: "Api"
+      PERF_RUNNER_ID: ${{ vars.PERF_RUNNER_ID || 'unverified-hosted-runner' }}
       ASPNETCORE_URLS: "http://127.0.0.1:5088"
 
     services:
@@ -61,24 +68,6 @@ jobs:
         with:
           path: ChatApp.Server
           fetch-depth: 0
-
-      - name: Read pinned Realtime version
-        id: realtime-version
-        working-directory: ChatApp.Server
-        run: |
-          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
-          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
-          # actions/checkout 需要 owner/repo 格式；Realtime.version 可能存完整 URL
-          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout RealtimeServices at pinned commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.realtime-version.outputs.repo }}
-          path: ChatApp.RealtimeServices
-          ref: ${{ steps.realtime-version.outputs.commit }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -110,9 +99,13 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Locked restore
+        working-directory: ChatApp.Server
+        run: dotnet restore ChatApp.Server.sln --locked-mode
+
       - name: Release build
         working-directory: ChatApp.Server
-        run: dotnet build ChatApp.Server.sln -c Release
+        run: dotnet build ChatApp.Server.sln -c Release --no-restore
 
       - name: Apply migrations
         working-directory: ChatApp.Server
@@ -137,7 +130,8 @@ jobs:
       - name: Start API (Performance env)
         working-directory: ChatApp.Server
         run: |
-          dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile &
+          LoginRisk__Enabled=true GeoLocation__AllowExternalFallback=false \
+            dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile &
           echo $! > /tmp/api.pid
           for i in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:5088/health/ready" > /dev/null 2>&1; then
@@ -147,6 +141,25 @@ jobs:
             sleep 2
           done
           echo "API failed to become ready"
+          exit 1
+
+      # Full-system soak intentionally uses two processes. The API keeps its
+      # own connection/GC/Redis counters while Worker polling and job I/O use
+      # a separate Worker budget and process-local metrics endpoint.
+      - name: Start Worker (Worker role)
+        working-directory: ChatApp.Server
+        run: |
+          DatabasePool__Role=Worker LoginRisk__Enabled=true ASPNETCORE_URLS="http://127.0.0.1:5090" \
+            dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile > /tmp/worker.log 2>&1 &
+          echo $! > /tmp/worker.pid
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:5090/health/ready" > /dev/null 2>&1; then
+              echo "Worker ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/worker.log || true
           exit 1
 
       - name: Generate preset tokens
@@ -187,7 +200,7 @@ jobs:
           node tests/load/extract-summary.mjs \
             --input tests/load/steady-15m.json \
             --output tests/load/baselines/baseline-steady-rate20.json \
-            --runner ubuntu-24.04 \
+            --runner "$PERF_RUNNER_ID" \
             --runtime "steady 15m RATE=20"
           echo "候选基线已生成；审阅 artifact 后通过普通提交更新基线。"
 
@@ -220,7 +233,8 @@ jobs:
         working-directory: ChatApp.Server
         run: |
           # 第二实例使用不同端口，共享同一 Postgres + Garnet
-          ASPNETCORE_URLS="http://127.0.0.1:5089" \
+          DatabasePool__Role=Api LoginRisk__Enabled=true \
+            ASPNETCORE_URLS="http://127.0.0.1:5089" \
             dotnet run --project ChatApp.Server.csproj -c Release --no-build --no-launch-profile &
           echo $! > /tmp/api2.pid
           for i in $(seq 1 30); do
@@ -351,10 +365,15 @@ jobs:
             console.log("✓ soak 无单调错误增长");
           '
 
-      - name: Stop API
+      - name: Capture Worker process metrics
         if: always()
         run: |
-          for f in /tmp/api.pid /tmp/api2.pid; do
+          curl -fsS "http://127.0.0.1:5090/debug/metrics" > ChatApp.Server/tests/load/worker-metrics.json || true
+
+      - name: Stop API and Worker
+        if: always()
+        run: |
+          for f in /tmp/api.pid /tmp/api2.pid /tmp/worker.pid; do
             if [ -f "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi
           done
 
@@ -375,6 +394,8 @@ jobs:
             ChatApp.Server/tests/load/restart-before.json
             ChatApp.Server/tests/load/restart-after.json
             ChatApp.Server/tests/load/soak.json
+            ChatApp.Server/tests/load/worker-metrics.json
+            /tmp/worker.log
           retention-days: 90
 
       - name: Summary

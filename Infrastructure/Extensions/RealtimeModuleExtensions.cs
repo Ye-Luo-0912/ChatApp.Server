@@ -1,6 +1,8 @@
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
+using Core.Interfaces;
+using Core.Interfaces.Cache;
 using Core.Settings;
 using Infrastructure.Services;
 using Microsoft.Extensions.Configuration;
@@ -27,6 +29,8 @@ public static class RealtimeModuleExtensions
             .ValidateOnStart();
 
         services.Configure<RealtimeIntegrationHostOptions>(config.GetSection(RealtimeIntegrationHostOptions.SectionName));
+        services.AddSingleton<RealtimePostgresDataSource>();
+        services.AddScoped<IPresenceAuthorizationService, PresenceAuthorizationService>();
 
         services.AddScoped<IRealtimeOutboxAdminService, RealtimeOutboxAdminService>();
         if (registerWorkerHostedServices)
@@ -34,9 +38,11 @@ public static class RealtimeModuleExtensions
             services.AddHostedService(sp => new PresenceAuthorizeWorker(
                 sp.GetService<IRealtimeMessageBus>(),
                 sp.GetRequiredService<IServiceScopeFactory>(),
-                sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
-                sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
                 sp.GetRequiredService<ILogger<PresenceAuthorizeWorker>>()));
+            services.AddHostedService(sp => new PresenceAuthorizationInvalidationWorker(
+                sp.GetService<IRealtimeMessageBus>(),
+                sp.GetRequiredService<IAtomicCacheStore>(),
+                sp.GetRequiredService<ILogger<PresenceAuthorizationInvalidationWorker>>()));
         }
 
         TryAddRealtimeIntegration(services, config);

@@ -1,9 +1,10 @@
 using System.Text.Json.Serialization;
+using ChatApp.Auth.Contracts;
 using Core.Models.Auth;
 using Core.Models.Common;
 using Core.Models.Email;
-using Core.Models.Friend;
 using Core.Models.Identity;
+using Core.Models.Presence;
 using Core.Models.Token;
 using Core.Models.User;
 using Infrastructure.Services;
@@ -34,22 +35,13 @@ namespace Infrastructure.Serialization;
 [JsonSerializable(typeof(AuthOperationError))]
 [JsonSerializable(typeof(UserProfileResponse))]
 [JsonSerializable(typeof(PublicUserResponse))]
-// ─ 好友相关 DTO ──────────────────────────────────────────
-[JsonSerializable(typeof(FriendDto))]
-[JsonSerializable(typeof(FriendshipOperationResult))]
-[JsonSerializable(typeof(SendFriendRequestResult))]
-[JsonSerializable(typeof(FriendshipOperationResult<FriendDto>))]
 // ─ 其他 ───────────────────────────────────────────────
 [JsonSerializable(typeof(EmailResult))]
-[JsonSerializable(typeof(CursorPage<FriendDto>))]
-[JsonSerializable(typeof(CursorPage<FriendRequestDto>))]
-[JsonSerializable(typeof(CursorPage<BlockedUserDto>))]
-[JsonSerializable(typeof(CursorPage<FriendSearchResultDto>))]
-[JsonSerializable(typeof(AccessTokenData))]
+[JsonSerializable(typeof(AccessTokenCacheRecord))]
 [JsonSerializable(typeof(RefreshToken))]
 [JsonSerializable(typeof(SessionRecord))]
 [JsonSerializable(typeof(UserAuthSnapshot))]
-[JsonSerializable(typeof(FriendshipStatusInfo))]
+[JsonSerializable(typeof(PresenceAuthorizationProjection))]
 [JsonSerializable(typeof(AttachmentDownloadTicketPayload))]
 [JsonSerializable(typeof(AttachmentUploadTicket))]
 [JsonSerializable(typeof(LocalAvatarStorage.AvatarTicketInfo))]

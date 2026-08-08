@@ -5,6 +5,7 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using ChatApp.Realtime.Integration;
+using Npgsql;
 
 namespace ChatApp.Server.Extensions;
 
@@ -12,6 +13,9 @@ internal sealed class AttachmentStorageHealthCheck(
     IOptions<AttachmentStorageOptions> options,
     IAttachmentMetadataStore metadata,
     IAttachmentStorage storage,
+    IAvatarStorage avatarStorage,
+    IAttachmentContentScanner scanner,
+    IOptions<HealthDependencyOptions> dependencyOptions,
     IHostEnvironment environment) : IHealthCheck
 {
     public async Task<HealthCheckResult> CheckHealthAsync(
@@ -48,15 +52,76 @@ internal sealed class AttachmentStorageHealthCheck(
             }
         }
 
+        if (storage is IS3LifecycleHealthProbe attachmentLifecycle)
+        {
+            try
+            {
+                await attachmentLifecycle.ValidateLifecycleAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new HealthCheckResult(
+                    HealthStatus.Unhealthy,
+                    "附件 S3 Lifecycle 配置不可用",
+                    ex,
+                    new Dictionary<string, object>
+                    {
+                        ["provider"] = opts.Provider,
+                        ["capability"] = "candidate_lifecycle",
+                    });
+            }
+        }
+
+        if (avatarStorage is IS3LifecycleHealthProbe avatarLifecycle)
+        {
+            try
+            {
+                await avatarLifecycle.ValidateLifecycleAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new HealthCheckResult(
+                    HealthStatus.Unhealthy,
+                    "头像 S3 Lifecycle 配置不可用",
+                    ex,
+                    new Dictionary<string, object>
+                    {
+                        ["capability"] = "avatar_candidate_lifecycle",
+                    });
+            }
+        }
+
         if (!metadata.IsAvailable)
         {
             return new HealthCheckResult(
-                HealthStatus.Degraded,
+                dependencyOptions.Value.RequireAttachmentMetadata(metadata.IsAvailable)
+                    ? HealthStatus.Unhealthy
+                    : HealthStatus.Degraded,
                 "附件元数据服务不可用",
                 data: new Dictionary<string, object>
                 {
                     ["reason"] = metadata.UnavailableReason,
                 });
+        }
+
+        if (metadata is IAttachmentMetadataHealthProbe metadataProbe)
+        {
+            try
+            {
+                await metadataProbe.ProbeAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                return new HealthCheckResult(
+                    dependencyOptions.Value.RequireAttachmentMetadata(configured: true)
+                        ? HealthStatus.Unhealthy
+                        : HealthStatus.Degraded,
+                    "附件元数据 Realtime PostgreSQL 不可用",
+                    ex,
+                    new Dictionary<string, object> { ["provider"] = "realtime-postgres" });
+            }
         }
 
         if (string.Equals(opts.ScannerProvider, "DenyList", StringComparison.OrdinalIgnoreCase)
@@ -73,47 +138,106 @@ internal sealed class AttachmentStorageHealthCheck(
                 });
         }
 
+        if (dependencyOptions.Value.IsWorker
+            && string.Equals(opts.ScannerProvider, "ClamAV", StringComparison.OrdinalIgnoreCase)
+            && scanner is IAttachmentScannerHealthProbe scannerProbe)
+        {
+            try
+            {
+                await scannerProbe.ProbeAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                return new HealthCheckResult(
+                    HealthStatus.Unhealthy,
+                    "ClamAV 扫描服务不可用",
+                    ex,
+                    new Dictionary<string, object> { ["provider"] = "clamav" });
+            }
+        }
+
         return HealthCheckResult.Healthy("附件存储配置就绪");
     }
 }
 
 internal sealed class MessageEvidenceHealthCheck(
     IOptions<MessageEvidenceOptions> options,
-    IServiceProvider services) : IHealthCheck
+    RealtimePostgresDataSource dataSource,
+    IServiceProvider services,
+    IOptions<HealthDependencyOptions> dependencyOptions) : IHealthCheck
 {
-    public Task<HealthCheckResult> CheckHealthAsync(
+    public async Task<HealthCheckResult> CheckHealthAsync(
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
     {
         var opts = options.Value;
-        var hasRealtime = !string.IsNullOrWhiteSpace(opts.RealtimeConnectionString)
-                          || services.GetService<IRealtimeMessageBus>() is not null;
-        return Task.FromResult(hasRealtime
-            ? HealthCheckResult.Healthy("消息证据服务已配置")
-            : new HealthCheckResult(
-                HealthStatus.Degraded,
+        try
+        {
+            if (dataSource.DataSource is { } postgres)
+            {
+                await using var connection = await postgres.OpenConnectionAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                await using var command = new NpgsqlCommand("SELECT 1", connection);
+                await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                return HealthCheckResult.Healthy("消息证据 Realtime PostgreSQL 可用");
+            }
+
+            if (services.GetService<IRealtimeMessageBus>() is { } bus)
+            {
+                await bus.PingAsync(cancellationToken).ConfigureAwait(false);
+                return HealthCheckResult.Healthy("消息证据 Realtime 总线可用");
+            }
+
+            return new HealthCheckResult(
+                dependencyOptions.Value.RequireMessageEvidence(configured: false)
+                    ? HealthStatus.Unhealthy
+                    : HealthStatus.Degraded,
                 "消息证据服务不可用",
                 data: new Dictionary<string, object>
                 {
                     ["reason"] = "未配置 Realtime Postgres 或 NATS 总线",
-                }));
+                });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            return new HealthCheckResult(
+                HealthStatus.Unhealthy,
+                "消息证据实时探测失败",
+                ex,
+                new Dictionary<string, object> { ["provider"] = "realtime" });
+        }
     }
 }
 
-internal sealed class RealtimeOutboxHealthCheck(IServiceProvider services) : IHealthCheck
+internal sealed class RealtimeOutboxHealthCheck(
+    IServiceProvider services,
+    IOptions<HealthDependencyOptions> dependencyOptions) : IHealthCheck
 {
-    public Task<HealthCheckResult> CheckHealthAsync(
+    public async Task<HealthCheckResult> CheckHealthAsync(
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
-        => Task.FromResult(services.GetService<IRealtimeMessageBus>() is not null
-            ? HealthCheckResult.Healthy("Realtime outbox 已连接")
-            : new HealthCheckResult(
-                HealthStatus.Degraded,
+    {
+        if (services.GetService<IRealtimeMessageBus>() is not { } bus)
+            return new HealthCheckResult(
+                dependencyOptions.Value.RequireRealtimeOutbox
+                    ? HealthStatus.Unhealthy
+                    : HealthStatus.Degraded,
                 "Realtime outbox 不可用",
                 data: new Dictionary<string, object>
                 {
                     ["reason"] = "未注册 Realtime NATS 总线",
-                }));
+                });
+
+        try
+        {
+            await bus.PingAsync(cancellationToken).ConfigureAwait(false);
+            return HealthCheckResult.Healthy("Realtime outbox 总线可用");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            return new HealthCheckResult(HealthStatus.Unhealthy, "Realtime outbox 实时探测失败", ex);
+        }
+    }
 }
 
 internal sealed class DataExportHealthCheck(
@@ -153,6 +277,27 @@ internal sealed class DataExportHealthCheck(
             }
         }
 
+        if (blobStore is IS3LifecycleHealthProbe lifecycle)
+        {
+            try
+            {
+                await lifecycle.ValidateLifecycleAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return new HealthCheckResult(
+                    HealthStatus.Unhealthy,
+                    "导出 S3 Lifecycle 配置不可用",
+                    ex,
+                    new Dictionary<string, object>
+                    {
+                        ["provider"] = opts.Provider,
+                        ["capability"] = "candidate_lifecycle",
+                    });
+            }
+        }
+
         if (string.Equals(opts.Provider, "Local", StringComparison.OrdinalIgnoreCase)
             && !environment.IsDevelopment()
             && !environment.IsEnvironment("Testing"))
@@ -173,6 +318,15 @@ internal sealed class DataExportHealthCheck(
 
 internal static class HealthResponseWriter
 {
+    public static async Task WriteSimpleAsync(HttpContext context, HealthReport report)
+    {
+        context.Response.ContentType = "application/json; charset=utf-8";
+        await context.Response.WriteAsJsonAsync(new
+        {
+            status = report.Status.ToString().ToLowerInvariant(),
+        }).ConfigureAwait(false);
+    }
+
     public static async Task WriteAsync(HttpContext context, HealthReport report)
     {
         context.Response.ContentType = "application/json; charset=utf-8";

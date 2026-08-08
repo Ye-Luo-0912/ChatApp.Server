@@ -11,7 +11,7 @@ Guidance for humans and coding agents working in this repository.
 | Host/API | `Controllers/`, `Middlewares/`, `Filters/`, `Program.cs` | Core and Infrastructure | Persistence details in controllers |
 | Tests | `tests/` | Public behavior and explicitly exposed internals | Depend on execution order or shared mutable fixtures |
 
-Dependency direction is **Host → Infrastructure → Core**. Realtime contracts and integration code come from the pinned sibling repository `../ChatApp.RealtimeServices`; keep `Realtime.version`, project references, CI checkout, and Docker build context aligned.
+Dependency direction is **Host → Infrastructure → Core**. Realtime contracts, NATS integration, and EF Outbox mapping are consumed from the independently versioned `ChatApp.Realtime.Contracts`, `ChatApp.Realtime.Integration`, and `ChatApp.Realtime.Outbox.EntityFrameworkCore` packages in the repository-local feed; Server restore/build must not require a sibling source checkout. Consumers that do not persist the EF Outbox must not reference the Outbox package.
 
 ## Engineering priorities
 

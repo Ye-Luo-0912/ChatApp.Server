@@ -46,7 +46,6 @@ internal static class WafTestHelpers
             SecurityStamp = Guid.NewGuid().ToString(),
             LockoutEnabled = true,
             AllowBeSearched = allowSearch,
-            FriendRequestPolicy = FriendRequestPolicy.RequireVerification,
         };
         db.Users.Add(user);
         await db.SaveChangesAsync();

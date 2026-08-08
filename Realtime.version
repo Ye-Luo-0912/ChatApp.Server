@@ -1,5 +1,0 @@
-# P0-7: 固定 Realtime 依赖的 commit，保证同一 Server commit 在不同时间编译到相同版本的 Realtime 代码。
-# 升级 Realtime 时：更新此文件中的 Commit，本地重新拉取对应版本，提交 PR。
-Repo=https://github.com/Ye-Luo-0912/ChatApp.RealtimeServices.git
-Branch=main
-Commit=a2ede73d8ee2dfc4a36d099a6a4d6961d8f45532

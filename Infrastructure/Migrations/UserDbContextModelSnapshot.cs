@@ -89,6 +89,62 @@ namespace Infrastructure.Migrations
                     b.ToTable("outbox", "realtime");
                 });
 
+            modelBuilder.Entity("Core.Models.Auth.MfaRecoveryCodeClaimEntity", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("ClaimToken")
+                        .IsRequired()
+                        .HasMaxLength(96)
+                        .HasColumnType("character varying(96)");
+
+                    b.Property<DateTimeOffset>("ClaimedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("CodeDigest")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("ExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("OriginalCodesJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("RemainingCodesJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<short>("State")
+                        .HasColumnType("smallint");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ClaimToken")
+                        .IsUnique()
+                        .HasDatabaseName("UX_MfaRecoveryCodeClaim_Token");
+
+                    b.HasIndex("State", "ExpiresAt")
+                        .HasDatabaseName("IX_MfaRecoveryCodeClaim_State_Expires");
+
+                    b.HasIndex("UserId", "State")
+                        .HasDatabaseName("IX_MfaRecoveryCodeClaim_User_State");
+
+                    b.ToTable("T_MfaRecoveryCodeClaim", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Email.EmailOutboxItem", b =>
                 {
                     b.Property<long>("Id")
@@ -329,6 +385,13 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
 
+                    b.Property<string>("StorageKind")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasDefaultValue("attachment");
+
                     b.Property<long?>("UserId")
                         .HasColumnType("bigint");
 
@@ -349,6 +412,105 @@ namespace Infrastructure.Migrations
                         .HasDatabaseName("IX_AttachmentBlobDeleteJob_Due");
 
                     b.ToTable("T_AttachmentBlobDeleteJob", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Export.AttachmentConfirmSaga", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("AttachmentId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ConfirmedObjectKey")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("ContentType")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("LeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("OriginalName")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<string>("ProtectedTicket")
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
+
+                    b.Property<long?>("ScanJobId")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("SizeBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("UploaderDeletionEpoch")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AttachmentId")
+                        .IsUnique()
+                        .HasDatabaseName("UX_AttachmentConfirmSaga_AttachmentId");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("IX_AttachmentConfirmSaga_UserId");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_AttachmentConfirmSaga_LeaseDue");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_AttachmentConfirmSaga_Due");
+
+                    b.ToTable("T_AttachmentConfirmSaga", (string)null);
                 });
 
             modelBuilder.Entity("Core.Models.Export.AttachmentScanAudit", b =>
@@ -485,6 +647,9 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
 
+                    b.Property<long>("UploaderDeletionEpoch")
+                        .HasColumnType("bigint");
+
                     b.Property<long>("UserId")
                         .HasColumnType("bigint");
 
@@ -576,6 +741,9 @@ namespace Infrastructure.Migrations
                     b.Property<long>("ScanJobId")
                         .HasColumnType("bigint");
 
+                    b.Property<long>("ScanVersion")
+                        .HasColumnType("bigint");
+
                     b.Property<long>("SizeBytes")
                         .HasColumnType("bigint");
 
@@ -587,6 +755,9 @@ namespace Infrastructure.Migrations
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
+
+                    b.Property<long>("UploaderDeletionEpoch")
+                        .HasColumnType("bigint");
 
                     b.Property<long>("UserId")
                         .HasColumnType("bigint");
@@ -607,6 +778,97 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_AttachmentScanProjection", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Models.Export.AvatarFinalizationSaga", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("ExpectedAvatarVersion")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("FinalObjectKey")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("LeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("ObjectKey")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<string>("OldAvatarUrl")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)");
+
+                    b.Property<string>("ProtectedTicket")
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
+
+                    b.Property<string>("PublicUrl")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("UploaderDeletionEpoch")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("IX_AvatarFinalizationSaga_UserId");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_AvatarFinalizationSaga_LeaseDue");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_AvatarFinalizationSaga_Due");
+
+                    b.HasIndex("UserId", "ObjectKey")
+                        .IsUnique()
+                        .HasDatabaseName("UX_AvatarFinalizationSaga_User_Object");
+
+                    b.ToTable("T_AvatarFinalizationSaga", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Export.DataExportJob", b =>
                 {
                     b.Property<string>("Id")
@@ -620,6 +882,9 @@ namespace Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("DownloadLeaseUntil")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("Error")
@@ -638,6 +903,9 @@ namespace Infrastructure.Migrations
                         .HasColumnType("character varying(64)");
 
                     b.Property<DateTimeOffset?>("LeaseUntil")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("ObjectKey")
@@ -660,15 +928,59 @@ namespace Infrastructure.Migrations
                     b.HasIndex("UserId")
                         .IsUnique()
                         .HasDatabaseName("UX_DataExportJob_OneActive")
-                        .HasFilter("\"ConsumedAt\" IS NULL AND \"Status\" IN ('Pending', 'Processing', 'Ready')");
+                        .HasFilter("\"ConsumedAt\" IS NULL AND \"Status\" IN ('Pending', 'Processing', 'CancelRequested', 'Ready')");
 
                     b.HasIndex("Status", "LeaseUntil", "CreatedAt")
                         .HasDatabaseName("IX_DataExportJob_Claim");
+
+                    b.HasIndex("Status", "NextAttemptAt", "CreatedAt")
+                        .HasDatabaseName("IX_DataExportJob_Due");
 
                     b.HasIndex("UserId", "Status", "CreatedAt")
                         .HasDatabaseName("IX_DataExportJob_User_Status");
 
                     b.ToTable("T_DataExportJob", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Export.JobDeadLetterResolution", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long>("AdminUserId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("JobId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Queue")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Reason")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Queue", "JobId", "CreatedAt")
+                        .HasDatabaseName("IX_JobDeadLetterResolution_Queue_Job_Created");
+
+                    b.ToTable("T_JobDeadLetterResolution", (string)null);
                 });
 
             modelBuilder.Entity("Core.Models.Friend.BlockRecord", b =>
@@ -728,9 +1040,14 @@ namespace Infrastructure.Migrations
 
                     b.HasKey("GroupId");
 
+                    b.HasIndex("UserId")
+                        .IsUnique()
+                        .HasDatabaseName("UX_FriendGroup_User_Default")
+                        .HasFilter("\"IsDefault\" = TRUE");
+
                     b.HasIndex("UserId", "GroupName")
                         .IsUnique()
-                        .HasDatabaseName("IX_T_FriendGroup_UserId_GroupName");
+                        .HasDatabaseName("FriendGroupNameConstraint");
 
                     b.HasIndex("UserId", "SortOrder")
                         .HasDatabaseName("IX_FriendGroup_UserId_SortOrder");
@@ -856,6 +1173,11 @@ namespace Infrastructure.Migrations
                     b.Property<int>("AccessFailedCount")
                         .HasColumnType("integer");
 
+                    b.Property<short>("AccountState")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("smallint")
+                        .HasDefaultValue((short)0);
+
                     b.Property<bool>("AllowBeSearched")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
@@ -864,6 +1186,12 @@ namespace Infrastructure.Migrations
                     b.Property<string>("AvatarUrl")
                         .HasMaxLength(2048)
                         .HasColumnType("character varying(2048)");
+
+                    b.Property<long>("AvatarVersion")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasDefaultValue(1L);
 
                     b.Property<DateTimeOffset?>("BanUntil")
                         .HasColumnType("timestamp with time zone");
@@ -877,11 +1205,31 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset>("CreatedDate")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<int>("DeletionAttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("DeletionDeadLetterAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("DeletionEpoch")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("DeletionLastError")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
                     b.Property<string>("DeletionLeaseOwner")
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<string>("DeletionLeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<DateTimeOffset?>("DeletionLeaseUntil")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("DeletionNextAttemptAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTimeOffset?>("DeletionScheduledAt")
@@ -924,6 +1272,14 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
 
+                    b.Property<string>("NormalizedPendingPhoneNumber")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("NormalizedPhoneNumber")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
                     b.Property<string>("NormalizedUserName")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
@@ -941,11 +1297,23 @@ namespace Infrastructure.Migrations
                     b.Property<string>("PasswordHash")
                         .HasColumnType("text");
 
+                    b.Property<int>("PasswordHashVersion")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(0);
+
                     b.Property<string>("PendingEmail")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
 
                     b.Property<DateTimeOffset?>("PendingEmailRequestedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("PendingPhoneNumber")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTimeOffset?>("PendingPhoneRequestedAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("PendingRecoveryCodesHashJson")
@@ -956,7 +1324,8 @@ namespace Infrastructure.Migrations
                         .HasColumnType("character varying(512)");
 
                     b.Property<string>("PhoneNumber")
-                        .HasColumnType("text");
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
 
                     b.Property<bool>("PhoneNumberConfirmed")
                         .HasColumnType("boolean");
@@ -972,6 +1341,7 @@ namespace Infrastructure.Migrations
                         .HasColumnType("text");
 
                     b.Property<long>("SecurityVersion")
+                        .IsConcurrencyToken()
                         .ValueGeneratedOnAdd()
                         .HasColumnType("bigint")
                         .HasDefaultValue(1L);
@@ -1010,9 +1380,20 @@ namespace Infrastructure.Migrations
                     b.HasIndex("NormalizedPendingEmail")
                         .HasDatabaseName("IX_AspNetUsers_NormalizedPendingEmail");
 
+                    b.HasIndex("NormalizedPendingPhoneNumber")
+                        .HasDatabaseName("IX_AspNetUsers_NormalizedPendingPhoneNumber");
+
+                    b.HasIndex("NormalizedPhoneNumber")
+                        .IsUnique()
+                        .HasDatabaseName("UX_AspNetUsers_NormalizedPhoneNumber")
+                        .HasFilter("\"NormalizedPhoneNumber\" IS NOT NULL");
+
                     b.HasIndex("NormalizedUserName")
                         .IsUnique()
                         .HasDatabaseName("UserNameIndex");
+
+                    b.HasIndex("DeletionScheduledAt", "DeletionNextAttemptAt")
+                        .HasDatabaseName("IX_AspNetUsers_DeletionDue");
 
                     b.ToTable("AspNetUsers", (string)null);
                 });
@@ -1050,13 +1431,24 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("DedupeKey")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
                     b.Property<string>("Detail")
                         .HasMaxLength(2000)
                         .HasColumnType("character varying(2000)");
 
-                    b.Property<string>("EvidenceSnapshot")
+                    b.Property<string>("EvidenceBodyPreview")
                         .HasMaxLength(4000)
                         .HasColumnType("character varying(4000)");
+
+                    b.Property<string>("EvidenceContentHash")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("EvidenceSnapshot")
+                        .HasColumnType("jsonb");
 
                     b.Property<string>("Reason")
                         .IsRequired()
@@ -1086,6 +1478,11 @@ namespace Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("DedupeKey")
+                        .IsUnique()
+                        .HasDatabaseName("UX_UserReport_DedupeKey")
+                        .HasFilter("\"DedupeKey\" IS NOT NULL");
 
                     b.HasIndex("TargetUserId")
                         .HasDatabaseName("IX_UserReport_TargetUser");
@@ -1281,6 +1678,166 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_InAppNotification", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Models.Security.LoginAuditOutboxItem", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("ActorUserId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ClientIp")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Detail")
+                        .HasMaxLength(1024)
+                        .HasColumnType("character varying(1024)");
+
+                    b.Property<string>("DeviceId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<short>("EventType")
+                        .HasColumnType("smallint");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("LeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Location")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("SessionId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<byte>("Status")
+                        .HasColumnType("smallint");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long?>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_LoginAuditOutbox_Status_LeaseExpiresAt");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_LoginAuditOutbox_Status_NextAttemptAt");
+
+                    b.ToTable("T_LoginAuditOutbox", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Security.LoginRiskOutboxItem", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ClientIp")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("DeviceId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<bool>("IpChanged")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool>("IsNewDevice")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("LeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("RuleVersion")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(1);
+
+                    b.Property<string>("SessionId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<byte>("Status")
+                        .HasColumnType("smallint");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_LoginRiskOutbox_Status_LeaseExpiresAt");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_LoginRiskOutbox_Status_NextAttemptAt");
+
+                    b.ToTable("T_LoginRiskOutbox", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Security.ModerationSessionRevocationOutboxItem", b =>
                 {
                     b.Property<long>("Id")
@@ -1387,15 +1944,144 @@ namespace Infrastructure.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
 
+                    b.Property<long?>("SourceLoginAuditOutboxId")
+                        .HasColumnType("bigint");
+
                     b.Property<long?>("UserId")
                         .HasColumnType("bigint");
 
                     b.HasKey("Id");
 
+                    b.HasIndex("SourceLoginAuditOutboxId")
+                        .IsUnique()
+                        .HasDatabaseName("UX_SecurityEvent_LoginAuditOutbox")
+                        .HasFilter("\"SourceLoginAuditOutboxId\" IS NOT NULL");
+
                     b.HasIndex("UserId", "Id")
                         .HasDatabaseName("IX_SecurityEvent_UserId_Id");
 
                     b.ToTable("T_SecurityEvent", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Security.SecurityOperationGrant", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset?>("ClaimedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("ExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("GrantHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("PayloadHash")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Purpose")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<byte>("State")
+                        .IsConcurrencyToken()
+                        .HasColumnType("smallint");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("GrantHash")
+                        .IsUnique()
+                        .HasDatabaseName("UX_SecurityOperationGrant_Hash");
+
+                    b.HasIndex("UserId", "State", "ExpiresAt")
+                        .HasDatabaseName("IX_SecurityOperationGrant_User_State_Expires");
+
+                    b.ToTable("T_SecurityOperationGrant", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Security.SecuritySessionRevocationOutboxItem", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset?>("CompletedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<short>("EventType")
+                        .HasColumnType("smallint");
+
+                    b.Property<string>("ExceptDeviceId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<long>("ExpectedSecurityVersion")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("character varying(1000)");
+
+                    b.Property<DateTimeOffset?>("LeaseExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("LeaseOwner")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("LeaseToken")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset>("NextAttemptAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("RevokeTrustedDevices")
+                        .HasColumnType("boolean");
+
+                    b.Property<byte>("Status")
+                        .HasColumnType("smallint");
+
+                    b.Property<DateTimeOffset>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Status", "LeaseExpiresAt")
+                        .HasDatabaseName("IX_SecuritySessionRevocationOutbox_Status_LeaseExpiresAt");
+
+                    b.HasIndex("Status", "NextAttemptAt")
+                        .HasDatabaseName("IX_SecuritySessionRevocationOutbox_Status_NextAttemptAt");
+
+                    b.ToTable("T_SecuritySessionRevocationOutbox", (string)null);
                 });
 
             modelBuilder.Entity("Core.Models.Security.TrustedDevice", b =>
@@ -1427,6 +2113,11 @@ namespace Infrastructure.Migrations
                     b.Property<DateTimeOffset?>("RevokedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<long>("SecurityVersion")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasDefaultValue(1L);
+
                     b.Property<string>("TokenHash")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -1448,6 +2139,15 @@ namespace Infrastructure.Migrations
                         .HasDatabaseName("IX_TrustedDevice_User_Expires");
 
                     b.ToTable("T_TrustedDevice", (string)null);
+                });
+
+            modelBuilder.Entity("Core.Models.Auth.MfaRecoveryCodeClaimEntity", b =>
+                {
+                    b.HasOne("Core.Models.Identity.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("Core.Models.Friend.BlockRecord", b =>
@@ -1535,6 +2235,15 @@ namespace Infrastructure.Migrations
                     b.Navigation("Role");
 
                     b.Navigation("User");
+                });
+
+            modelBuilder.Entity("Core.Models.Security.SecurityOperationGrant", b =>
+                {
+                    b.HasOne("Core.Models.Identity.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 #pragma warning restore 612, 618
         }

@@ -9,9 +9,8 @@ namespace Infrastructure.Data;
 internal static class PostgresDbException
 {
     public const string EmailOutboxIdempotencyConstraint = "IX_EmailOutbox_IdempotencyKey_Active";
-    // 与 Initial 迁移中的唯一索引名一致
-    public const string FriendGroupNameConstraint = "IX_T_FriendGroup_UserId_GroupName";
-
+    public const string FriendGroupNameConstraint = "FriendGroupNameConstraint";
+    public const string UserReportDedupeConstraint = "UX_UserReport_DedupeKey";
     public static bool IsUniqueViolation(DbUpdateException ex, string expectedConstraintName)
     {
         return ex.InnerException is PostgresException

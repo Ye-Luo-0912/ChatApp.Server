@@ -2,17 +2,35 @@ name: Performance Stage Gate
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "Core/**"
+      - "Infrastructure/**"
+      - "Controllers/**"
+      - "Program.cs"
+      - "tests/load/**"
+      - ".github/workflows/performance-regression.yml"
+  pull_request:
+    paths:
+      - "Core/**"
+      - "Infrastructure/**"
+      - "Controllers/**"
+      - "Program.cs"
+      - "tests/load/**"
+      - ".github/workflows/performance-regression.yml"
+      - ".github/workflows/performance-worker.yml"
 
-# 阶段性手动执行；避免同一分支重复触发并发压测。
+# 手动 Stage Gate 使用完整基线；PR 只执行低成本 API smoke。
 concurrency:
   group: perf-regression-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   regression:
-    # 固定 runner 镜像，避免 ubuntu-latest 漂移污染性能基线。
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Prefer a dedicated runner.  If the committed provenance is not a match,
+    # the job falls back to a paired baseline/candidate run on this same host.
+    runs-on: ${{ vars.PERF_RUNNER_LABEL || 'ubuntu-24.04' }}
+    timeout-minutes: 60
     env:
       DOTNET_NOLOGO: "1"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
@@ -28,7 +46,24 @@ jobs:
       EmailSettings__SenderEmail: "noreply@localhost"
       EmailSettings__Password: "dummy"
       ASPNETCORE_ENVIRONMENT: "Performance"
+      # Stage Gate measures the HTTP process only. Background jobs run in a
+      # separate Worker deployment and must not contaminate API counters.
+      DatabasePool__Role: "Api"
+      # Login-risk analysis is a durable Worker concern.  Do not append an
+      # outbox row or make GeoIP activity part of the API benchmark.
+      LoginRisk__Enabled: "false"
+      GeoLocation__AllowExternalFallback: "false"
+      PERF_RUNNER_ID: ${{ vars.PERF_RUNNER_ID || '' }}
+      PERF_BASELINE_COMMIT: ${{ vars.PERF_BASELINE_COMMIT || '' }}
+      PERF_ENDPOINT_DURATION: ${{ github.event_name == 'pull_request' && '10s' || '30s' }}
+      PRESENCE_URL: ${{ vars.PRESENCE_URL || '' }}
+      PRESENCE_BODY: ${{ vars.PRESENCE_BODY || '{}' }}
+      PRESENCE_METHOD: ${{ vars.PRESENCE_METHOD || 'POST' }}
       ASPNETCORE_URLS: "http://127.0.0.1:5088"
+      # The disposable CI database also hosts the Realtime attachment schema
+      # for the presign endpoint stage. Production Realtime remains separate.
+      MessageEvidence__RealtimeConnectionString: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres;Pooling=true"
+      DataExport__RealtimeConnectionString: "Host=127.0.0.1;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=postgres;Pooling=true"
 
     services:
       postgres:
@@ -50,24 +85,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: ChatApp.Server
-
-      - name: Read pinned Realtime version
-        id: realtime-version
-        working-directory: ChatApp.Server
-        run: |
-          commit=$(grep "^Commit=" Realtime.version | cut -d= -f2)
-          repo_raw=$(grep "^Repo=" Realtime.version | cut -d= -f2)
-          # actions/checkout 需要 owner/repo 格式；Realtime.version 可能存完整 URL
-          repo=$(echo "$repo_raw" | sed -E 's#^https?://[^/]+/##; s#\.git$##')
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout RealtimeServices at pinned commit
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.realtime-version.outputs.repo }}
-          path: ChatApp.RealtimeServices
-          ref: ${{ steps.realtime-version.outputs.commit }}
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -78,6 +96,61 @@ jobs:
         uses: grafana/setup-k6-action@v1
         with:
           k6-version: "0.54.0"
+
+      - name: Select comparison mode
+        id: comparison
+        working-directory: ChatApp.Server
+        run: |
+          set -euo pipefail
+          baseline_path="tests/load/baselines/baseline-steady-rate20.json"
+          baseline_commit=""
+          baseline_runner=""
+          if [ -f "$baseline_path" ]; then
+            baseline_commit=$(node -e 'const fs=require("fs"); const x=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(String(x.commit || ""));' "$baseline_path")
+            baseline_runner=$(node -e 'const fs=require("fs"); const x=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(String(x.runner || ""));' "$baseline_path")
+          fi
+          if [ -z "$baseline_commit" ]; then
+            baseline_commit="${PERF_BASELINE_COMMIT:-}"
+          fi
+          if [ -z "$baseline_commit" ]; then
+            baseline_commit=$(git rev-parse HEAD^)
+            echo "::warning::基线文件缺少 commit，使用 HEAD^=${baseline_commit} 进行同机配对测量。"
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            mode="smoke"
+            comparison_runner="smoke-${GITHUB_RUN_ID}"
+          elif [ -n "$PERF_RUNNER_ID" ] && [ "$baseline_runner" = "$PERF_RUNNER_ID" ]; then
+            mode="committed"
+            comparison_runner="$PERF_RUNNER_ID"
+            echo "使用已审阅且 runner 匹配的提交基线：$baseline_runner"
+          else
+            # A runner label or ubuntu image is not a hardware identity. If
+            # provenance does not match, measure both commits in this job.
+            mode="paired"
+            safe_runner=$(printf '%s' "${RUNNER_NAME:-host}" | tr ' /' '__')
+            comparison_runner="paired-${GITHUB_RUN_ID}-${safe_runner}"
+            echo "同机配对模式：committed runner=${baseline_runner:-missing}; configured runner=${PERF_RUNNER_ID:-missing}"
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "runner=$comparison_runner" >> "$GITHUB_OUTPUT"
+          echo "commit=$baseline_commit" >> "$GITHUB_OUTPUT"
+          echo "PERF_COMPARISON_MODE=$mode" >> "$GITHUB_ENV"
+          echo "PERF_COMPARISON_RUNNER=$comparison_runner" >> "$GITHUB_ENV"
+          echo "PERF_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
+
+      - name: Validate strict runner provenance
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ "$PERF_COMPARISON_MODE" = "paired" ]; then
+            echo "严格门禁使用同一 job 的基线 commit/候选 commit 配对运行：$PERF_COMPARISON_RUNNER"
+          elif [ -z "$PERF_RUNNER_ID" ]; then
+            echo "::error::提交基线模式必须配置 repository variable PERF_RUNNER_ID。"
+            exit 1
+          else
+            echo "严格门禁使用专用 runner：$PERF_RUNNER_ID"
+          fi
 
       - name: Start Garnet with Lua scripting
         run: |
@@ -94,9 +167,53 @@ jobs:
           echo "Garnet failed to start"
           exit 1
 
+      - name: Install EF CLI
+        if: github.event_name != 'pull_request' && steps.comparison.outputs.mode == 'paired'
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.* || true
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Run paired baseline commit
+        if: github.event_name != 'pull_request' && steps.comparison.outputs.mode == 'paired'
+        working-directory: ChatApp.Server
+        env:
+          SERVER_ROOT: ${{ github.workspace }}/ChatApp.Server
+          BASELINE_COMMIT: ${{ steps.comparison.outputs.commit }}
+          RUNNER_ID: ${{ steps.comparison.outputs.runner }}
+          RATE: "20"
+          DURATION: "3m"
+          ROUNDS: "3"
+          BASELINE_PORT: "5087"
+          PGHOST: "127.0.0.1"
+          PGUSER: "postgres"
+          PGPASSWORD: "postgres"
+          PGDATABASE: "ChatAppDatabase"
+        run: bash tests/load/run-paired-api-stage.sh
+
+      - name: Reset Garnet before candidate
+        if: github.event_name != 'pull_request' && steps.comparison.outputs.mode == 'paired'
+        run: |
+          docker rm -f garnet >/dev/null 2>&1 || true
+          docker run -d --name garnet -p 6379:6379 --user 0:0 \
+            ghcr.io/microsoft/garnet:1.0.84 \
+            --bind 0.0.0.0 --port 6379 --lua
+          for i in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/127.0.0.1/6379' 2>/dev/null; then
+              echo "Garnet candidate instance ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Garnet candidate instance failed to start"
+          exit 1
+
+      - name: Locked restore
+        working-directory: ChatApp.Server
+        run: dotnet restore ChatApp.Server.sln --locked-mode
+
       - name: Release build
         working-directory: ChatApp.Server
-        run: dotnet build ChatApp.Server.sln -c Release
+        run: dotnet build ChatApp.Server.sln -c Release --no-restore
 
       - name: Apply migrations
         working-directory: ChatApp.Server
@@ -104,6 +221,33 @@ jobs:
           dotnet tool install --global dotnet-ef --version 10.0.* || true
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
           dotnet ef database update --project Infrastructure --startup-project Infrastructure --context UserDbContext
+
+      - name: Prepare disposable Realtime attachment schema
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d ChatAppDatabase -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE SCHEMA IF NOT EXISTS realtime;
+          CREATE TABLE IF NOT EXISTS realtime.attachments (
+            attachment_id varchar(64) PRIMARY KEY,
+            uploader_user_id bigint NOT NULL,
+            object_key varchar(512) NOT NULL,
+            public_url varchar(1024) NULL,
+            content_type varchar(128) NOT NULL,
+            size_bytes bigint NOT NULL,
+            original_name varchar(256) NULL,
+            content_hash varchar(64) NULL,
+            status smallint NOT NULL,
+            message_id varchar(64) NULL,
+            conversation_id varchar(64) NULL,
+            client_attachment_id varchar(128) NULL,
+            created_at_ms bigint NOT NULL,
+            confirmed_at_ms bigint NULL,
+            bound_at_ms bigint NULL,
+            scan_projection_id bigint NULL,
+            scan_version bigint NOT NULL DEFAULT 0
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS ux_ci_attachments_object_key
+            ON realtime.attachments (object_key);
+          SQL
 
       - name: Seed test users
         working-directory: ChatApp.Server
@@ -138,6 +282,7 @@ jobs:
           TOKEN_CONCURRENCY: "4"
         run: node generate-preset-tokens.mjs
       - name: Warmup run (90s)
+        if: github.event_name != 'pull_request'
         working-directory: ChatApp.Server/tests/load
         run: |
           k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
@@ -146,13 +291,116 @@ jobs:
           echo "--- warmup 完成 ---"
           tail -n 5 /tmp/warmup.log || true
 
-      - name: Measured run (3m)
+      - name: PR API performance smoke (30s)
+        if: github.event_name == 'pull_request'
         working-directory: ChatApp.Server/tests/load
         run: |
           k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
-            -e PROFILE=steady -e RATE=20 -e DURATION=3m \
-            --out json=current.json \
+            -e PROFILE=steady -e RATE=2 -e DURATION=30s \
+            --out json=pr-smoke.json \
             mixed-workload.k6.js
+
+      - name: Independent endpoint measurements
+        working-directory: ChatApp.Server/tests/load
+        env:
+          ENDPOINT_RUNNER: ${{ steps.comparison.outputs.runner }}
+        run: |
+          set -euo pipefail
+          # Keep each route in a separate k6 process so host deltas and route
+          # tags cannot be hidden by a mixed-workload average. The short PR
+          # duration validates wiring; the strict stage uses a longer sample.
+          endpoint_rounds=1
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then endpoint_rounds=3; fi
+          for scenario in auth-read friends-read search notifications sessions refresh attachment-ticket; do
+            for round in $(seq 1 "$endpoint_rounds"); do
+              echo "=== endpoint ${scenario} round ${round}/${endpoint_rounds} (${PERF_ENDPOINT_DURATION}) ==="
+              if [ "$scenario" = "refresh" ]; then
+                TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
+                  node generate-preset-tokens.mjs
+              elif [ "$scenario" = "attachment-ticket" ]; then
+                # Presign is intentionally a create-only endpoint. Reset the
+                # disposable fixture between rounds so its pending-object
+                # quota does not turn a capacity sample into a quota sample.
+                PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d ChatAppDatabase \
+                  -v ON_ERROR_STOP=1 -c 'TRUNCATE realtime.attachments' >/dev/null
+              fi
+              k6 run \
+                -e BASE_URL=http://127.0.0.1:5088 \
+                -e TOKENS_FILE=./tokens.json \
+                -e SCENARIO="$scenario" \
+                -e RATE=20 -e DURATION="$PERF_ENDPOINT_DURATION" \
+                --out json="endpoint-${scenario}-${round}.json" \
+                endpoint-workload.k6.js
+              node extract-summary.mjs \
+                --input "endpoint-${scenario}-${round}.json" \
+                --output "endpoint-${scenario}-${round}-summary.json" \
+                --runner "$ENDPOINT_RUNNER" \
+                --runtime "endpoint=${scenario} round=${round} API role=Api LoginRisk=disabled"
+            done
+            if [ "$endpoint_rounds" -gt 1 ]; then
+              node aggregate-runs.mjs \
+                $(for round in $(seq 1 "$endpoint_rounds"); do printf '%s ' --input "endpoint-${scenario}-${round}-summary.json"; done) \
+                --output "endpoint-${scenario}-summary.json" \
+                --runner "$ENDPOINT_RUNNER" \
+                --runtime "endpoint=${scenario}; ${endpoint_rounds} rounds; median + noise interval"
+            else
+              cp "endpoint-${scenario}-1-summary.json" "endpoint-${scenario}-summary.json"
+            fi
+          done
+
+          if [ -n "${PRESENCE_URL:-}" ]; then
+            for round in $(seq 1 "$endpoint_rounds"); do
+              k6 run \
+                -e BASE_URL=http://127.0.0.1:5088 \
+                -e TOKENS_FILE=./tokens.json \
+                -e SCENARIO=presence -e PRESENCE_URL="$PRESENCE_URL" \
+                -e RATE=20 -e DURATION="$PERF_ENDPOINT_DURATION" \
+                --out json="endpoint-presence-${round}.json" \
+                endpoint-workload.k6.js
+              node extract-summary.mjs \
+                --input "endpoint-presence-${round}.json" \
+                --output "endpoint-presence-${round}-summary.json" \
+                --runner "$ENDPOINT_RUNNER" \
+                --runtime "endpoint=presence round=${round} API/Realtime adapter"
+            done
+            if [ "$endpoint_rounds" -gt 1 ]; then
+              node aggregate-runs.mjs \
+                $(for round in $(seq 1 "$endpoint_rounds"); do printf '%s ' --input "endpoint-presence-${round}-summary.json"; done) \
+                --output endpoint-presence-summary.json \
+                --runner "$ENDPOINT_RUNNER" \
+                --runtime "endpoint=presence; ${endpoint_rounds} rounds; median + noise interval"
+            else
+              cp endpoint-presence-1-summary.json endpoint-presence-summary.json
+            fi
+          else
+            echo "Presence skipped: Realtime uses NATS request/reply; set PRESENCE_URL for an adapter-backed stage."
+            echo "Presence skipped: configure PRESENCE_URL/PRESENCE_BODY for the Realtime adapter." > endpoint-presence-skipped.txt
+          fi
+
+      - name: Measured runs (3 x 3m)
+        if: github.event_name != 'pull_request'
+        working-directory: ChatApp.Server/tests/load
+        run: |
+          set -euo pipefail
+          for round in 1 2 3; do
+            echo "=== API steady round ${round}/3 ==="
+            k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
+              -e PROFILE=steady -e RATE=20 -e DURATION=3m \
+              --out json="current-${round}.json" \
+              mixed-workload.k6.js
+            node extract-summary.mjs \
+              --input "current-${round}.json" \
+              --output "current-${round}-summary.json" \
+              --runner "$PERF_COMPARISON_RUNNER" \
+              --runtime "steady 3m RATE=20 API role=Api LoginRisk=disabled"
+          done
+          node aggregate-runs.mjs \
+            --input current-1-summary.json \
+            --input current-2-summary.json \
+            --input current-3-summary.json \
+            --output current.json \
+            --runner "$PERF_COMPARISON_RUNNER" \
+            --runtime "steady 3m RATE=20; 3 rounds; median + noise interval"
 
       - name: Stop API
         if: always()
@@ -163,26 +411,31 @@ jobs:
 
       - name: Detect baseline
         id: baseline
+        if: github.event_name != 'pull_request'
         working-directory: ChatApp.Server/tests/load
         run: |
-          BASELINE="baselines/baseline-steady-rate20.json"
-          if [ -f "$BASELINE" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "path=$BASELINE" >> "$GITHUB_OUTPUT"
-            echo "找到基线: $BASELINE"
+          if [ "$PERF_COMPARISON_MODE" = "paired" ]; then
+            BASELINE="baseline-paired.json"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::error::未找到基线 $BASELINE。请先手动运行 Performance Soak，审阅候选 artifact，并通过普通提交加入基线。"
+            BASELINE="baselines/baseline-steady-rate20.json"
+          fi
+          if [ ! -f "$BASELINE" ]; then
+            echo "::error::比较基线不存在：$BASELINE"
             exit 1
           fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "path=$BASELINE" >> "$GITHUB_OUTPUT"
+          echo "使用基线：$BASELINE（mode=$PERF_COMPARISON_MODE）"
 
       - name: Compare against baseline
+        if: github.event_name != 'pull_request'
         working-directory: ChatApp.Server/tests/load
         run: |
           node compare-baseline.mjs \
             --baseline "${{ steps.baseline.outputs.path }}" \
             --current current.json \
             --absolute absolute-goals.json \
+            --runner "$PERF_COMPARISON_RUNNER" \
             --strict
 
       - name: Upload current run
@@ -190,5 +443,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: perf-current-${{ github.run_id }}
-          path: ChatApp.Server/tests/load/current.json
+          path: |
+            ChatApp.Server/tests/load/current.json
+            ChatApp.Server/tests/load/current-*-summary.json
+            ChatApp.Server/tests/load/baseline-paired.json
+            ChatApp.Server/tests/load/paired-baseline.log
+            ChatApp.Server/tests/load/endpoint-*.json
+            ChatApp.Server/tests/load/endpoint-*-summary.json
+            ChatApp.Server/tests/load/endpoint-presence-skipped.txt
+            ChatApp.Server/tests/load/pr-smoke.json
+          if-no-files-found: ignore
           retention-days: 30

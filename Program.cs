@@ -7,6 +7,8 @@ using Core.Settings;
 using Infrastructure.Diagnostics;
 using Infrastructure.Extensions;
 using Infrastructure.Serialization;
+using ChatApp.Contracts.Http;
+using Infrastructure.Services;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -28,6 +30,11 @@ public abstract partial class Program
         builder.Logging.AddNLog();
 
         var config = builder.Configuration;
+        // Migrations must not inherit the API's 3–5 second request budget.
+        // Set the bound option before DbContext registration so the design
+        // and runtime migration paths share the same explicit timeout.
+        if (args.Any(a => string.Equals(a, "--migrate", StringComparison.OrdinalIgnoreCase)))
+            config[$"{DatabasePoolOptions.SectionName}:UseMigrationTimeout"] = "true";
         var configuredRole = builder.WebHost.GetSetting($"{DatabasePoolOptions.SectionName}:Role");
         var processRole = DatabasePoolOptions.ParseRole(
             configuredRole ?? config[$"{DatabasePoolOptions.SectionName}:Role"]);
@@ -37,7 +44,12 @@ public abstract partial class Program
         if (runsApi)
         {
             builder.Services.AddControllers().AddJsonOptions(op =>
-                AppJsonOptions.ApplyTo(op.JsonSerializerOptions));
+            {
+                AppJsonOptions.ApplyTo(op.JsonSerializerOptions);
+                op.JsonSerializerOptions.TypeInfoResolverChain.Insert(
+                    0,
+                    HttpContractsJsonSerializerContext.Default);
+            });
 
             builder.Services.AddOpenApi(options =>
             {
@@ -62,18 +74,21 @@ public abstract partial class Program
         // 组合根：按模块拆分的服务注册与配置绑定。
         // 各模块位于 Infrastructure.Extensions（业务/基础设施层）
         // 与 ChatApp.Server.Extensions（API 层，引用宿主独占类型）。
-        service.AddIdentityModule(config, registerApiLocalHostedServices: runsApi);
+        service.AddIdentityModule(
+            config,
+            registerApiLocalHostedServices: runsApi,
+            registerWorkerHostedServices: runsWorkers);
         service.AddFriendshipModule();
         service.AddAttachmentModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddNotificationModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddModerationModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddAccountLifecycleModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddRealtimeIntegrationModule(config, registerWorkerHostedServices: runsWorkers);
-        service.AddObservability(config);
+        service.AddObservability(config, registerWorkerHostedServices: runsWorkers);
         if (runsApi)
             service.AddApiPolicies(config);
         else
-            service.AddWorkerHealthChecks();
+            service.AddWorkerHealthChecks(config);
 
         // 连接串校验推迟到宿主启动（ValidateOnStart），确保 Testing 下 WebApplicationFactory
         // 的 ConfigureAppConfiguration 覆盖已生效。
@@ -125,6 +140,30 @@ public abstract partial class Program
         app.UseRouting();
         if (runsApi)
         {
+        if (app.Environment.IsEnvironment("Performance") || app.Environment.IsEnvironment("Testing"))
+        {
+            app.Use(async (context, next) =>
+            {
+                var dbCounter = context.RequestServices
+                    .GetRequiredService<DbCommandCounterInterceptor>();
+                dbCounter.BeginRequest(context);
+                context.Response.OnStarting(() =>
+                {
+                context.Response.Headers["X-ChatApp-Db-Commands"] =
+                    dbCounter.GetRequestCount(context).ToString(
+                        System.Globalization.CultureInfo.InvariantCulture);
+                context.Response.Headers["X-ChatApp-Auth-Db-Commands"] =
+                    dbCounter.GetAuthFenceRequestCount(context).ToString(
+                        System.Globalization.CultureInfo.InvariantCulture);
+                context.Response.Headers["X-ChatApp-Db-Pool-Wait-Ms"] =
+                    dbCounter.GetPoolWaitMilliseconds(context).ToString(
+                        "F3",
+                        System.Globalization.CultureInfo.InvariantCulture);
+                return Task.CompletedTask;
+                });
+                await next(context).ConfigureAwait(false);
+            });
+        }
         app.UseForwardedHeaders();
         app.UseMiddleware<CorrelationIdMiddleware>();
         app.UseMiddleware<ExceptionHandlingMiddleware>();
@@ -138,6 +177,7 @@ public abstract partial class Program
         // P0-2：先认证再限流，使 user-email-change / user-sensitive 能按用户 Claim 分区。
         // 匿名接口（login/register）仍按 IP/device/email 多维限流。
         app.UseAuthentication();
+        app.UseMiddleware<ChatApp.Server.Authorization.DeletionPendingAccessMiddleware>();
         app.UseDistributedRateLimiting();
         app.UseAuthorization();
 
@@ -168,23 +208,7 @@ public abstract partial class Program
         // 诊断端点：仅供压测/测试环境采样 allocations/Redis commands/DB queries。
         // 生产环境不映射——暴露 uptime/资源压力/后端活动趋势会构成信息泄露。
         if (app.Environment.IsEnvironment("Performance") || app.Environment.IsEnvironment("Testing"))
-        {
-            app.MapGet("/debug/metrics", (IConnectionMultiplexer redis, DbCommandCounterInterceptor dbCounter) =>
-            {
-                return Results.Ok(new Dictionary<string, object>
-                {
-                    ["allocated_bytes"] = GC.GetTotalAllocatedBytes(),
-                    ["gc_heap_bytes"] = GC.GetTotalMemory(false),
-                    ["gen0_collections"] = GC.CollectionCount(0),
-                    ["gen1_collections"] = GC.CollectionCount(1),
-                    ["gen2_collections"] = GC.CollectionCount(2),
-                    ["working_set_bytes"] = Environment.WorkingSet,
-                    ["redis_total_commands"] = redis.OperationCount,
-                    ["db_total_commands"] = dbCounter.TotalCommandsExecuted,
-                    ["uptime_ms"] = Environment.TickCount64,
-                });
-            });
-        }
+            MapDebugMetrics(app);
 
         app.MapControllers();
 
@@ -199,36 +223,118 @@ public abstract partial class Program
 
         }
 
-        MapHealthEndpoints(app);
+        // Worker processes have no public API pipeline, but their internal
+        // performance stage still needs process-local DB/Redis/GC counters.
+        // This route exists only in Performance/Testing and is bound to the
+        // worker's private probe port by the deployment/workflow.
+        if (!runsApi
+            && (app.Environment.IsEnvironment("Performance")
+                || app.Environment.IsEnvironment("Testing")))
+        {
+            MapDebugMetrics(app);
+        }
+
+        MapHealthEndpoints(app, runsApi);
 
         await app.RunAsync().ConfigureAwait(false);
     }
 
-    private static void MapHealthEndpoints(WebApplication app)
+    private static void MapHealthEndpoints(WebApplication app, bool runsApi)
     {
         app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = _ => false,
-            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
+            ResponseWriter = Extensions.HealthResponseWriter.WriteSimpleAsync,
         });
 
         app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = check => check.Tags.Contains("ready"),
-            ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
+            ResultStatusCodes =
+            {
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Healthy] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Degraded] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
+            },
+            ResponseWriter = Extensions.HealthResponseWriter.WriteSimpleAsync,
         });
 
-        app.MapHealthChecks("/health/dependencies", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+        // Worker processes intentionally have no HTTP authentication pipeline.
+        // Keep their probe surface limited to the orchestrator-facing
+        // liveness/readiness endpoints; detailed dependency diagnostics are
+        // only mapped on an API process where the admin policy can protect it.
+        if (!runsApi)
+            return;
+
+        var dependencies = app.MapHealthChecks("/health/dependencies", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = check => check.Tags.Contains("dependencies"),
+            ResultStatusCodes =
+            {
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Healthy] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Degraded] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
+            },
             ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
         });
 
-        app.MapHealthChecks("/health/capabilities", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+        var capabilities = app.MapHealthChecks("/health/capabilities", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
         {
             Predicate = check => check.Tags.Contains("capabilities"),
+            ResultStatusCodes =
+            {
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Healthy] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Degraded] = StatusCodes.Status200OK,
+                [Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
+            },
             ResponseWriter = Extensions.HealthResponseWriter.WriteAsync,
         });
+
+        if (runsApi)
+        {
+            var adminPolicy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName;
+            dependencies.RequireAuthorization(adminPolicy);
+            capabilities.RequireAuthorization(adminPolicy);
+        }
+    }
+
+    private static void MapDebugMetrics(WebApplication app)
+    {
+        app.MapGet("/debug/metrics", (IConnectionMultiplexer redis, DbCommandCounterInterceptor dbCounter) =>
+        {
+            var authFence = AuthSecurityMetrics.GetAuthFenceSnapshot();
+            return Results.Ok(new Dictionary<string, object>
+            {
+                ["allocated_bytes"] = GC.GetTotalAllocatedBytes(),
+                ["gc_heap_bytes"] = GC.GetTotalMemory(false),
+                ["gen0_collections"] = GC.CollectionCount(0),
+                ["gen1_collections"] = GC.CollectionCount(1),
+                ["gen2_collections"] = GC.CollectionCount(2),
+                ["working_set_bytes"] = Environment.WorkingSet,
+                ["redis_total_commands"] = redis.OperationCount,
+                ["db_total_commands"] = dbCounter.TotalCommandsExecuted,
+                ["db_auth_fence_commands_total"] = dbCounter.TotalAuthFenceCommands,
+                ["db_pool_wait_ms_total"] = app.Services
+                    .GetRequiredService<DbConnectionPoolWaitInterceptor>()
+                    .TotalWaitMilliseconds,
+                ["gc_pause_ms_total"] = GetGcPauseMilliseconds(),
+                ["auth_fence_l1_hits_total"] = authFence.L1Hits,
+                ["auth_fence_l1_misses_total"] = authFence.L1Misses,
+                ["auth_fence_garnet_reads_total"] = authFence.GarnetReads,
+                ["auth_fence_postgres_reads_total"] = authFence.PostgresReads,
+                ["db_commands_by_endpoint"] = dbCounter.GetEndpointCounts(),
+                ["uptime_ms"] = Environment.TickCount64,
+            });
+        });
+    }
+
+    private static double GetGcPauseMilliseconds()
+    {
+        var pauses = GC.GetGCMemoryInfo().PauseDurations;
+        var total = 0.0;
+        foreach (var pause in pauses)
+            total += pause.TotalMilliseconds;
+        return total;
     }
 
     private static void ConfigureForwardedHeaders(WebApplicationBuilder builder)

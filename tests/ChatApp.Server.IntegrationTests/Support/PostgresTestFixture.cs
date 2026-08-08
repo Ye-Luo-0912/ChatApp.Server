@@ -84,8 +84,9 @@ public sealed class PostgresTestFixture : IAsyncLifetime
             await context.Database.MigrateAsync();
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"PostgreSQL migration failed: {ex.GetType().Name}: {ex.Message}");
             return false;
         }
     }

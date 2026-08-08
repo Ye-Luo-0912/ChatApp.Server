@@ -14,7 +14,13 @@ internal sealed class UserDbContextFactory : IDesignTimeDbContextFactory<UserDbC
                 "设计时迁移需要连接串：请设置环境变量 ConnectionStrings__DefaultConnection，或先加载项目根目录 .env。");
 
         var optionsBuilder = new DbContextOptionsBuilder<UserDbContext>();
-        optionsBuilder.UseNpgsql(connectionString);
+        var timeoutText = Environment.GetEnvironmentVariable(
+            "DatabasePool__MigrationCommandTimeoutSeconds");
+        var timeoutSeconds = int.TryParse(timeoutText, out var configured)
+            ? Math.Clamp(configured, 30, 600)
+            : 120;
+        optionsBuilder.UseNpgsql(connectionString, npgsql =>
+            npgsql.CommandTimeout(timeoutSeconds));
         return new UserDbContext(optionsBuilder.Options);
     }
 }

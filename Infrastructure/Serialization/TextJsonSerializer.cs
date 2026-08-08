@@ -13,4 +13,7 @@ public class TextJsonSerializer : ISerializer
 
     public T? Deserialize<T>(byte[] bytes)
         => System.Text.Json.JsonSerializer.Deserialize<T>(bytes, AppJsonOptions.Default);
+
+    public T? Deserialize<T>(string json)
+        => System.Text.Json.JsonSerializer.Deserialize<T>(json, AppJsonOptions.Default);
 }

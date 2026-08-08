@@ -31,11 +31,14 @@ import { Rate, Trend, Counter, Gauge } from 'k6/metrics';
 const errorRate = new Rate('errors');
 const loginTrend = new Trend('login_ms', true);
 const refreshTrend = new Trend('refresh_ms', true);
-const friendsTrend = new Trend('friends_ms', true);
 const searchTrend = new Trend('search_ms', true);
 const notifyTrend = new Trend('notifications_ms', true);
 const sessionsTrend = new Trend('sessions_ms', true);
 const meTrend = new Trend('me_ms', true);
+// Response header is emitted only in Performance/Testing. This is the
+// endpoint-scoped assertion that a warmed authenticated read stays off DB.
+const meDbQueriesTrend = new Trend('me_db_queries');
+const meAuthDbQueriesTrend = new Trend('me_auth_db_queries');
 const overloaded = new Counter('login_overloaded_503');
 
 // 宿主侧 delta 指标：teardown() 中从 /debug/metrics 采样并计算差值。
@@ -43,6 +46,21 @@ const overloaded = new Counter('login_overloaded_503');
 const allocationsDelta = new Gauge('allocations_delta_bytes');
 const redisCmdsDelta = new Gauge('redis_cmds_delta');
 const dbQueriesDelta = new Gauge('db_queries_delta');
+
+function responseHeader(headers, name) {
+  // net/http canonicalizes response headers (for example, Db-Commands),
+  // while k6 preserves the received key. Keep this lookup allocation-free
+  // on the request hot path and accept the common casing variants.
+  if (name === 'X-ChatApp-Auth-Db-Commands') {
+    return headers[name]
+      ?? headers['X-Chatapp-Auth-Db-Commands']
+      ?? headers['x-chatapp-auth-db-commands'];
+  }
+
+  return headers[name]
+    ?? headers['X-Chatapp-Db-Commands']
+    ?? headers['x-chatapp-db-commands'];
+}
 
 const PROFILE = __ENV.PROFILE || 'steady';
 const BASE_URL = (__ENV.BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
@@ -88,9 +106,17 @@ const profiles = {
     },
     thresholds: {
       errors: ['rate<0.05'],
+      // /api/users/me itself performs one profile projection query. A warmed
+      // auth path must not add another query, so two queries at p95 is a
+      // regression (one endpoint query + one authentication-fence query).
+      me_db_queries: ['p(95)<2'],
+      // The /me endpoint may legitimately execute its profile projection,
+      // but a warmed authenticated request must never execute the auth fence
+      // projection itself.
+      // Counts are integers; <0.5 is the portable k6 spelling of p95 == 0.
+      me_auth_db_queries: ['p(95)<0.5'],
       login_ms: ['p(95)<800', 'p(99)<2000'],
       refresh_ms: ['p(95)<300', 'p(99)<800'],
-      friends_ms: ['p(95)<400', 'p(99)<1000'],
       search_ms: ['p(95)<500', 'p(99)<1200'],
       notifications_ms: ['p(95)<400', 'p(99)<1000'],
       sessions_ms: ['p(95)<400', 'p(99)<1000'],
@@ -244,6 +270,11 @@ function authedReads(headers, accessToken, refreshToken, deviceCredential, userI
   group('me', () => {
     const res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
     meTrend.add(res.timings.duration);
+    const dbCommands = Number(responseHeader(res.headers, 'X-ChatApp-Db-Commands') ?? NaN);
+    if (Number.isFinite(dbCommands)) meDbQueriesTrend.add(dbCommands);
+    const authDbCommands = Number(
+      responseHeader(res.headers, 'X-ChatApp-Auth-Db-Commands') ?? NaN);
+    if (Number.isFinite(authDbCommands)) meAuthDbQueriesTrend.add(authDbCommands);
     const ok = check(res, { 'me 200': (r) => r.status === 200 });
     errorRate.add(!ok);
     // AT 失效或被撤销：清除会话以触发下次迭代重新登录
@@ -251,13 +282,6 @@ function authedReads(headers, accessToken, refreshToken, deviceCredential, userI
       newAccessToken = '';
       newRefreshToken = '';
     }
-  });
-
-  group('friends', () => {
-    const res = http.get(`${BASE_URL}/api/Friendship/all`, { headers: auth, tags: { endpoint: 'friends' } });
-    friendsTrend.add(res.timings.duration);
-    const ok = check(res, { 'friends 200': (r) => r.status === 200 });
-    errorRate.add(!ok);
   });
 
   group('search', () => {

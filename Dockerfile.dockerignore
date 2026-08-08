@@ -4,6 +4,7 @@
 **/.idea
 **/bin
 **/obj
+**/.nuget
 **/TestResults
 **/coverage
 **/Logs
