@@ -76,6 +76,7 @@ services:
       - chatapp_net
 
   api:
+    container_name: chatapp_api
     build:
       context: .
       dockerfile: Dockerfile
