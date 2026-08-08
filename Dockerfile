@@ -23,7 +23,10 @@ ENV DataExport__LocalRootPath=/app/App_Data/exports
 EXPOSE 8080
 
 USER root
-RUN groupadd --system --gid 10001 chatapp \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgssapi-krb5-2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 chatapp \
  && useradd --system --uid 10001 --gid chatapp --home-dir /app --shell /usr/sbin/nologin chatapp \
  && mkdir -p /app/App_Data/avatars /app/App_Data/attachments /app/App_Data/exports \
  && chown -R chatapp:chatapp /app
