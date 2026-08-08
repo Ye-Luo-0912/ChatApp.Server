@@ -40,6 +40,19 @@ Read-only operational visibility for attachment GC / scan / delete tombs. Auth: 
 
 Account cleanup saga / inbox DLQ remain under `/api/admin/account-cleanup-saga`.
 
+## Download ticket consumption
+
+- A download ticket is atomically consumed when the server successfully opens
+  the download response. For local storage this means the file response is
+  returned; for S3 this includes returning the signed redirect.
+- The endpoint peeks and validates the user/attachment binding first, so an
+  invalid user, a scanning attachment, or unavailable metadata does not consume
+  the ticket.
+- A client or network interruption after that point does not restore the
+  ticket. The client must request a new short-lived ticket. This is intentional
+  one-shot behavior; a future Download Lease would be a separate product/API
+  change.
+
 ## S3 production contract
 
 - Client uploads are written only to
@@ -61,6 +74,15 @@ Account cleanup saga / inbox DLQ remain under `/api/admin/account-cleanup-saga`.
   and SSE headers. `chatapp-scan-state=quarantine` is set after upload
   confirmation and before the background scan; the database delete tombstone
   remains the source of truth for rejected/abandoned objects.
+- Apply [avatar-lifecycle.json](../deploy/s3/avatar-lifecycle.json) as well.
+  Avatar uploads are isolated under `avatars/{userId}/pending/` and carry an
+  `unconfirmed` tag; the final re-encoded object is under `confirmed/` and is
+  removed only through the durable avatar blob-delete job. `AvatarCleanupWorker`
+  intentionally does not list the full avatar prefix.
+- Apply [data-export-lifecycle.json](../deploy/s3/data-export-lifecycle.json)
+  to reclaim `candidates/` export objects left by a process crash. The
+  `T_DataExportJob` PendingDelete row remains the durable retry path;
+  Lifecycle is only the final storage-side safety net.
 - In a production environment set `AttachmentStorage:ScannerProvider=ClamAV`
   and configure the ClamAV endpoint. `DenyList` is only a development fallback;
   it is not a malware scanner.

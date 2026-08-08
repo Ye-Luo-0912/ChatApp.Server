@@ -33,6 +33,10 @@ internal static class RealtimeAttachmentTestSchema
             ALTER TABLE realtime.attachments
                 ADD COLUMN IF NOT EXISTS content_hash varchar(64) NULL;
             ALTER TABLE realtime.attachments
+                ADD COLUMN IF NOT EXISTS scan_projection_id bigint NULL;
+            ALTER TABLE realtime.attachments
+                ADD COLUMN IF NOT EXISTS scan_version bigint NOT NULL DEFAULT 0;
+            ALTER TABLE realtime.attachments
                 DROP CONSTRAINT IF EXISTS ck_attachments_status_known;
             ALTER TABLE realtime.attachments
                 ADD CONSTRAINT ck_attachments_status_known

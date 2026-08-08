@@ -1,7 +1,7 @@
 {
   "Rules": [
     {
-      "ID": "delete-unconfirmed-attachments",
+      "ID": "delete-unconfirmed-attachment-candidates",
       "Status": "Enabled",
       "Filter": {
         "Tag": {
@@ -17,7 +17,7 @@
       }
     },
     {
-      "ID": "delete-quarantined-attachments",
+      "ID": "delete-quarantined-attachment-candidates",
       "Status": "Enabled",
       "Filter": {
         "Tag": {
@@ -26,14 +26,7 @@
         }
       },
       "Expiration": {
-        "Days": 1
-      }
-    },
-    {
-      "ID": "abort-incomplete-attachment-multipart-uploads",
-      "Status": "Enabled",
-      "Filter": {
-        "Prefix": "attachments/"
+        "Days": 7
       },
       "AbortIncompleteMultipartUpload": {
         "DaysAfterInitiation": 1

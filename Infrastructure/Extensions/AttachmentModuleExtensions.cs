@@ -1,4 +1,5 @@
 using Core.Interfaces;
+using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Services;
 using Infrastructure.Validation;
@@ -27,6 +28,7 @@ public static class AttachmentModuleExtensions
 
         services.AddSingleton<AvatarReencodeMetrics>();
         services.AddSingleton<AvatarReencodeQueue>();
+        services.AddSingleton<AttachmentScanStagingBudget>();
         services.AddSingleton<IAvatarStorage>(sp =>
         {
             var opts = sp.GetRequiredService<IOptions<AvatarStorageOptions>>().Value;
@@ -36,11 +38,24 @@ public static class AttachmentModuleExtensions
         });
         if (registerWorkerHostedServices)
             services.AddHostedService<AvatarCleanupWorker>();
-        services.AddScoped<IAttachmentBlobDeleteService, AttachmentBlobDeleteService>();
+        services.AddScoped<AttachmentBlobDeleteService>();
+        services.AddScoped<IAttachmentBlobDeleteService>(
+            sp => sp.GetRequiredService<AttachmentBlobDeleteService>());
+        services.AddSingleton<ILeasedJobStore<AttachmentBlobDeleteJob>, AttachmentBlobDeleteJobStore>();
         services.AddSingleton<AttachmentBlobDeleteEnqueuer>();
         services.AddScoped<AttachmentAbandonedAgeSweeper>();
-        services.AddScoped<IAttachmentScanProjectionService, AttachmentScanProjectionService>();
+        services.AddScoped<IAttachmentConfirmSagaService, AttachmentConfirmSagaService>();
+        services.AddSingleton<ILeasedJobStore<AttachmentConfirmSaga>, AttachmentConfirmSagaJobStore>();
+        services.AddScoped<IAvatarFinalizationSagaService, AvatarFinalizationSagaService>();
+        services.AddSingleton<ILeasedJobStore<AvatarFinalizationSaga>, AvatarFinalizationSagaJobStore>();
+        services.AddScoped<AttachmentScanProjectionService>();
+        services.AddScoped<IAttachmentScanProjectionService>(
+            sp => sp.GetRequiredService<AttachmentScanProjectionService>());
+        services.AddSingleton<ILeasedJobStore<AttachmentScanProjection>, AttachmentScanProjectionJobStore>();
         services.AddScoped<IAttachmentScanService, AttachmentScanService>();
+        services.AddSingleton<AttachmentScanJobStore>();
+        services.AddSingleton<ILeasedJobStore<AttachmentScanJob>>(sp =>
+            sp.GetRequiredService<AttachmentScanJobStore>());
         services.AddSingleton<AttachmentScanEnqueuer>();
         services.AddSingleton<IAttachmentDownloadTicketService, AttachmentDownloadTicketService>();
         services.AddSingleton<IAttachmentContentScanner>(sp =>
@@ -77,8 +92,10 @@ public static class AttachmentModuleExtensions
         if (registerWorkerHostedServices)
         {
             services.AddHostedService<AttachmentCleanupWorker>();
+            services.AddHostedService<AttachmentConfirmSagaWorker>();
             services.AddHostedService<AttachmentScanWorker>();
             services.AddHostedService<AttachmentScanProjectionWorker>();
+            services.AddHostedService<AvatarFinalizationSagaWorker>();
         }
         services.AddScoped<IAttachmentOpsAdminService, AttachmentOpsAdminService>();
 

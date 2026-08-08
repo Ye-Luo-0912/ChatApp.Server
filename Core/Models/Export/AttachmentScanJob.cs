@@ -19,6 +19,7 @@ public sealed class AttachmentScanJob
     public string AttachmentId { get; set; } = string.Empty;
     public string ObjectKey { get; set; } = string.Empty;
     public long UserId { get; set; }
+    public long UploaderDeletionEpoch { get; set; }
     public string? ContentType { get; set; }
     public string? OriginalName { get; set; }
     public long SizeBytes { get; set; }

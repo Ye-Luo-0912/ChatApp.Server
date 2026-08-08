@@ -12,6 +12,9 @@ public sealed class AttachmentScanProjection
     public string AttachmentId { get; set; } = string.Empty;
     public string ObjectKey { get; set; } = string.Empty;
     public long UserId { get; set; }
+    public long UploaderDeletionEpoch { get; set; }
+    /// <summary>Monotonic scan generation used by the target-side CAS fence.</summary>
+    public long ScanVersion { get; set; }
     public string? ContentType { get; set; }
     public string? OriginalName { get; set; }
     public long SizeBytes { get; set; }
@@ -46,4 +49,5 @@ public static class AttachmentScanProjectionOutcome
 {
     public const string Confirmed = "Confirmed";
     public const string Rejected = "Rejected";
+    public const string Abandoned = "Abandoned";
 }

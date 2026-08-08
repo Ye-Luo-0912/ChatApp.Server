@@ -5,9 +5,11 @@ using Core.Interfaces;
 using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
@@ -18,8 +20,14 @@ public sealed class AttachmentScanService(
     IAttachmentContentScanner contentScanner,
     IOptions<AttachmentStorageOptions> options,
     ILogger<AttachmentScanService> logger,
-    IAttachmentScanProjectionService projections) : IAttachmentScanService
+    IAttachmentScanProjectionService projections,
+    IAttachmentConfirmSagaService? confirmSagas = null,
+    AttachmentScanStagingBudget? stagingBudget = null) : IAttachmentScanService
 {
+    private readonly AttachmentScanStagingBudget _stagingBudget = stagingBudget
+        ?? new AttachmentScanStagingBudget(
+            options,
+            NullLogger<AttachmentScanStagingBudget>.Instance);
     private static readonly string ProcessOwner =
         $"{Environment.MachineName}:{Environment.ProcessId}";
 
@@ -36,6 +44,10 @@ public sealed class AttachmentScanService(
     /// <summary>P0-5.2：扫描租约时长。Worker 心跳按 lease/3 续租，避免大文件扫描期间租约过期被重新领取。</summary>
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(LeaseMinutes);
 
+    public TimeSpan ProcessingLease => Lease;
+
+    public int MaxAttempts => Math.Max(1, options.Value.MaxScanAttempts);
+
     public async Task EnqueueAsync(
         string attachmentId,
         long userId,
@@ -50,6 +62,17 @@ public sealed class AttachmentScanService(
 
         var id = attachmentId.Trim();
         var key = objectKey.Trim();
+        var uploader = await db.Users.AsNoTracking()
+            .Where(x => x.Id == userId)
+            .Select(x => new { x.DeletionEpoch, x.DeletionScheduledAt })
+            .SingleOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+        // A few legacy/test callers enqueue a job before creating the user row;
+        // retain epoch 0 for those records. New production upload flows always
+        // have the user row and therefore carry the current deletion generation.
+        if (uploader?.DeletionScheduledAt is not null)
+            return;
+        var uploaderDeletionEpoch = uploader?.DeletionEpoch ?? 0;
         var exists = await db.AttachmentScanJobs
             .AnyAsync(
                 j => j.AttachmentId == id && ActiveStatuses.Contains(j.Status),
@@ -64,6 +87,7 @@ public sealed class AttachmentScanService(
             AttachmentId = id,
             ObjectKey = key,
             UserId = userId,
+            UploaderDeletionEpoch = uploaderDeletionEpoch,
             ContentType = contentType,
             OriginalName = originalName,
             SizeBytes = sizeBytes,
@@ -72,7 +96,25 @@ public sealed class AttachmentScanService(
             NextAttemptAt = now,
             CreatedAt = now,
         });
-        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException)
+        {
+            // Two confirm retries can race between the AnyAsync check and the
+            // insert. The filtered unique index is the arbitration boundary;
+            // an already-active row means the durable enqueue succeeded for
+            // this attachment and must be treated as an idempotent success.
+            db.ChangeTracker.Clear();
+            var active = await db.AttachmentScanJobs.AsNoTracking()
+                .AnyAsync(
+                    j => j.AttachmentId == id && ActiveStatuses.Contains(j.Status),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!active)
+                throw;
+        }
         AuthSecurityMetrics.AttachmentPendingScanDelta(1);
         AuthSecurityMetrics.AttachmentScan("enqueued");
         logger.LogInformation(
@@ -87,6 +129,8 @@ public sealed class AttachmentScanService(
     /// </summary>
     public async Task<int> ProcessDueAsync(CancellationToken cancellationToken = default)
     {
+        if (confirmSagas is not null)
+            await confirmSagas.ProcessDueAsync(cancellationToken).ConfigureAwait(false);
         var batchSize = Math.Clamp(options.Value.ScanBatchSize, 1, 200);
         var claimed = await ClaimDueJobsAsync(batchSize, cancellationToken).ConfigureAwait(false);
         foreach (var job in claimed)
@@ -95,7 +139,10 @@ public sealed class AttachmentScanService(
         // The projection path is also drained here so single-scope test/admin calls
         // observe the same terminal behavior as the dedicated production worker.
         var projected = await projections.ProcessDueAsync(cancellationToken).ConfigureAwait(false);
-        await PurgeOldDoneAsync(cancellationToken).ConfigureAwait(false);
+        // The public count is the number of scan projections that reached a
+        // terminal state. Confirm-Saga progress is an internal prerequisite,
+        // not a second scan job; counting both made one attachment look like
+        // two completed jobs to callers and metrics.
         return projected;
     }
 
@@ -108,12 +155,11 @@ public sealed class AttachmentScanService(
         var owner = $"{ProcessOwner}:{Guid.NewGuid():N}";
         if (owner.Length > 128)
             owner = owner[..128];
-        var leaseToken = Guid.NewGuid().ToString("N");
 
         if (IsNpgsql())
         {
             var claimedIds = await ClaimDueJobIdsNpgsqlAsync(
-                    batchSize, owner, leaseToken, now, leaseUntil, cancellationToken)
+                    batchSize, owner, now, leaseUntil, cancellationToken)
                 .ConfigureAwait(false);
             if (claimedIds.Count == 0)
                 return [];
@@ -145,7 +191,7 @@ public sealed class AttachmentScanService(
         {
             job.Status = AttachmentScanJobStatus.Processing;
             job.LeaseOwner = owner;
-            job.LeaseToken = leaseToken;
+            job.LeaseToken = Guid.NewGuid().ToString("N");
             job.LeaseExpiresAt = leaseUntil;
         }
 
@@ -276,13 +322,54 @@ public sealed class AttachmentScanService(
         }
     }
 
+    /// <summary>
+    /// Shared executor fallback for an infrastructure exception outside the
+    /// normal scan result path. The update remains fenced and may either
+    /// requeue the job or stage a durable rejected projection when attempts are
+    /// exhausted.
+    /// </summary>
+    public async Task<bool> RetryClaimedJobAsync(
+        AttachmentScanJob claimed,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        var result = await ApplyTerminalAsync(
+                claimed,
+                ScanOutcome.Transient,
+                Truncate(error, 500),
+                MaxAttempts,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return result != AttachmentScanProcessResult.LeaseLost;
+    }
+
+    /// <summary>Stage a fenced rejection when the common executor dead-letters a scan.</summary>
+    public Task<bool> DeadLetterClaimedJobAsync(
+        AttachmentScanJob claimed,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        var exhausted = new ContentScanResult(
+            false,
+            null,
+            Truncate(error, 500),
+            false,
+            "ChatApp.ContentPipeline",
+            "executor_dead_letter");
+        return PersistFinalResultAsync(
+            claimed,
+            exhausted,
+            AttachmentScanProjectionOutcome.Rejected,
+            Math.Max(MaxAttempts, claimed.AttemptCount + 1),
+            cancellationToken);
+    }
+
     private bool IsNpgsql() =>
         db.Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true;
 
     private async Task<List<long>> ClaimDueJobIdsNpgsqlAsync(
         int batchSize,
         string owner,
-        string leaseToken,
         DateTimeOffset now,
         DateTimeOffset leaseUntil,
         CancellationToken cancellationToken)
@@ -297,7 +384,7 @@ public sealed class AttachmentScanService(
             UPDATE "T_AttachmentScanJob" AS j
             SET "Status" = 'Processing',
                 "LeaseOwner" = @owner,
-                "LeaseToken" = @lease_token,
+                "LeaseToken" = md5(random()::text || clock_timestamp()::text || j."Id"::text),
                 "LeaseExpiresAt" = @lease_until
             WHERE j."Id" IN (
                 SELECT c."Id"
@@ -317,11 +404,6 @@ public sealed class AttachmentScanService(
         pOwner.ParameterName = "owner";
         pOwner.Value = owner;
         command.Parameters.Add(pOwner);
-
-        var pToken = command.CreateParameter();
-        pToken.ParameterName = "lease_token";
-        pToken.Value = leaseToken;
-        command.Parameters.Add(pToken);
 
         var pLease = command.CreateParameter();
         pLease.ParameterName = "lease_until";
@@ -437,6 +519,11 @@ public sealed class AttachmentScanService(
             AttachmentId = claimed.AttachmentId,
             ObjectKey = claimed.ObjectKey,
             UserId = claimed.UserId,
+            UploaderDeletionEpoch = claimed.UploaderDeletionEpoch,
+            // A job id is an immutable, database-ordered generation for this
+            // attachment. Retries keep the same generation; a later job gets a
+            // larger id and therefore wins the target-side CAS.
+            ScanVersion = claimed.Id,
             ContentType = finalContentType,
             OriginalName = claimed.OriginalName,
             SizeBytes = claimed.SizeBytes,
@@ -459,7 +546,8 @@ public sealed class AttachmentScanService(
             if (tracked is null
                 || tracked.Status != AttachmentScanJobStatus.Processing
                 || tracked.LeaseOwner != claimed.LeaseOwner
-                || tracked.LeaseToken != claimed.LeaseToken)
+                || tracked.LeaseToken != claimed.LeaseToken
+                || tracked.UploaderDeletionEpoch != claimed.UploaderDeletionEpoch)
                 return false;
 
             tracked.Status = AttachmentScanJobStatus.Finalizing;
@@ -484,7 +572,8 @@ public sealed class AttachmentScanService(
                 .Where(j => j.Id == claimed.Id
                             && j.Status == AttachmentScanJobStatus.Processing
                             && j.LeaseOwner == claimed.LeaseOwner
-                            && j.LeaseToken == claimed.LeaseToken)
+                            && j.LeaseToken == claimed.LeaseToken
+                            && j.UploaderDeletionEpoch == claimed.UploaderDeletionEpoch)
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(j => j.Status, AttachmentScanJobStatus.Finalizing)
                     .SetProperty(j => j.CompletedAt, (DateTimeOffset?)null)
@@ -542,6 +631,7 @@ public sealed class AttachmentScanService(
             if (tracked is null
                 || tracked.LeaseOwner != claimed.LeaseOwner
                 || tracked.LeaseToken != claimed.LeaseToken
+                || tracked.UploaderDeletionEpoch != claimed.UploaderDeletionEpoch
                 || (tracked.Status != AttachmentScanJobStatus.Processing
                     && tracked.Status != AttachmentScanJobStatus.Finalizing))
                 return false;
@@ -563,7 +653,8 @@ public sealed class AttachmentScanService(
                 && (j.Status == AttachmentScanJobStatus.Processing
                     || j.Status == AttachmentScanJobStatus.Finalizing)
                 && j.LeaseOwner == claimed.LeaseOwner
-                && j.LeaseToken == claimed.LeaseToken)
+                && j.LeaseToken == claimed.LeaseToken
+                && j.UploaderDeletionEpoch == claimed.UploaderDeletionEpoch)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(j => j.Status, target.Status)
                 .SetProperty(j => j.CompletedAt, target.CompletedAt)
@@ -588,45 +679,6 @@ public sealed class AttachmentScanService(
             claimed.SizeBytes,
             cancellationToken);
 
-    private async Task PurgeOldDoneAsync(CancellationToken cancellationToken)
-    {
-        var cutoff = DateTimeOffset.UtcNow.AddDays(-7);
-        var old = await db.AttachmentScanJobs
-            .Where(j => j.Status == AttachmentScanJobStatus.Done
-                        && j.CompletedAt != null
-                        && j.CompletedAt < cutoff)
-            .OrderBy(j => j.CompletedAt)
-            .Take(200)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if (old.Count > 0)
-            db.AttachmentScanJobs.RemoveRange(old);
-
-        var auditCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.Value.ScanAuditRetentionDays));
-        var oldAudits = await db.AttachmentScanAudits
-            .Where(x => x.CreatedAt < auditCutoff)
-            .OrderBy(x => x.CreatedAt)
-            .Take(1000)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if (oldAudits.Count > 0)
-            db.AttachmentScanAudits.RemoveRange(oldAudits);
-
-        var oldProjections = await db.AttachmentScanProjections
-            .Where(x => x.Status == AttachmentScanProjectionStatus.Done
-                        && x.CompletedAt != null
-                        && x.CompletedAt < cutoff)
-            .OrderBy(x => x.CompletedAt)
-            .Take(200)
-            .ToListAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if (oldProjections.Count > 0)
-            db.AttachmentScanProjections.RemoveRange(oldProjections);
-
-        if (old.Count > 0 || oldAudits.Count > 0 || oldProjections.Count > 0)
-            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     private async Task<ContentScanResult> ScanContentAsync(
         string objectKey,
         string? claimedContentType,
@@ -634,6 +686,13 @@ public sealed class AttachmentScanService(
         long claimedSize,
         CancellationToken cancellationToken)
     {
+        // Reserve the full configured object limit before opening the remote
+        // stream. This is intentionally byte-based rather than task-count
+        // based, so a pair of 25 MiB scans cannot overrun a small tmpfs.
+        await using var stagingReservation = await _stagingBudget
+            .ReserveAsync(options.Value.MaxBytes, cancellationToken)
+            .ConfigureAwait(false);
+
         AttachmentReadResult? read;
         try
         {
@@ -657,9 +716,7 @@ public sealed class AttachmentScanService(
         var auditEngine = "ChatApp.ContentPipeline";
         var auditVersion = "1";
         string? contentHash = null;
-        var scanPath = Path.Combine(
-            Path.GetTempPath(),
-            $"chatapp-attachment-scan-{Guid.NewGuid():N}.blob");
+        var scanPath = _stagingBudget.CreatePath();
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
@@ -673,18 +730,18 @@ public sealed class AttachmentScanService(
                              FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
                 var headerLen = 0;
-                var headerBuf = new byte[16];
-                while (headerLen < headerBuf.Length)
+                const int headerLength = 16;
+                while (headerLen < headerLength)
                 {
                     var n = await read.Content.ReadAsync(
-                            headerBuf.AsMemory(headerLen, headerBuf.Length - headerLen),
+                            buffer.AsMemory(headerLen, headerLength - headerLen),
                             cancellationToken)
                         .ConfigureAwait(false);
                     if (n == 0) break;
                     headerLen += n;
                 }
 
-                finalType = AttachmentMagicSniffer.Sniff(headerBuf.AsSpan(0, headerLen))
+                finalType = AttachmentMagicSniffer.Sniff(buffer.AsSpan(0, headerLen))
                             ?? "application/octet-stream";
                 if (!storage.IsAllowedContentType(finalType))
                     return new ContentScanResult(
@@ -695,10 +752,10 @@ public sealed class AttachmentScanService(
                 // policy/AV。S3 response streams are commonly non-seekable; the
                 // temporary file keeps scanning full-content without a large byte[].
                 await scanFile.WriteAsync(
-                        headerBuf.AsMemory(0, headerLen), cancellationToken)
+                        buffer.AsMemory(0, headerLen), cancellationToken)
                     .ConfigureAwait(false);
                 using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                hasher.AppendData(headerBuf.AsSpan(0, headerLen));
+                hasher.AppendData(buffer.AsSpan(0, headerLen));
                 long total = headerLen;
                 var max = options.Value.MaxBytes;
                 while (true)
@@ -715,11 +772,10 @@ public sealed class AttachmentScanService(
                         .ConfigureAwait(false);
                 }
 
-                var hashBytes = new byte[32];
-                if (!hasher.TryGetHashAndReset(hashBytes, out var written) || written != 32)
+                contentHash = GetHashHex(hasher);
+                if (contentHash is null)
                     return new ContentScanResult(
                         false, null, "附件哈希计算失败", true, auditEngine, auditVersion);
-                contentHash = Convert.ToHexStringLower(hashBytes);
 
                 if (claimedSize > 0 && Math.Abs(total - claimedSize) > Math.Max(1024, claimedSize / 10))
                     return new ContentScanResult(
@@ -775,6 +831,15 @@ public sealed class AttachmentScanService(
             contentHash, read.EntityTag);
     }
 
+    private static string? GetHashHex(IncrementalHash hasher)
+    {
+        Span<byte> hashBytes = stackalloc byte[32];
+        if (!hasher.TryGetHashAndReset(hashBytes, out var written) || written != hashBytes.Length)
+            return null;
+
+        return Convert.ToHexStringLower(hashBytes);
+    }
+
     private AttachmentScanAudit CreateScanAudit(
         AttachmentScanJob job,
         ContentScanResult result,
@@ -807,12 +872,10 @@ public sealed class AttachmentScanService(
     }
 
     private static TimeSpan ComputeBackoff(AttachmentStorageOptions opts, int attemptCount)
-    {
-        var baseSeconds = Math.Max(5, opts.ScanBackoffSeconds);
-        var exp = Math.Min(attemptCount - 1, 10);
-        var seconds = Math.Min(3600, baseSeconds * Math.Pow(2, Math.Max(0, exp)));
-        return TimeSpan.FromSeconds(seconds);
-    }
+        => LeasedJobBackoff.ExponentialWithJitter(
+            TimeSpan.FromSeconds(Math.Max(5, opts.ScanBackoffSeconds)),
+            attemptCount,
+            TimeSpan.FromHours(1));
 
     private static string Truncate(string value, int max)
         => value.Length <= max ? value : value[..max];

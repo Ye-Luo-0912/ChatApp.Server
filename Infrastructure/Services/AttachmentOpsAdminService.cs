@@ -9,40 +9,6 @@ using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services;
 
-public interface IAttachmentOpsAdminService
-{
-    Task<AttachmentOpsOrphansDto> GetOrphansAsync(CancellationToken cancellationToken = default);
-
-    Task<AttachmentOpsDeleteFailuresDto> GetDeleteFailuresAsync(CancellationToken cancellationToken = default);
-
-    Task<AttachmentOpsScanBacklogDto> GetScanBacklogAsync(CancellationToken cancellationToken = default);
-
-    Task<IReadOnlyList<AttachmentScanAuditDto>> GetScanAuditsAsync(
-        string attachmentId,
-        int limit = 50,
-        CancellationToken cancellationToken = default);
-
-    Task<AttachmentOpsHintsDto> GetHintsAsync(CancellationToken cancellationToken = default);
-
-    Task<bool> RescanAsync(
-        long adminUserId,
-        string attachmentId,
-        string? reason,
-        CancellationToken cancellationToken = default);
-
-    Task<bool> DeleteAsync(
-        long adminUserId,
-        string attachmentId,
-        string? reason,
-        CancellationToken cancellationToken = default);
-
-    Task<bool> ReleaseAsync(
-        long adminUserId,
-        string attachmentId,
-        string? reason,
-        CancellationToken cancellationToken = default);
-}
-
 public sealed class AttachmentOpsAdminService(
     UserDbContext db,
     IAttachmentMetadataStore metadata,
@@ -99,24 +65,28 @@ public sealed class AttachmentOpsAdminService(
         var sampleLimit = Math.Clamp(opts.OpsSampleLimit, 1, 20);
         var now = DateTimeOffset.UtcNow;
         var pending = AttachmentBlobDeleteJobStatus.Pending;
+        var awaitingPublication = AttachmentBlobDeleteJobStatus.AwaitingPublication;
         var done = AttachmentBlobDeleteJobStatus.Done;
 
         var agg = await db.AttachmentBlobDeleteJobs.AsNoTracking()
             .GroupBy(_ => 1)
             .Select(g => new
             {
-                PendingCount = g.Count(x => x.Status == pending),
+                PendingCount = g.Count(x => x.Status == pending || x.Status == awaitingPublication),
                 DoneCount = g.Count(x => x.Status == done),
                 HighAttemptPendingCount = g.Count(x =>
-                    x.Status == pending && x.AttemptCount >= highThreshold),
-                MaxAttemptCount = g.Where(x => x.Status == pending).Max(x => (int?)x.AttemptCount) ?? 0,
-                OldestPendingAt = g.Where(x => x.Status == pending).Min(x => (DateTimeOffset?)x.CreatedAt),
+                    (x.Status == pending || x.Status == awaitingPublication)
+                    && x.AttemptCount >= highThreshold),
+                MaxAttemptCount = g.Where(x => x.Status == pending || x.Status == awaitingPublication)
+                    .Max(x => (int?)x.AttemptCount) ?? 0,
+                OldestPendingAt = g.Where(x => x.Status == pending || x.Status == awaitingPublication)
+                    .Min(x => (DateTimeOffset?)x.CreatedAt),
             })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
         var worst = await db.AttachmentBlobDeleteJobs.AsNoTracking()
-            .Where(x => x.Status == pending)
+            .Where(x => x.Status == pending || x.Status == awaitingPublication)
             .OrderByDescending(x => x.AttemptCount)
             .ThenBy(x => x.CreatedAt)
             .Take(sampleLimit)

@@ -86,8 +86,32 @@ public sealed class AttachmentStorageOptions
     /// <summary>扫描 Worker 每轮处理条数。</summary>
     public int ScanBatchSize { get; set; } = 20;
 
+    /// <summary>确认 Saga 每轮最多领取数量。</summary>
+    public int ConfirmBatchSize { get; set; } = 20;
+
+    /// <summary>确认 Saga 租约秒数。</summary>
+    public int ConfirmLeaseSeconds { get; set; } = 120;
+
+    /// <summary>确认 Saga 最大重试次数。</summary>
+    public int MaxConfirmAttempts { get; set; } = 10;
+
+    /// <summary>扫描结果投影租约秒数；长于单次 Realtime/S3 操作即可。</summary>
+    public int ProjectionLeaseSeconds { get; set; } = 120;
+
     /// <summary>扫描审计保留天数；独立于短期扫描作业清理周期。</summary>
     public int ScanAuditRetentionDays { get; set; } = 90;
+
+    /// <summary>扫描临时目录的硬字节上限（包含进程重启后残留文件）。</summary>
+    public long ScanStagingMaxBytes { get; set; } = 100L * 1024 * 1024;
+
+    /// <summary>扫描 Worker 可同时保留的临时文件字节数。</summary>
+    public long ScanMaxConcurrentBytes { get; set; } = 50L * 1024 * 1024;
+
+    /// <summary>扫描临时文件目录；生产容器应映射到有明确配额的 tmpfs/卷。</summary>
+    public string ScanStagingRoot { get; set; } = "/tmp/chatapp-scan";
+
+    /// <summary>部署层 tmpfs 预算，仅用于启动配置/运维校验。</summary>
+    public long TmpfsSizeBytes { get; set; } = 128L * 1024 * 1024;
 
     /// <summary>压缩归档最多允许的条目数/声明解压大小，防止 zip bomb。</summary>
     public int ArchiveMaxEntries { get; set; } = 10_000;
@@ -114,7 +138,8 @@ public sealed class AttachmentStorageOptions
     public bool AbandonedUnboundEnabled { get; set; } = true;
 
     /// <summary>
-    /// 未绑定 Ticketed/Confirmed 超过该分钟数则 Abandoned；≤0 时回退为 max(30, TicketMinutes*4)。
+    /// 未绑定 Ticketed/Confirmed 超过该分钟数则 Abandoned；已 Abandoned 的
+    /// 候选会继续用于补建删除墓碑；≤0 时回退为 max(30, TicketMinutes*4)。
     /// </summary>
     public int AbandonedUnboundAgeMinutes { get; set; }
 

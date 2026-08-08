@@ -2,6 +2,7 @@ using Core.Interfaces;
 using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Data;
+using Infrastructure.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,15 +15,19 @@ public sealed class AttachmentBlobDeleteService(
     UserDbContext db,
     IAttachmentStorage storage,
     IOptions<AttachmentStorageOptions> options,
-    ILogger<AttachmentBlobDeleteService> logger) : IAttachmentBlobDeleteService
+    ILogger<AttachmentBlobDeleteService> logger,
+    IAvatarStorage? avatarStorage = null) : IAttachmentBlobDeleteService
 {
+    private readonly IAvatarStorage? _avatarStorage = avatarStorage;
     private static readonly string ProcessOwner =
         $"{Environment.MachineName}:{Environment.ProcessId}";
     private static readonly string[] ActiveStatuses =
     [
         AttachmentBlobDeleteJobStatus.Pending,
+        AttachmentBlobDeleteJobStatus.AwaitingPublication,
         AttachmentBlobDeleteJobStatus.Processing,
     ];
+    private static readonly TimeSpan AvatarPublicationGrace = TimeSpan.FromHours(1);
 
     /// <summary>删除通常是短 I/O；实例崩溃后可安全接管。</summary>
     public const int LeaseMinutes = 5;
@@ -33,17 +38,136 @@ public sealed class AttachmentBlobDeleteService(
         long? userId = null,
         string? attachmentId = null,
         CancellationToken cancellationToken = default)
-        => EnqueueAsync(
+        => EnqueueCoreAsync(
             objectKeys
                 .Where(k => !string.IsNullOrWhiteSpace(k))
                 .Select(k => (k.Trim(), attachmentId)),
             userId,
+            AttachmentBlobDeleteStorageKind.Attachment,
             cancellationToken);
 
     public async Task EnqueueAsync(
         IEnumerable<(string ObjectKey, string? AttachmentId)> items,
         long? userId = null,
         CancellationToken cancellationToken = default)
+        => await EnqueueCoreAsync(
+                items,
+                userId,
+                AttachmentBlobDeleteStorageKind.Attachment,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    public Task EnqueueAvatarAsync(
+        IEnumerable<string> objectKeys,
+        long? userId = null,
+        CancellationToken cancellationToken = default)
+        => EnqueueCoreAsync(
+            objectKeys
+                .Where(k => !string.IsNullOrWhiteSpace(k))
+                .Select(k => (k.Trim(), (string?)null)),
+            userId,
+            AttachmentBlobDeleteStorageKind.Avatar,
+            cancellationToken);
+
+    public Task EnqueueAvatarCandidatesAsync(
+        IEnumerable<string> objectKeys,
+        long? userId = null,
+        CancellationToken cancellationToken = default)
+        => EnqueueCoreAsync(
+            objectKeys
+                .Where(k => !string.IsNullOrWhiteSpace(k))
+                .Select(k => (k.Trim(), (string?)null)),
+            userId,
+            AttachmentBlobDeleteStorageKind.Avatar,
+            cancellationToken,
+            AttachmentBlobDeleteJobStatus.AwaitingPublication,
+            DateTimeOffset.UtcNow.Add(AvatarPublicationGrace));
+
+    public async Task PublishAvatarCandidatesAsync(
+        IEnumerable<string> objectKeys,
+        long? userId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var keys = objectKeys
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .Select(k => k.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (keys.Length == 0)
+            return;
+
+        var query = db.AttachmentBlobDeleteJobs
+            .Where(j => keys.Contains(j.ObjectKey)
+                        && j.StorageKind == AttachmentBlobDeleteStorageKind.Avatar
+                        && (j.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication
+                            || j.Status == AttachmentBlobDeleteJobStatus.Published));
+        if (userId is { } id)
+            query = query.Where(j => j.UserId == id);
+
+        // S3 avatar objects are deliberately written with the unconfirmed
+        // lifecycle tag. Promote the object before changing the durable
+        // candidate row to Published. If this call or the surrounding user
+        // transaction fails, the AwaitingPublication tombstone remains a
+        // safe deletion candidate and no confirmed object can be reclaimed.
+        if (_avatarStorage is IAvatarPublicationStorage publicationStorage)
+        {
+            foreach (var key in keys)
+                await publicationStorage.PublishAsync(key, cancellationToken)
+                    .ConfigureAwait(false);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var published = await query.ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(j => j.Status, AttachmentBlobDeleteJobStatus.Published)
+                    .SetProperty(j => j.CompletedAt, (DateTimeOffset?)null)
+                    .SetProperty(j => j.LastError, (string?)null)
+                    .SetProperty(j => j.NextAttemptAt, now.Add(AvatarPublicationGrace))
+                    .SetProperty(j => j.LeaseOwner, (string?)null)
+                    .SetProperty(j => j.LeaseToken, (string?)null)
+                    .SetProperty(j => j.LeaseExpiresAt, (DateTimeOffset?)null),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (published > 0)
+            AuthSecurityMetrics.AttachmentPendingDeleteDelta(-published);
+    }
+
+    public async Task ReleaseAvatarCandidatesAsync(
+        IEnumerable<string> objectKeys,
+        long? userId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var keys = objectKeys
+            .Where(k => !string.IsNullOrWhiteSpace(k))
+            .Select(k => k.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (keys.Length == 0)
+            return;
+
+        var query = db.AttachmentBlobDeleteJobs
+            .Where(j => keys.Contains(j.ObjectKey)
+                        && j.StorageKind == AttachmentBlobDeleteStorageKind.Avatar
+                        && j.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication);
+        if (userId is { } id)
+            query = query.Where(j => j.UserId == id);
+
+        await query.ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(j => j.Status, AttachmentBlobDeleteJobStatus.Pending)
+                    .SetProperty(j => j.NextAttemptAt, DateTimeOffset.UtcNow)
+                    .SetProperty(j => j.LastError, (string?)null),
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task EnqueueCoreAsync(
+        IEnumerable<(string ObjectKey, string? AttachmentId)> items,
+        long? userId,
+        string storageKind,
+        CancellationToken cancellationToken,
+        string initialStatus = AttachmentBlobDeleteJobStatus.Pending,
+        DateTimeOffset? initialNextAttemptAt = null)
     {
         var normalized = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var (objectKey, attachmentId) in items)
@@ -57,23 +181,59 @@ public sealed class AttachmentBlobDeleteService(
 
         var now = DateTimeOffset.UtcNow;
         var objectKeys = normalized.Keys.ToArray();
-        var activeKeys = await db.AttachmentBlobDeleteJobs
+        // Pending/processing/candidate rows are the active idempotency
+        // boundary. A Published avatar is intentionally excluded: it is a
+        // retention record, and the same object key may need a new deletion
+        // tombstone after the user replaces that avatar.
+        var existingRows = await db.AttachmentBlobDeleteJobs
             .AsNoTracking()
-            .Where(j => objectKeys.Contains(j.ObjectKey) && ActiveStatuses.Contains(j.Status))
-            .Select(j => j.ObjectKey)
+            .Where(j => objectKeys.Contains(j.ObjectKey))
+            .Select(j => new { j.ObjectKey, j.StorageKind, j.Status, j.AttachmentId })
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
-        var active = activeKeys.ToHashSet(StringComparer.Ordinal);
+        var existing = existingRows
+            .Where(row =>
+            {
+                if (row.Status is AttachmentBlobDeleteJobStatus.Pending
+                    or AttachmentBlobDeleteJobStatus.AwaitingPublication
+                    or AttachmentBlobDeleteJobStatus.Processing)
+                    return true;
+
+                // Repeated age sweeps must not create a fresh tombstone after
+                // the previous attachment deletion reached Done/DeadLetter.
+                // A terminal row is scoped by AttachmentId so a broken legacy
+                // key reuse cannot suppress a different attachment. Avatar
+                // final keys are deterministic and terminal deletion is also
+                // final, so they are safe to suppress by object key.
+                if (row.Status is not (AttachmentBlobDeleteJobStatus.Done
+                    or AttachmentBlobDeleteJobStatus.DeadLetter))
+                    return false;
+
+                if (string.Equals(storageKind, AttachmentBlobDeleteStorageKind.Avatar,
+                        StringComparison.Ordinal))
+                    return true;
+
+                return row.AttachmentId is not null
+                       && normalized.TryGetValue(row.ObjectKey, out var suppliedAttachmentId)
+                       && string.Equals(row.AttachmentId, suppliedAttachmentId, StringComparison.Ordinal);
+            })
+            .Select(row => row.ObjectKey)
+            .ToHashSet(StringComparer.Ordinal);
         var pending = normalized
-            .Where(pair => !active.Contains(pair.Key))
+            .Where(pair => !existing.Contains(pair.Key))
             .Select(pair => (pair.Key, pair.Value))
             .ToArray();
         if (pending.Length == 0)
             return;
 
+        var nextAttemptAt = initialNextAttemptAt ?? now;
         var queued = IsNpgsql()
-            ? await EnqueueNpgsqlAsync(pending, userId, now, cancellationToken).ConfigureAwait(false)
-            : await EnqueueFallbackAsync(pending, userId, now, cancellationToken).ConfigureAwait(false);
+            ? await EnqueueNpgsqlAsync(
+                    pending, userId, storageKind, initialStatus, nextAttemptAt, now, cancellationToken)
+                .ConfigureAwait(false)
+            : await EnqueueFallbackAsync(
+                    pending, userId, storageKind, initialStatus, nextAttemptAt, now, cancellationToken)
+                .ConfigureAwait(false);
         if (queued == 0)
             return;
 
@@ -111,12 +271,19 @@ public sealed class AttachmentBlobDeleteService(
         var owner = $"{ProcessOwner}:{Guid.NewGuid():N}";
         if (owner.Length > 128)
             owner = owner[..128];
-        var leaseToken = Guid.NewGuid().ToString("N");
+
+        // Candidate rows are deliberately not claimed as deletion jobs until
+        // their owning user row has been checked. This closes the crash window
+        // between the avatar transaction and candidate publication: a current
+        // avatar becomes Published, while an unreferenced candidate becomes a
+        // normal Pending deletion tombstone.
+        await ReconcileAvatarCandidatesAsync(now, cancellationToken)
+            .ConfigureAwait(false);
 
         if (IsNpgsql())
         {
             var claimedIds = await ClaimDueJobIdsNpgsqlAsync(
-                    batchSize, owner, leaseToken, now, leaseUntil, cancellationToken)
+                    batchSize, owner, now, leaseUntil, cancellationToken)
                 .ConfigureAwait(false);
             if (claimedIds.Count == 0)
                 return [];
@@ -147,12 +314,163 @@ public sealed class AttachmentBlobDeleteService(
         {
             job.Status = AttachmentBlobDeleteJobStatus.Processing;
             job.LeaseOwner = owner;
-            job.LeaseToken = leaseToken;
+            job.LeaseToken = Guid.NewGuid().ToString("N");
             job.LeaseExpiresAt = leaseUntil;
         }
 
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return due;
+    }
+
+    /// <summary>仅由当前 owner/token 持有者续租。</summary>
+    public async Task<LeaseRenewalResult> RenewLeaseAsync(
+        AttachmentBlobDeleteJob claimed,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(claimed.LeaseOwner)
+            || string.IsNullOrWhiteSpace(claimed.LeaseToken))
+            return LeaseRenewalResult.LeaseLost;
+
+        var until = DateTimeOffset.UtcNow.Add(Lease);
+        try
+        {
+            if (!IsNpgsql())
+            {
+                var tracked = await db.AttachmentBlobDeleteJobs
+                    .FirstOrDefaultAsync(j => j.Id == claimed.Id
+                        && j.Status == AttachmentBlobDeleteJobStatus.Processing
+                        && j.LeaseOwner == claimed.LeaseOwner
+                        && j.LeaseToken == claimed.LeaseToken, cancellationToken)
+                    .ConfigureAwait(false);
+                if (tracked is null)
+                    return LeaseRenewalResult.LeaseLost;
+
+                tracked.LeaseExpiresAt = until;
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                return LeaseRenewalResult.Renewed;
+            }
+
+            var updated = await db.AttachmentBlobDeleteJobs
+                .Where(j => j.Id == claimed.Id
+                    && j.Status == AttachmentBlobDeleteJobStatus.Processing
+                    && j.LeaseOwner == claimed.LeaseOwner
+                    && j.LeaseToken == claimed.LeaseToken)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(j => j.LeaseExpiresAt, until),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return updated == 1
+                ? LeaseRenewalResult.Renewed
+                : LeaseRenewalResult.LeaseLost;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "附件 blob 删除租约续租失败 JobId={Id}", claimed.Id);
+            return LeaseRenewalResult.TransientFailure;
+        }
+    }
+
+    /// <summary>删除成功后的 fenced 终态写入。</summary>
+    public async Task<bool> CompleteClaimedJobAsync(
+        AttachmentBlobDeleteJob claimed,
+        CancellationToken cancellationToken = default)
+    {
+        var completed = await ApplyFencedUpdateAsync(
+                claimed,
+                new TargetFields
+                {
+                    Status = AttachmentBlobDeleteJobStatus.Done,
+                    AttemptCount = claimed.AttemptCount,
+                    CompletedAt = DateTimeOffset.UtcNow,
+                    LastError = null,
+                    NextAttemptAt = claimed.NextAttemptAt,
+                    LeaseOwner = null,
+                    LeaseToken = null,
+                    LeaseExpiresAt = null,
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!completed)
+            return false;
+
+        AuthSecurityMetrics.AttachmentBlobDelete("success");
+        AuthSecurityMetrics.AttachmentPendingDeleteDelta(-1);
+        return true;
+    }
+
+    /// <summary>失败后的可重试状态写入；返回 false 表示租约已易主。</summary>
+    public async Task<bool> RetryClaimedJobAsync(
+        AttachmentBlobDeleteJob claimed,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        var attemptCount = Math.Max(1, claimed.AttemptCount + 1);
+        var opts = options.Value;
+        var updated = await ApplyFencedUpdateAsync(
+                claimed,
+                new TargetFields
+                {
+                    Status = AttachmentBlobDeleteJobStatus.Pending,
+                    AttemptCount = attemptCount,
+                    CompletedAt = null,
+                    LastError = Truncate(error, 500),
+                    NextAttemptAt = DateTimeOffset.UtcNow.Add(ComputeBackoff(opts, attemptCount)),
+                    LeaseOwner = null,
+                    LeaseToken = null,
+                    LeaseExpiresAt = null,
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!updated)
+            return false;
+
+        AuthSecurityMetrics.AttachmentBlobDelete("failed");
+        logger.LogWarning(
+            "附件 blob 删除失败，已按退避重新入队 JobId={Id} Key={Key} Attempt={Attempt}",
+            claimed.Id,
+            claimed.ObjectKey,
+            attemptCount);
+        return true;
+    }
+
+    /// <summary>重试耗尽后的 DeadLetter fenced 状态写入。</summary>
+    public async Task<bool> DeadLetterClaimedJobAsync(
+        AttachmentBlobDeleteJob claimed,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        var attemptCount = Math.Max(1, claimed.AttemptCount + 1);
+        var updated = await ApplyFencedUpdateAsync(
+                claimed,
+                new TargetFields
+                {
+                    Status = AttachmentBlobDeleteJobStatus.DeadLetter,
+                    AttemptCount = attemptCount,
+                    CompletedAt = DateTimeOffset.UtcNow,
+                    LastError = Truncate(error, 500),
+                    NextAttemptAt = DateTimeOffset.UtcNow,
+                    LeaseOwner = null,
+                    LeaseToken = null,
+                    LeaseExpiresAt = null,
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!updated)
+            return false;
+
+        AuthSecurityMetrics.AttachmentBlobDelete("failed");
+        AuthSecurityMetrics.AttachmentBlobDelete("exhausted");
+        AuthSecurityMetrics.AttachmentPendingDeleteDelta(-1);
+        logger.LogError(
+            "附件 blob 删除重试已耗尽，转入 DeadLetter JobId={Id} Key={Key} Attempts={Attempt}",
+            claimed.Id,
+            claimed.ObjectKey,
+            attemptCount);
+        return true;
     }
 
     /// <summary>
@@ -171,7 +489,7 @@ public sealed class AttachmentBlobDeleteService(
         var maxAttempts = Math.Max(1, opts.MaxDeleteAttempts);
         try
         {
-            await storage.DeleteAsync(claimed.ObjectKey, cancellationToken).ConfigureAwait(false);
+            await DeleteObjectAsync(claimed, cancellationToken).ConfigureAwait(false);
             var completed = await ApplyFencedUpdateAsync(
                     claimed,
                     new TargetFields
@@ -259,26 +577,129 @@ public sealed class AttachmentBlobDeleteService(
     private async Task<int> EnqueueFallbackAsync(
         IReadOnlyList<(string ObjectKey, string? AttachmentId)> items,
         long? userId,
+        string storageKind,
+        string status,
+        DateTimeOffset nextAttemptAt,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
         db.AttachmentBlobDeleteJobs.AddRange(items.Select(item => new AttachmentBlobDeleteJob
         {
             ObjectKey = item.ObjectKey,
+            StorageKind = storageKind,
             AttachmentId = item.AttachmentId,
             UserId = userId,
-            Status = AttachmentBlobDeleteJobStatus.Pending,
+            Status = status,
             AttemptCount = 0,
-            NextAttemptAt = now,
+            NextAttemptAt = nextAttemptAt,
             CreatedAt = now,
         }));
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         return items.Count;
     }
 
+    private async Task ReconcileAvatarCandidatesAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var candidates = await db.AttachmentBlobDeleteJobs
+            .AsNoTracking()
+            .Where(j => (j.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication
+                         || j.Status == AttachmentBlobDeleteJobStatus.Published)
+                        && j.NextAttemptAt <= now)
+            .OrderBy(j => j.NextAttemptAt)
+            .ThenBy(j => j.Id)
+            .Take(500)
+            .Select(j => new { j.Id, j.ObjectKey, j.UserId, j.Status })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (candidates.Count == 0)
+            return;
+
+        var userIds = candidates
+            .Where(x => x.UserId.HasValue)
+            .Select(x => x.UserId!.Value)
+            .Distinct()
+            .ToArray();
+        var avatarUrls = userIds.Length == 0
+            ? []
+            : await db.Users.AsNoTracking()
+                .Where(user => userIds.Contains(user.Id))
+                .Select(user => new { user.Id, user.AvatarUrl })
+                .ToDictionaryAsync(x => x.Id, x => x.AvatarUrl, cancellationToken)
+                .ConfigureAwait(false);
+
+        foreach (var candidate in candidates)
+        {
+            avatarUrls.TryGetValue(candidate.UserId ?? 0, out var avatarUrl);
+            var stillReferenced = ReferencesAvatar(avatarUrl, candidate.ObjectKey);
+            if (stillReferenced)
+            {
+                if (candidate.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication
+                    && _avatarStorage is IAvatarPublicationStorage publicationStorage)
+                {
+                    // Reconciliation is the crash-recovery leg of the avatar
+                    // finalization saga. A successful CAS/reference check is
+                    // the authority for promoting the candidate tag.
+                    await publicationStorage.PublishAsync(
+                            candidate.ObjectKey,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                if (candidate.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication)
+                {
+                    var published = await db.AttachmentBlobDeleteJobs
+                        .Where(job => job.Id == candidate.Id
+                                      && job.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication)
+                        .ExecuteUpdateAsync(
+                            setters => setters
+                                .SetProperty(job => job.Status, AttachmentBlobDeleteJobStatus.Published)
+                                .SetProperty(job => job.CompletedAt, (DateTimeOffset?)null)
+                                .SetProperty(job => job.LastError, (string?)null)
+                                .SetProperty(job => job.NextAttemptAt, DateTimeOffset.MaxValue),
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (published == 1)
+                        AuthSecurityMetrics.AttachmentPendingDeleteDelta(-1);
+                }
+
+                continue;
+            }
+
+            var pending = await db.AttachmentBlobDeleteJobs
+                .Where(job => job.Id == candidate.Id
+                              && (job.Status == AttachmentBlobDeleteJobStatus.AwaitingPublication
+                                  || job.Status == AttachmentBlobDeleteJobStatus.Published))
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(job => job.Status, AttachmentBlobDeleteJobStatus.Pending)
+                        .SetProperty(job => job.CompletedAt, (DateTimeOffset?)null)
+                        .SetProperty(job => job.LastError, (string?)null)
+                        .SetProperty(job => job.NextAttemptAt, now),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (pending == 1 && candidate.Status == AttachmentBlobDeleteJobStatus.Published)
+                AuthSecurityMetrics.AttachmentPendingDeleteDelta(1);
+        }
+    }
+
+    private static bool ReferencesAvatar(string? avatarUrl, string objectKey)
+    {
+        if (string.IsNullOrWhiteSpace(avatarUrl) || string.IsNullOrWhiteSpace(objectKey))
+            return false;
+
+        var normalizedKey = objectKey.TrimStart('/');
+        return string.Equals(avatarUrl, normalizedKey, StringComparison.Ordinal)
+               || avatarUrl.EndsWith('/' + normalizedKey, StringComparison.Ordinal);
+    }
+
     private async Task<int> EnqueueNpgsqlAsync(
         IReadOnlyList<(string ObjectKey, string? AttachmentId)> items,
         long? userId,
+        string storageKind,
+        string status,
+        DateTimeOffset nextAttemptAt,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
@@ -292,14 +713,17 @@ public sealed class AttachmentBlobDeleteService(
         command.CommandText =
             """
             INSERT INTO "T_AttachmentBlobDeleteJob"
-                ("ObjectKey", "AttachmentId", "UserId", "Status", "AttemptCount", "NextAttemptAt", "CreatedAt")
-            SELECT i."ObjectKey", i."AttachmentId", @user_id::bigint, 'Pending', 0, @now, @now
+                ("ObjectKey", "StorageKind", "AttachmentId", "UserId", "Status", "AttemptCount", "NextAttemptAt", "CreatedAt")
+            SELECT i."ObjectKey", @storage_kind, i."AttachmentId", @user_id::bigint, @status, 0, @next_attempt_at, @now
             FROM unnest(@object_keys::text[], @attachment_ids::text[])
                 AS i("ObjectKey", "AttachmentId")
             ON CONFLICT DO NOTHING
             RETURNING "Id";
             """;
         AddParameter(command, "user_id", userId.HasValue ? (object)userId.Value : DBNull.Value);
+        AddParameter(command, "storage_kind", storageKind);
+        AddParameter(command, "status", status);
+        AddParameter(command, "next_attempt_at", nextAttemptAt);
         AddParameter(command, "now", now);
         AddParameter(command, "object_keys", items.Select(item => item.ObjectKey).ToArray());
         AddParameter(command, "attachment_ids", items.Select(item => item.AttachmentId).ToArray());
@@ -314,7 +738,6 @@ public sealed class AttachmentBlobDeleteService(
     private async Task<List<long>> ClaimDueJobIdsNpgsqlAsync(
         int batchSize,
         string owner,
-        string leaseToken,
         DateTimeOffset now,
         DateTimeOffset leaseUntil,
         CancellationToken cancellationToken)
@@ -331,12 +754,12 @@ public sealed class AttachmentBlobDeleteService(
             UPDATE "T_AttachmentBlobDeleteJob" AS j
             SET "Status" = 'Processing',
                 "LeaseOwner" = @owner,
-                "LeaseToken" = @lease_token,
+                "LeaseToken" = md5(random()::text || clock_timestamp()::text || j."Id"::text),
                 "LeaseExpiresAt" = @lease_until
             WHERE j."Id" IN (
                 SELECT c."Id"
                 FROM "T_AttachmentBlobDeleteJob" AS c
-                WHERE (c."Status" = 'Pending' AND c."NextAttemptAt" <= @now)
+             WHERE (c."Status" = 'Pending' AND c."NextAttemptAt" <= @now)
                    OR (c."Status" = 'Processing'
                        AND c."LeaseExpiresAt" IS NOT NULL
                        AND c."LeaseExpiresAt" < @now)
@@ -345,9 +768,8 @@ public sealed class AttachmentBlobDeleteService(
                 LIMIT @batch
             )
             RETURNING j."Id";
-            """;
+        """;
         AddParameter(command, "owner", owner);
-        AddParameter(command, "lease_token", leaseToken);
         AddParameter(command, "lease_until", leaseUntil);
         AddParameter(command, "now", now);
         AddParameter(command, "batch", Math.Clamp(batchSize, 1, 500));
@@ -430,15 +852,31 @@ public sealed class AttachmentBlobDeleteService(
     }
 
     private static TimeSpan ComputeBackoff(AttachmentStorageOptions opts, int attemptCount)
-    {
-        var baseSeconds = Math.Max(5, opts.DeleteBackoffSeconds);
-        var exp = Math.Min(attemptCount - 1, 10);
-        var seconds = Math.Min(3600, baseSeconds * Math.Pow(2, Math.Max(0, exp)));
-        return TimeSpan.FromSeconds(seconds);
-    }
+        => LeasedJobBackoff.ExponentialWithJitter(
+            TimeSpan.FromSeconds(Math.Max(5, opts.DeleteBackoffSeconds)),
+            attemptCount,
+            TimeSpan.FromHours(1));
 
     private static string Truncate(string value, int max)
         => value.Length <= max ? value : value[..max];
+
+    private Task DeleteObjectAsync(
+        AttachmentBlobDeleteJob job,
+        CancellationToken cancellationToken)
+    {
+        if (string.Equals(
+                job.StorageKind,
+                AttachmentBlobDeleteStorageKind.Avatar,
+                StringComparison.Ordinal))
+        {
+            if (_avatarStorage is null)
+                throw new InvalidOperationException("头像删除存储未注册");
+
+            return _avatarStorage.TryDeleteAsync(job.ObjectKey, cancellationToken);
+        }
+
+        return storage.DeleteAsync(job.ObjectKey, cancellationToken);
+    }
 }
 
 /// <summary>DI 作用域工厂封装，供 BackgroundService 入队。</summary>

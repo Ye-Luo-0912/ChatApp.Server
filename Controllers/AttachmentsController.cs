@@ -1,9 +1,12 @@
+using Core.Interfaces;
 using Core.Models.Attachment;
-using Infrastructure.Services;
+using ChatApp.Server.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using AttachmentPresignRequest = ChatApp.Contracts.Http.Attachments.AttachmentPresignRequest;
+using ConfirmAttachmentRequest = ChatApp.Contracts.Http.Attachments.ConfirmAttachmentRequest;
 
 namespace ChatApp.Server.Controllers;
 
@@ -12,7 +15,9 @@ namespace ChatApp.Server.Controllers;
 [Authorize]
 [Route("api/attachments")]
 [EnableRateLimiting("user-sensitive")]
-public sealed class AttachmentsController(IAttachmentService attachments) : BaseApiController
+    public sealed class AttachmentsController(
+        IAttachmentService attachments,
+        IAttachmentConfirmSagaService confirmSagas) : BaseApiController
 {
     [HttpPost("presign")]
     public async Task<IActionResult> Presign(
@@ -24,11 +29,14 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
 
         try
         {
-            var result = await attachments.PresignAsync(userId, model, cancellationToken);
+            var result = await attachments.PresignAsync(
+                userId,
+                model.ToCoreContract(),
+                cancellationToken);
             return result.Status switch
             {
                 AttachmentUploadReservationStatus.Reserved when result.Response is not null =>
-                    Ok(result.Response),
+                    Ok(result.Response.ToHttpContract()),
                 AttachmentUploadReservationStatus.UnconfirmedObjectLimitExceeded =>
                     StatusCode(
                         StatusCodes.Status429TooManyRequests,
@@ -91,10 +99,39 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var (result, body) = await attachments.ConfirmAsync(userId, model, cancellationToken);
+        var (result, body) = await attachments.ConfirmAsync(
+            userId,
+            model.ToCoreContract(),
+            cancellationToken);
         if (!result.Succeeded)
             return BadRequest(result.Errors);
-        return Accepted(body);
+        return Accepted(body?.ToHttpContract());
+    }
+
+    /// <summary>查询确认 Saga；客户端可在扫描和投影期间安全轮询。</summary>
+    [HttpGet("{attachmentId}/confirm")]
+    public async Task<IActionResult> ConfirmStatus(
+        string attachmentId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var status = await confirmSagas.GetStatusAsync(userId, attachmentId, cancellationToken);
+        return status is null ? NotFound() : Ok(status.ToHttpContract());
+    }
+
+    /// <summary>查询附件真实生命周期状态，避免客户端猜测扫描/投影进度。</summary>
+    [HttpGet("{attachmentId}/status")]
+    public async Task<IActionResult> Status(
+        string attachmentId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var status = await attachments.GetStatusAsync(userId, attachmentId, cancellationToken);
+        return status is null ? NotFound() : Ok(status);
     }
 
     [HttpPost("{attachmentId}/abandon")]
@@ -157,6 +194,7 @@ public sealed class AttachmentsController(IAttachmentService attachments) : Base
     /// </summary>
     [HttpGet("{attachmentId}/download")]
     [HttpGet("{attachmentId}/content")]
+    [DisableRequestTimeout]
     public async Task<IActionResult> Download(
         string attachmentId,
         [FromQuery] string? format,

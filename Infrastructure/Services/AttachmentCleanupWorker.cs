@@ -1,7 +1,7 @@
-using Amazon.S3;
-using Amazon.S3.Model;
 using Core.Interfaces;
+using Core.Models.Export;
 using Core.Settings;
+using Infrastructure.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -15,8 +15,15 @@ namespace Infrastructure.Services;
 public sealed class AttachmentCleanupWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<AttachmentStorageOptions> options,
+    IOptions<WorkerConcurrencyOptions> workerConcurrencyOptions,
+    ILeasedJobStore<AttachmentBlobDeleteJob> blobDeleteStore,
+    LeasedJobExecutor<AttachmentBlobDeleteJob> blobDeleteExecutor,
+    IAttachmentStorage attachmentStorage,
+    IAvatarStorage avatarStorage,
     ILogger<AttachmentCleanupWorker> logger) : BackgroundService
 {
+    private const string WorkerName = "attachment_blob_delete";
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // 启动后稍等再跑，避免与迁移竞态。
@@ -64,67 +71,36 @@ public sealed class AttachmentCleanupWorker(
 
     private async Task ProcessDeleteJobsAsync(CancellationToken ct)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var svc = scope.ServiceProvider.GetRequiredService<IAttachmentBlobDeleteService>();
-        var deleted = await svc.ProcessDueAsync(ct).ConfigureAwait(false);
+        var deleted = await blobDeleteExecutor.DrainAsync(
+                WorkerName,
+                Math.Max(1, workerConcurrencyOptions.Value.AttachmentBlobDelete),
+                TimeSpan.FromMinutes(AttachmentBlobDeleteService.LeaseMinutes),
+                blobDeleteStore,
+                (job, cancellationToken) =>
+                    string.Equals(
+                        job.StorageKind,
+                        AttachmentBlobDeleteStorageKind.Avatar,
+                        StringComparison.Ordinal)
+                        ? avatarStorage.TryDeleteAsync(job.ObjectKey, cancellationToken)
+                        : attachmentStorage.DeleteAsync(job.ObjectKey, cancellationToken),
+                job => job.AttemptCount + 1 >= Math.Max(1, options.Value.MaxDeleteAttempts),
+                ct)
+            .ConfigureAwait(false);
         if (deleted > 0)
             logger.LogInformation("附件墓碑删除成功 {Count} 个对象", deleted);
     }
 
     private async Task CleanupS3Async(AttachmentStorageOptions opts, TimeSpan maxAge, CancellationToken ct)
     {
-        var (activeKeys, metadataAvailable) = await LoadActiveKeysAsync(ct).ConfigureAwait(false);
-
-        using var s3 = S3ClientFactory.Create(
-            opts.S3Region,
-            opts.S3Endpoint,
-            opts.S3ForcePathStyle);
-
-        var cutoff = DateTime.UtcNow - maxAge;
-        string? token = null;
-        var deleted = 0;
-        do
-        {
-            var list = await s3.ListObjectsV2Async(new ListObjectsV2Request
-            {
-                BucketName = opts.S3Bucket,
-                Prefix = "attachments/",
-                ContinuationToken = token,
-            }, ct).ConfigureAwait(false);
-
-            foreach (var obj in list.S3Objects)
-            {
-                if (obj.LastModified.ToUniversalTime() > cutoff)
-                    continue;
-
-                if (!metadataAvailable)
-                {
-                    // 无元数据时不能 safely infer final-vs-pending from a file
-                    // extension. Leave the object for bucket lifecycle/operations.
-                    if (!obj.Key.Contains("/pending/", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                }
-                else if (activeKeys.Contains(obj.Key))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    await s3.DeleteObjectAsync(opts.S3Bucket, obj.Key, ct).ConfigureAwait(false);
-                    deleted++;
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex, "删除过期附件失败 Key={Key}", obj.Key);
-                }
-            }
-
-            token = list.IsTruncated ? list.NextContinuationToken : null;
-        } while (token is not null && !ct.IsCancellationRequested);
-
-        if (deleted > 0)
-            logger.LogInformation("已清理 {Count} 个 S3 过期/孤儿附件对象", deleted);
+        // S3 is intentionally not globally listed here. Client-writable
+        // staging/quarantine objects are covered by bucket Lifecycle rules;
+        // confirmed/abandoned objects are removed through durable Server DB
+        // tombstones. The cleanup loop therefore stays O(expired candidates)
+        // instead of O(all attachments) on every five-minute pass.
+        _ = opts;
+        _ = maxAge;
+        _ = ct;
+        logger.LogDebug("S3 附件临时前缀由 Lifecycle 与 durable tombstone 清理");
     }
 
     private async Task CleanupLocalAsync(AttachmentStorageOptions opts, TimeSpan maxAge, CancellationToken ct)
@@ -132,31 +108,32 @@ public sealed class AttachmentCleanupWorker(
         var root = Path.GetFullPath(opts.LocalRootPath);
         if (!Directory.Exists(root)) return;
 
-        var (activeKeys, metadataAvailable) = await LoadActiveKeysAsync(ct).ConfigureAwait(false);
         var cutoff = DateTime.UtcNow - maxAge;
         var deleted = 0;
-        var rootWithSep = root.EndsWith(Path.DirectorySeparatorChar)
-            ? root
-            : root + Path.DirectorySeparatorChar;
+        // New transient objects live below lifecycle prefixes. Legacy final
+        // objects are deleted by DB tombstones, so this local sweep only walks
+        // bounded candidate prefixes and never loads active keys.
+        var candidateRoots = new List<string>();
+        foreach (var prefix in new[] { "pending", "quarantine", "staging" })
+        {
+            var candidate = Path.Combine(root, prefix);
+            if (Directory.Exists(candidate))
+                candidateRoots.Add(candidate);
+        }
 
-        var pattern = metadataAvailable ? "*" : "*.bin";
-        foreach (var file in Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
+        foreach (var candidateRoot in candidateRoots)
         {
             ct.ThrowIfCancellationRequested();
-            try
+            if (File.Exists(candidateRoot))
             {
-                if (File.GetLastWriteTimeUtc(file) > cutoff) continue;
-
-                var relative = Path.GetRelativePath(rootWithSep, file).Replace('\\', '/');
-                if (metadataAvailable && activeKeys.Contains(relative))
-                    continue;
-
-                File.Delete(file);
-                deleted++;
+                deleted += TryDeleteLocalCandidate(candidateRoot, cutoff);
+                continue;
             }
-            catch (Exception ex)
+
+            foreach (var file in Directory.EnumerateFiles(candidateRoot, "*", SearchOption.AllDirectories))
             {
-                logger.LogWarning(ex, "删除本地过期/孤儿附件失败 Path={Path}", file);
+                ct.ThrowIfCancellationRequested();
+                deleted += TryDeleteLocalCandidate(file, cutoff);
             }
         }
 
@@ -164,13 +141,19 @@ public sealed class AttachmentCleanupWorker(
             logger.LogInformation("已清理 {Count} 个本地过期/孤儿附件文件", deleted);
     }
 
-    private async Task<(IReadOnlySet<string> Keys, bool Available)> LoadActiveKeysAsync(CancellationToken ct)
+    private int TryDeleteLocalCandidate(string file, DateTime cutoff)
     {
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var metadata = scope.ServiceProvider.GetRequiredService<IAttachmentMetadataStore>();
-        if (!metadata.IsAvailable)
-            return (new HashSet<string>(StringComparer.Ordinal), false);
-        var keys = await metadata.ListActiveObjectKeysAsync(ct).ConfigureAwait(false);
-        return (keys, true);
+        try
+        {
+            if (File.GetLastWriteTimeUtc(file) > cutoff)
+                return 0;
+            File.Delete(file);
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "删除本地过期附件候选失败 Path={Path}", file);
+            return 0;
+        }
     }
 }

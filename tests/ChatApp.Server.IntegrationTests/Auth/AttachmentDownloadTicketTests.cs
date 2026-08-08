@@ -55,20 +55,15 @@ public sealed class AttachmentDownloadTicketTests(PostgresTestFixture postgres, 
             $"/api/attachments/{attachmentId}/download?ticket={Uri.EscapeDataString(ticketBody.Ticket)}");
         Assert.Equal(HttpStatusCode.Unauthorized, wrongUser.StatusCode);
 
-        // 重新签发（上一张被错误用户消费掉了）
-        var mint2 = await owner.PostAsync($"/api/attachments/{attachmentId}/ticket", content: null);
-        Assert.Equal(HttpStatusCode.OK, mint2.StatusCode);
-        var ticket2 = await mint2.Content.ReadFromJsonAsync<TicketDto>(WafTestHelpers.Json);
-        Assert.NotNull(ticket2);
-
+        // 错误用户只会读取绑定信息，不消费原票；票仍可由 owner 使用。
         var ok = await owner.GetAsync(
-            $"/api/attachments/{attachmentId}/download?ticket={Uri.EscapeDataString(ticket2!.Ticket)}");
+            $"/api/attachments/{attachmentId}/download?ticket={Uri.EscapeDataString(ticketBody.Ticket)}");
         Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
         Assert.Equal(payload, await ok.Content.ReadAsByteArrayAsync());
 
         // 单次消费后再用 → 无效
         var reused = await owner.GetAsync(
-            $"/api/attachments/{attachmentId}/download?ticket={Uri.EscapeDataString(ticket2.Ticket)}");
+            $"/api/attachments/{attachmentId}/download?ticket={Uri.EscapeDataString(ticketBody.Ticket)}");
         Assert.Equal(HttpStatusCode.Unauthorized, reused.StatusCode);
 
         // 过期票

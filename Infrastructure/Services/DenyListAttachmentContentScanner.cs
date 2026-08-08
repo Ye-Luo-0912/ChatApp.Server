@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Compression;
 using Core.Interfaces;
 using Core.Settings;
@@ -12,6 +13,10 @@ namespace Infrastructure.Services;
 public sealed class DenyListAttachmentContentScanner(
     IOptions<AttachmentStorageOptions>? options = null) : IAttachmentContentScanner
 {
+    private static readonly byte[] PdfJavaScriptToken = "/JavaScript"u8.ToArray();
+    private static readonly byte[] PdfOpenActionToken = "/OpenAction"u8.ToArray();
+    private static readonly byte[] PdfAdditionalActionsToken = "/AA"u8.ToArray();
+
     private static readonly HashSet<string> DangerousExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".exe", ".dll", ".bat", ".cmd", ".com", ".scr", ".msi", ".msp",
@@ -40,97 +45,95 @@ public sealed class DenyListAttachmentContentScanner(
         }
 
         if (!content.CanSeek)
-            return AttachmentContentScanResult.Allow(engine, version);
+            return AttachmentContentScanResult.TransientFail(
+                "内容流不可回退，无法完成安全策略扫描", engine, version);
 
         var originalPosition = content.Position;
         try
         {
             content.Position = 0;
-            var header = new byte[4];
+            var header = ArrayPool<byte>.Shared.Rent(64 * 1024);
             var read = 0;
-            while (read < header.Length)
+            try
             {
-                var n = await content.ReadAsync(
-                        header.AsMemory(read, header.Length - read), cancellationToken)
-                    .ConfigureAwait(false);
-                if (n == 0) break;
-                read += n;
-            }
-
-            if (read >= 2 && header[0] == (byte)'M' && header[1] == (byte)'Z')
-                return AttachmentContentScanResult.Deny(
-                    "检测到 PE/MZ 可执行文件头", engine, version);
-            if (read >= 4
-                && header[0] == 0x7F && header[1] == (byte)'E'
-                && header[2] == (byte)'L' && header[3] == (byte)'F')
-                return AttachmentContentScanResult.Deny(
-                    "检测到 ELF 可执行文件头", engine, version);
-            if (read >= 2 && header[0] == (byte)'#' && header[1] == (byte)'!')
-                return AttachmentContentScanResult.Deny(
-                    "检测到脚本 shebang", engine, version);
-
-            content.Position = 0;
-            if (string.Equals(sniffedContentType, "application/pdf", StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (var token in new[] { "/JavaScript"u8.ToArray(), "/OpenAction"u8.ToArray(), "/AA"u8.ToArray() })
+                while (read < 4)
                 {
-                    if (await ContainsTokenAsync(content, token, cancellationToken).ConfigureAwait(false))
+                    var n = await content.ReadAsync(
+                            header.AsMemory(read, 4 - read), cancellationToken)
+                        .ConfigureAwait(false);
+                    if (n == 0) break;
+                    read += n;
+                }
+
+                if (read >= 2 && header[0] == (byte)'M' && header[1] == (byte)'Z')
+                    return AttachmentContentScanResult.Deny(
+                        "检测到 PE/MZ 可执行文件头", engine, version);
+                if (read >= 4
+                    && header[0] == 0x7F && header[1] == (byte)'E'
+                    && header[2] == (byte)'L' && header[3] == (byte)'F')
+                    return AttachmentContentScanResult.Deny(
+                        "检测到 ELF 可执行文件头", engine, version);
+                if (read >= 2 && header[0] == (byte)'#' && header[1] == (byte)'!')
+                    return AttachmentContentScanResult.Deny(
+                        "检测到脚本 shebang", engine, version);
+
+                content.Position = 0;
+                if (string.Equals(sniffedContentType, "application/pdf", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (await ContainsAnyPdfDangerousTokenAsync(
+                                content, header, cancellationToken)
+                            .ConfigureAwait(false))
                         return AttachmentContentScanResult.Deny(
                             "PDF 包含主动脚本或自动动作", engine, version);
-                    content.Position = 0;
                 }
-            }
 
-            if (read >= 2 && header[0] == (byte)'P' && header[1] == (byte)'K')
-            {
-                try
+                if (read >= 2 && header[0] == (byte)'P' && header[1] == (byte)'K')
                 {
-                    using var archive = new ZipArchive(content, ZipArchiveMode.Read, leaveOpen: true);
-                    var entries = 0;
-                    long expanded = 0;
-                    foreach (var entry in archive.Entries)
+                    try
                     {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        entries++;
-                        expanded = checked(expanded + Math.Max(0, entry.Length));
-                        var depth = entry.FullName.Count(c => c == '/' || c == '\\');
-                        if (entries > _options.ArchiveMaxEntries
-                            || expanded > _options.ArchiveMaxUncompressedBytes
-                            || depth > _options.ArchiveMaxPathDepth)
-                            return AttachmentContentScanResult.Deny(
-                                "压缩归档超过条目、解压大小或层级限制", engine, version);
-
-                        var name = entry.FullName.Replace('\\', '/');
-                        if (IsScriptOrExecutableEntry(name))
-                            return AttachmentContentScanResult.Deny(
-                                "压缩归档包含脚本或可执行内容", engine, version);
-                        if (name.EndsWith("vbaProject.bin", StringComparison.OrdinalIgnoreCase)
-                            || name.EndsWith("/customUI/customUI.xml", StringComparison.OrdinalIgnoreCase))
-                            return AttachmentContentScanResult.Deny(
-                                "Office 宏或自定义脚本内容被拒绝", engine, version);
-
-                        if (IsNestedArchiveName(name))
+                        using var archive = new ZipArchive(content, ZipArchiveMode.Read, leaveOpen: true);
+                        var entries = 0;
+                        long expanded = 0;
+                        foreach (var entry in archive.Entries)
                         {
-                            var nested = InspectNestedArchive(
-                                entry,
-                                depth: 1,
-                                ref entries,
-                                ref expanded,
-                                cancellationToken);
-                            if (!nested.Allowed)
+                            cancellationToken.ThrowIfCancellationRequested();
+                            entries++;
+                            expanded = checked(expanded + Math.Max(0, entry.Length));
+                            var name = entry.FullName.AsSpan();
+                            var depth = CountPathSeparators(name);
+                            if (entries > _options.ArchiveMaxEntries
+                                || expanded > _options.ArchiveMaxUncompressedBytes
+                                || depth > _options.ArchiveMaxPathDepth)
                                 return AttachmentContentScanResult.Deny(
-                                    nested.Reason ?? "压缩归档层数超过限制", engine, version);
+                                    "压缩归档超过条目、解压大小或层级限制", engine, version);
+
+                            if (IsScriptOrExecutableEntry(name))
+                                return AttachmentContentScanResult.Deny(
+                                    "压缩归档包含脚本或可执行内容", engine, version);
+                            if (name.EndsWith("vbaProject.bin", StringComparison.OrdinalIgnoreCase)
+                                || name.EndsWith("/customUI/customUI.xml", StringComparison.OrdinalIgnoreCase)
+                                || name.EndsWith("\\customUI\\customUI.xml", StringComparison.OrdinalIgnoreCase))
+                                return AttachmentContentScanResult.Deny(
+                                    "Office 宏或自定义脚本内容被拒绝", engine, version);
+
+                            if (IsNestedArchiveName(name))
+                                return AttachmentContentScanResult.Deny(
+                                    "嵌套压缩归档被拒绝", engine, version);
                         }
                     }
+                    catch (InvalidDataException)
+                    {
+                        return AttachmentContentScanResult.Deny(
+                            "压缩归档结构无效", engine, version);
+                    }
                 }
-                catch (InvalidDataException)
-                {
-                    return AttachmentContentScanResult.Deny(
-                        "压缩归档结构无效", engine, version);
-                }
-            }
 
-            return AttachmentContentScanResult.Allow(engine, version);
+                return AttachmentContentScanResult.Allow(engine, version);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(header);
+            }
         }
         finally
         {
@@ -138,93 +141,125 @@ public sealed class DenyListAttachmentContentScanner(
         }
     }
 
-    private (bool Allowed, string? Reason) InspectNestedArchive(
-        ZipArchiveEntry entry,
-        int depth,
-        ref int entries,
-        ref long expanded,
-        CancellationToken cancellationToken)
-    {
-        if (depth >= _options.ArchiveMaxNestingDepth)
-            return (false, "压缩归档层数超过限制");
-
-        try
-        {
-            using var nestedStream = entry.Open();
-            using var nestedArchive = new ZipArchive(nestedStream, ZipArchiveMode.Read);
-            foreach (var nestedEntry in nestedArchive.Entries)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                entries++;
-                expanded = checked(expanded + Math.Max(0, nestedEntry.Length));
-                var name = nestedEntry.FullName.Replace('\\', '/');
-                var pathDepth = name.Count(c => c == '/' || c == '\\');
-                if (entries > _options.ArchiveMaxEntries
-                    || expanded > _options.ArchiveMaxUncompressedBytes
-                    || pathDepth > _options.ArchiveMaxPathDepth)
-                    return (false, "压缩归档超过条目、解压大小或层级限制");
-
-                if (IsScriptOrExecutableEntry(name))
-                    return (false, "压缩归档包含脚本或可执行内容");
-
-                if (name.EndsWith("vbaProject.bin", StringComparison.OrdinalIgnoreCase)
-                    || name.EndsWith("/customUI/customUI.xml", StringComparison.OrdinalIgnoreCase))
-                    return (false, "Office 宏或自定义脚本内容被拒绝");
-
-                if (IsNestedArchiveName(name))
-                {
-                    var deeper = InspectNestedArchive(
-                        nestedEntry,
-                        depth + 1,
-                        ref entries,
-                        ref expanded,
-                        cancellationToken);
-                    if (!deeper.Allowed)
-                        return deeper;
-                }
-            }
-
-            return (true, null);
-        }
-        catch (InvalidDataException)
-        {
-            return (false, "嵌套压缩归档结构无效");
-        }
-    }
-
-    private static bool IsNestedArchiveName(string name) =>
+    private static bool IsNestedArchiveName(ReadOnlySpan<char> name) =>
         name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
         || name.EndsWith(".jar", StringComparison.OrdinalIgnoreCase)
         || name.EndsWith(".apk", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsScriptOrExecutableEntry(string name)
+    private static bool IsScriptOrExecutableEntry(ReadOnlySpan<char> name)
     {
-        var extension = Path.GetExtension(name);
-        return DangerousExtensions.Contains(extension)
-               || name.EndsWith("vbaProject.bin", StringComparison.OrdinalIgnoreCase);
+        var extensionStart = name.LastIndexOf('.') + 1;
+        if (extensionStart > 0 && IsDangerousExtension(name[extensionStart..]))
+            return true;
+
+        return name.EndsWith("vbaProject.bin", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static async Task<bool> ContainsTokenAsync(
+    private static int CountPathSeparators(ReadOnlySpan<char> value)
+    {
+        var count = 0;
+        foreach (var character in value)
+        {
+            if (character is '/' or '\\')
+                count++;
+        }
+
+        return count;
+    }
+
+    private static bool IsDangerousExtension(ReadOnlySpan<char> extension)
+        => extension.Equals("exe", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("dll", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("bat", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("cmd", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("com", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("scr", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("msi", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("msp", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("ps1", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("vbs", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("js", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("jse", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("wsf", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("wsh", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("hta", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("apk", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("jar", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("sh", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("bash", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("zsh", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("elf", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("docm", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("dotm", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("xlsm", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("xlam", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("pptm", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("ppam", StringComparison.OrdinalIgnoreCase)
+           || extension.Equals("sldm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// One pass over a PDF. The three tokens are short, non-overlapping
+    /// patterns, so a small state machine preserves matches across read
+    /// boundaries without allocating a combined carry array per chunk.
+    /// </summary>
+    private static async Task<bool> ContainsAnyPdfDangerousTokenAsync(
         Stream content,
-        ReadOnlyMemory<byte> token,
+        byte[] buffer,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[64 * 1024];
-        var carry = Array.Empty<byte>();
+        var javascriptMatched = 0;
+        var openActionMatched = 0;
+        var additionalActionsMatched = 0;
         while (true)
         {
-            var read = await content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            var read = await content.ReadAsync(
+                    buffer.AsMemory(), cancellationToken)
+                .ConfigureAwait(false);
             if (read == 0)
                 return false;
 
-            var combined = new byte[carry.Length + read];
-            carry.CopyTo(combined, 0);
-            Buffer.BlockCopy(buffer, 0, combined, carry.Length, read);
-            if (combined.AsSpan().IndexOf(token.Span) >= 0)
-                return true;
+            unsafe
+            {
+                fixed (byte* input = buffer)
+                fixed (byte* javascript = PdfJavaScriptToken)
+                fixed (byte* openAction = PdfOpenActionToken)
+                fixed (byte* additionalActions = PdfAdditionalActionsToken)
+                {
+                    var current = input;
+                    var end = input + read;
+                    while (current < end)
+                    {
+                        var value = *current++;
+                        javascriptMatched = AdvancePdfToken(
+                            javascript, PdfJavaScriptToken.Length, javascriptMatched, value);
+                        openActionMatched = AdvancePdfToken(
+                            openAction, PdfOpenActionToken.Length, openActionMatched, value);
+                        additionalActionsMatched = AdvancePdfToken(
+                            additionalActions, PdfAdditionalActionsToken.Length,
+                            additionalActionsMatched, value);
 
-            var keep = Math.Min(token.Length - 1, combined.Length);
-            carry = combined[^keep..];
+                        if (javascriptMatched == PdfJavaScriptToken.Length
+                            || openActionMatched == PdfOpenActionToken.Length
+                            || additionalActionsMatched == PdfAdditionalActionsToken.Length)
+                            return true;
+                    }
+                }
+            }
         }
+    }
+
+    private static unsafe int AdvancePdfToken(
+        byte* token,
+        int tokenLength,
+        int matched,
+        byte value)
+    {
+        if (matched < tokenLength && value == token[matched])
+            return matched + 1;
+
+        // All three policy tokens begin with '/' and have no non-trivial
+        // prefix/suffix overlap. This reset still preserves a slash that is
+        // the first byte of a token at the current position.
+        return value == *token ? 1 : 0;
     }
 }

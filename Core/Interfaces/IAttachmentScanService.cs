@@ -35,7 +35,8 @@ public interface IAttachmentScanService
 
     /// <summary>
     /// 续租：仅当本实例仍持有该 LeaseToken 时延长 LeaseExpiresAt。处理大文件期间由 Worker 心跳调用。
-    /// LeaseLost 表示 ownership 已确认转移，Worker 必须立即取消主任务；TransientFailure 不得被误判为丢失。
+    /// LeaseLost 表示 ownership 已确认转移；TransientFailure 表示无法确认
+    /// 仍持有租约，通用 Worker 执行器会取消主任务并等待租约过期重试。
     /// </summary>
     Task<LeaseRenewalResult> RenewLeaseAsync(
         long jobId, string leaseOwner, string leaseToken, CancellationToken cancellationToken = default);

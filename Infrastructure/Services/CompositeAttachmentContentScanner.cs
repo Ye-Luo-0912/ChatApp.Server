@@ -4,8 +4,13 @@ namespace Infrastructure.Services;
 
 public sealed class CompositeAttachmentContentScanner(
     IAttachmentContentScanner policy,
-    IAttachmentContentScanner malware) : IAttachmentContentScanner
+    IAttachmentContentScanner malware) : IAttachmentContentScanner, IAttachmentScannerHealthProbe
 {
+    public Task ProbeAsync(CancellationToken cancellationToken = default)
+        => malware is IAttachmentScannerHealthProbe probe
+            ? probe.ProbeAsync(cancellationToken)
+            : Task.CompletedTask;
+
     public async Task<AttachmentContentScanResult> ScanAsync(
         Stream content,
         string? sniffedContentType,

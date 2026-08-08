@@ -7,6 +7,8 @@ namespace Infrastructure.Services;
 
 /// <summary>
 /// 将过期未绑定 Ticketed/Confirmed 标为 Abandoned，并入队 blob 删除墓碑。
+/// 已经 Abandoned 但上次 tombstone 入队失败的行也会被再次扫描，保证
+/// Realtime 状态更新与 Server DB 删除墓碑之间不会留下不可恢复的空洞。
 /// </summary>
 public sealed class AttachmentAbandonedAgeSweeper(
     IAttachmentMetadataStore metadata,

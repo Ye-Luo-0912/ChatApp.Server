@@ -97,6 +97,24 @@ public sealed class AttachmentStorageOptionsValidator : IValidateOptions<Attachm
             failures.Add("AttachmentStorage:ScanAuditRetentionDays 必须大于 0。");
         }
 
+        if (options.ScanStagingMaxBytes <= 0)
+            failures.Add("AttachmentStorage:ScanStagingMaxBytes 必须大于 0。");
+
+        if (options.ScanMaxConcurrentBytes <= 0)
+            failures.Add("AttachmentStorage:ScanMaxConcurrentBytes 必须大于 0。");
+
+        if (options.MaxBytes > 0 && options.ScanMaxConcurrentBytes < options.MaxBytes)
+            failures.Add("AttachmentStorage:ScanMaxConcurrentBytes 不得小于 MaxBytes。");
+
+        if (options.ScanMaxConcurrentBytes > options.ScanStagingMaxBytes)
+            failures.Add("AttachmentStorage:ScanMaxConcurrentBytes 不得大于 ScanStagingMaxBytes。");
+
+        if (options.TmpfsSizeBytes > 0 && options.ScanStagingMaxBytes > options.TmpfsSizeBytes)
+            failures.Add("AttachmentStorage:ScanStagingMaxBytes 不得大于 TmpfsSizeBytes。");
+
+        if (string.IsNullOrWhiteSpace(options.ScanStagingRoot))
+            failures.Add("AttachmentStorage:ScanStagingRoot 不能为空。");
+
         if (!string.Equals(options.ScannerProvider, "DenyList", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(options.ScannerProvider, "ClamAV", StringComparison.OrdinalIgnoreCase))
         {
