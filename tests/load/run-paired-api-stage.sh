@@ -64,6 +64,28 @@ if [[ -e "$worktree" ]]; then
 fi
 
 git -C "$server_root" worktree add --detach "$worktree" "$baseline_commit"
+
+# Pre-nupkg baselines (P0-7 era) reference the Realtime source tree via
+# ..\ChatApp.RealtimeServices (sln) and $(RealtimeSourcePath) (csproj).
+# Check out the pinned commit as a sibling of the baseline worktree so both
+# resolution forms agree, and export RealtimeSourcePath so every MSBuild
+# invocation (build, ef, run) resolves it.
+if [[ -f "$worktree/Realtime.version" ]]; then
+  realtime_commit=$(grep "^Commit=" "$worktree/Realtime.version" | cut -d= -f2)
+  realtime_repo=$(grep "^Repo=" "$worktree/Realtime.version" | cut -d= -f2)
+  if [[ -z "$realtime_commit" || -z "$realtime_repo" ]]; then
+    echo "Realtime.version is missing Commit= or Repo= in $worktree/Realtime.version" >&2
+    exit 1
+  fi
+  realtime_sibling="$(dirname "$worktree")/ChatApp.RealtimeServices"
+  if [[ ! -d "$realtime_sibling/.git" ]]; then
+    git clone --quiet --no-single-branch "$realtime_repo" "$realtime_sibling"
+  fi
+  git -C "$realtime_sibling" checkout --quiet --force "$realtime_commit"
+  export RealtimeSourcePath="$realtime_sibling"
+  echo "baseline uses RealtimeServices source at $realtime_commit ($realtime_sibling)"
+fi
+
 dotnet build "$worktree/ChatApp.Server.sln" -c Release --nologo
 
 reset_database
