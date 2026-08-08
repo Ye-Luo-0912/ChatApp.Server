@@ -51,6 +51,19 @@ public sealed class TokenFormatValidationTests(RedisTestFixture redis)
         await busB.StartAsync(CancellationToken.None);
         try
         {
+            // 与 AccessTokenL1InvalidationBus 的 ChannelName 保持一致的契约字面量。
+            // 发布是 fire-and-forget：若 revoke 早于订阅完成，消息会丢失。
+            // 因此必须先等待两端订阅就绪，再开始断言路径，避免 CI 慢启动竞态。
+            var channel = RedisChannel.Literal("chatapp:auth:l1:invalidate:v1");
+            var subscriptionDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+            while (instanceAConnection.GetSubscriber().SubscribedEndpoint(channel) is null
+                   || instanceBConnection.GetSubscriber().SubscribedEndpoint(channel) is null)
+            {
+                Assert.True(DateTimeOffset.UtcNow < subscriptionDeadline,
+                    "等待 L1 失效订阅就绪超时");
+                await Task.Delay(25);
+            }
+
             var instanceA = CreateTokenService(busA);
             var instanceB = CreateTokenService(busB);
             var token = instanceA.Generate();
