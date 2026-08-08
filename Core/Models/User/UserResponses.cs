@@ -1,4 +1,4 @@
-﻿using Core.Models.Identity;
+using Core.Models.Identity;
 namespace Core.Models.User;
 public sealed class UserProfileResponse
 {
@@ -13,9 +13,7 @@ public sealed class UserProfileResponse
     public string? Signature { get; init; }
     public string? Region { get; init; }
     public DateTime? Birthday { get; init; }
-    public FriendRequestPolicy FriendRequestPolicy { get; init; }
     public bool AllowBeSearched { get; init; }
-    public bool NotifyFriendRequests { get; init; }
     public bool NotifySecurityEmail { get; init; }
     public bool TwoFactorEnabled { get; init; }
     public DateTimeOffset? DeletionScheduledAt { get; init; }
@@ -37,9 +35,7 @@ public sealed class UserProfileResponse
         Signature     = user.Signature,
         Region        = user.Region,
         Birthday      = user.Birthday,
-        FriendRequestPolicy = user.FriendRequestPolicy,
         AllowBeSearched = user.AllowBeSearched,
-        NotifyFriendRequests = user.NotifyFriendRequests,
         NotifySecurityEmail = user.NotifySecurityEmail,
         TwoFactorEnabled = user.TwoFactorEnabled,
         DeletionScheduledAt = user.DeletionScheduledAt,

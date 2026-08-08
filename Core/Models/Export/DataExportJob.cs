@@ -6,10 +6,16 @@ public static class DataExportJobStatus
     public const string Processing = "Processing";
     public const string Ready = "Ready";
     public const string Failed = "Failed";
+    public const string CancelRequested = "CancelRequested";
+    public const string Cancelled = "Cancelled";
     public const string Consumed = "Consumed";
+    /// <summary>Download was opened; durable deletion is pending completion/timeout.</summary>
+    public const string ConsumedPendingDelete = "ConsumedPendingDelete";
     public const string Expired = "Expired";
     /// <summary>Blob 删除失败后的墓碑：保留 ObjectKey，由 Worker 后台重试删除。</summary>
     public const string PendingDelete = "PendingDelete";
+    /// <summary>Blob 删除达到最大重试次数；保留 ObjectKey 供运维重放或修复。</summary>
+    public const string DeleteDeadLetter = "DeleteDeadLetter";
 }
 
 /// <summary>账号数据导出作业（跨实例持久化）。</summary>
@@ -19,9 +25,11 @@ public sealed class DataExportJob
     public long UserId { get; set; }
     public string Status { get; set; } = DataExportJobStatus.Pending;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset NextAttemptAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? ReadyAt { get; set; }
     public DateTimeOffset? ExpiresAt { get; set; }
     public DateTimeOffset? ConsumedAt { get; set; }
+    public DateTimeOffset? DownloadLeaseUntil { get; set; }
     public string? ObjectKey { get; set; }
     public string? Error { get; set; }
     public string? LeaseOwner { get; set; }

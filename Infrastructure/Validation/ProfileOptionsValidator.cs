@@ -20,10 +20,11 @@ public sealed class ProfileOptionsValidator : IValidateOptions<ProfileOptions>
             return ValidateOptionsResult.Fail("ProfileOptions 不能为 null。");
         }
 
-        if (options.UserNameMinLength < 1)
-        {
-            failures.Add("Profile:UserNameMinLength 必须 >= 1。");
-        }
+        if (options.UserNameMinLength is < 3 or > 32)
+            failures.Add("Profile:UserNameMinLength 必须在 3..32。");
+
+        if (options.UserNameMaxLength is < 3 or > 32)
+            failures.Add("Profile:UserNameMaxLength 必须在 3..32。");
 
         if (options.UserNameMaxLength < options.UserNameMinLength)
         {

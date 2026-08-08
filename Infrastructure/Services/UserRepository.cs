@@ -1,18 +1,30 @@
 using Core.Interfaces;
+using Core.Interfaces.Auth;
 using Core.Models.Common;
 using Core.Models.Identity;
 using Core.Models.Security;
 using Core.Models.User;
 using Infrastructure.Data;
+using Infrastructure.Services.Auth;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Infrastructure.Services;
 
 /// <summary>
 /// 基于 EF Core 的用户数据访问实现。
 /// </summary>
-public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IUserRepository
+public class UserRepository(
+    UserDbContext db,
+    ITsidGenerator tsidGenerator,
+    ISecurityMutationCoordinator? securityMutations = null) : IUserRepository
 {
+    private readonly ISecurityMutationCoordinator _securityMutationCoordinator =
+        securityMutations ?? new SecurityMutationCoordinator(
+            db,
+            new SecurityVersionAdvancer(db),
+            NullLogger<SecurityMutationCoordinator>.Instance);
+
     public async Task<ApplicationUser?> FindByIdAsync(long userId, CancellationToken cancellationToken = default) =>
         await db.Users.FindAsync([userId], cancellationToken);
 
@@ -61,7 +73,8 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
     {
         // Repository queries return tracked users. Let EF persist only changed columns;
         // Update(user) would mark the whole wide row modified and overwrite unrelated concurrent changes.
-        return await db.SaveChangesAsync(cancellationToken) > 0;
+        db.ChangeTracker.DetectChanges();
+        return await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
     // ── 用户搜索：%keyword% 依赖 pg_trgm GIN（见 migration AddPgTrgmSearchIndexes）
@@ -70,10 +83,11 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
     {
         var pageSize = Math.Clamp(limit, 1, 50);
         var safe = searchTerm.Replace("%", @"\%").Replace("_", @"\_");
+        var normalizedTerm = searchTerm.Trim().ToUpperInvariant();
         // 前缀优先走 UserName btree；contains 由 gin_trgm_ops 加速
         var prefix = $"{safe}%";
         var contains = $"%{safe}%";
-        long? cursorId = long.TryParse(cursor, out var c) ? c : null;
+        var hasCursor = SearchCursor.TryDecode(cursor, out var searchCursor);
         var now = DateTimeOffset.UtcNow;
 
         var query = db.Users.AsNoTracking()
@@ -85,18 +99,32 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
                         && (EF.Functions.ILike(u.UserName, prefix)
                             || EF.Functions.ILike(u.UserName, contains)));
 
-        if (cursorId.HasValue)
-            query = query.Where(u => u.Id > cursorId.Value);
+        var scored = query.Select(u => new
+        {
+            User = u,
+            Score = u.NormalizedUserName == normalizedTerm
+                ? 3
+                : u.NormalizedUserName != null && u.NormalizedUserName.StartsWith(normalizedTerm)
+                    ? 2
+                    : 1,
+        });
+        if (hasCursor)
+        {
+            scored = scored.Where(x => x.Score < searchCursor.Score
+                                       || (x.Score == searchCursor.Score && x.User.Id > searchCursor.Id));
+        }
 
-        var rows = await query
-            .OrderBy(u => u.Id)
+        var rows = await scored
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => x.User.Id)
             .Take(pageSize + 1)
-            .Select(u => new PublicUserSearchResult
+            .Select(x => new PublicUserSearchResult
             {
-                Id = u.Id,
-                UserName = u.UserName,
-                AvatarUrl = u.AvatarUrl,
-                Signature = u.Signature,
+                Id = x.User.Id,
+                UserName = x.User.UserName,
+                AvatarUrl = x.User.AvatarUrl,
+                Signature = x.User.Signature,
+                RelevanceScore = x.Score,
             })
             .ToListAsync(cancellationToken);
 
@@ -107,7 +135,9 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
         {
             Items = rows,
             HasMore = hasMore,
-            NextCursor = hasMore && rows.Count > 0 ? rows[^1].Id.ToString() : null,
+            NextCursor = hasMore && rows.Count > 0
+                ? new SearchCursor(rows[^1].RelevanceScore, rows[^1].Id).Encode()
+                : null,
         };
     }
 
@@ -244,7 +274,6 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
             }
 
             user.SecurityStamp = Guid.NewGuid().ToString();
-            user.AdvanceSecurityVersion();
 
             db.AdminAuditLogs.Add(new AdminAuditLog
             {
@@ -257,17 +286,24 @@ public class UserRepository(UserDbContext db, ITsidGenerator tsidGenerator) : IU
                 CreatedAt = DateTimeOffset.UtcNow,
             });
 
-            db.SecurityEvents.Add(new SecurityEvent
+            var mutation = await _securityMutationCoordinator.ExecuteAsync(
+                    userId,
+                    assign ? SecurityEventType.RoleAssigned : SecurityEventType.RoleRemoved,
+                    role.Name,
+                    static _ => Task.CompletedTask,
+                    cancellationToken,
+                    securityEvent =>
+                    {
+                        securityEvent.ActorUserId = actorUserId.ToString();
+                        securityEvent.ClientIp = clientIp;
+                    })
+                .ConfigureAwait(false);
+            if (!mutation.Succeeded)
             {
-                UserId = userId,
-                EventType = assign ? SecurityEventType.RoleAssigned : SecurityEventType.RoleRemoved,
-                ActorUserId = actorUserId.ToString(),
-                Detail = role.Name,
-                ClientIp = clientIp,
-                CreatedAt = DateTimeOffset.UtcNow,
-            });
+                await tx.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return RoleMutationOutcome.SecurityVersionFailed;
+            }
 
-            await db.SaveChangesAsync(cancellationToken);
             await tx.CommitAsync(cancellationToken);
             return RoleMutationOutcome.Success;
         });

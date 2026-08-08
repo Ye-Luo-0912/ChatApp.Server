@@ -1,9 +1,13 @@
-﻿using ChatApp.Server.Models.Requests;
+using ChatApp.Server.Models.Requests;
+using ChatApp.Server.Authorization;
+using ChatApp.Server.Models;
+using ChatApp.Contracts.Http.Sessions;
 using Core.Interfaces;
 using Core.Models.Auth;
+using Core.Models.Export;
 using Core.Models.User;
-using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 
@@ -22,7 +26,8 @@ public class UsersController(
     IAdminAuditQuery adminAuditQuery,
     ITrustedDeviceService trustedDevices,
     IDataExportService dataExport,
-    IDeviceInfo deviceInfo) : BaseApiController
+    IDeviceInfo deviceInfo,
+    IAvatarFinalizationSagaService avatarFinalization) : BaseApiController
 {
     [HttpGet("me")]
     public async Task<IActionResult> GetCurrentUser(CancellationToken cancellationToken)
@@ -70,9 +75,7 @@ public class UsersController(
             Region = model.Region,
             Birthday = model.Birthday,
             Gender = model.Gender,
-            FriendRequestPolicy = model.FriendRequestPolicy,
             AllowBeSearched = model.AllowBeSearched,
-            NotifyFriendRequests = model.NotifyFriendRequests,
             NotifySecurityEmail = model.NotifySecurityEmail,
         }, cancellationToken);
 
@@ -103,6 +106,7 @@ public class UsersController(
 
     [HttpPut("me/avatar/upload")]
     [RequestSizeLimit(3 * 1024 * 1024)]
+    [RequestTimeout("avatar-upload")]
     public async Task<IActionResult> UploadAvatar(
         [FromQuery] string ticket,
         CancellationToken cancellationToken)
@@ -126,10 +130,23 @@ public class UsersController(
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await userAccountService.ConfirmAvatarAsync(
+        var (result, response) = await avatarFinalization.RequestAsync(
             userId, model.ObjectKey, model.Ticket, cancellationToken);
-        if (result is null) return NotFound();
-        return result.Succeeded ? Ok(new { Message = "头像已更新" }) : BadRequest(result.Errors);
+        if (!result.Succeeded)
+            return BadRequest(result.Errors);
+        return Accepted(response);
+    }
+
+    [HttpGet("me/avatar/finalization/{sagaId:long}")]
+    public async Task<IActionResult> GetAvatarFinalization(
+        long sagaId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var status = await avatarFinalization.GetStatusAsync(userId, sagaId, cancellationToken);
+        return status is null ? NotFound() : Ok(status);
     }
 
     [HttpGet("me/security-events")]
@@ -212,7 +229,7 @@ public class UsersController(
             {
                 StepUpToken = token,
                 Purpose = purpose,
-                ExpiresInSeconds = (int)TrustedDeviceService.StepUpTtl.TotalSeconds,
+                ExpiresInSeconds = (int)AuthTimingDefaults.StepUpLifetime.TotalSeconds,
             })
             : BadRequest(result.Errors);
     }
@@ -293,6 +310,7 @@ public class UsersController(
     }
 
     [HttpPost("me/deletion/cancel")]
+    [DeletionPendingAccess]
     public async Task<IActionResult> CancelDeletion(CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
@@ -301,17 +319,38 @@ public class UsersController(
         return result.Succeeded ? Ok(new { Message = "已取消注销" }) : BadRequest(result.Errors);
     }
 
-    [HttpGet("me/export")]
-    public async Task<IActionResult> ExportDataLegacy(CancellationToken cancellationToken)
+    [HttpGet("me/deletion")]
+    [DeletionPendingAccess]
+    public async Task<IActionResult> GetDeletionStatus(CancellationToken cancellationToken)
     {
-        // 保留同步精简导出以兼容旧客户端；完整导出走异步作业。
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
-        var data = await accountLifecycle.ExportAsync(userId, cancellationToken);
-        return data is null ? NotFound() : Ok(data);
+
+        var status = await accountLifecycle.GetDeletionStatusAsync(userId, cancellationToken);
+        return status is null ? NotFound() : Ok(status);
+    }
+
+    [HttpGet("me/export")]
+    [DeletionPendingAccess]
+    public IActionResult ExportDataLegacy()
+    {
+        // Do not keep a synchronous PII export path alive. It bypasses the
+        // asynchronous size/step-up/audit lifecycle and can hold a request
+        // together while the complete user record is materialized. Clients
+        // must use the bounded, audited export-job flow below.
+        Response.Headers["Deprecation"] = "true";
+        Response.Headers["Link"] = "</api/users/me/export/jobs>; rel=alternate";
+        return StatusCode(
+            StatusCodes.Status410Gone,
+            new
+            {
+                Code = "export_endpoint_retired",
+                Message = "同步导出接口已停用，请使用需要二次验证的异步导出作业。",
+            });
     }
 
     [HttpPost("me/export/jobs")]
+    [DeletionPendingAccess]
     [EnableRateLimiting("user-sensitive")]
     public async Task<IActionResult> StartExportJob(
         [FromBody] StepUpRequest? body, CancellationToken cancellationToken)
@@ -326,6 +365,7 @@ public class UsersController(
     }
 
     [HttpGet("me/export/jobs/{jobId}")]
+    [DeletionPendingAccess]
     public async Task<IActionResult> GetExportJob(string jobId, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
@@ -334,7 +374,22 @@ public class UsersController(
         return status is null ? NotFound() : Ok(status);
     }
 
+    [HttpPost("me/export/jobs/{jobId}/cancel")]
+    [DeletionPendingAccess]
+    public async Task<IActionResult> CancelExportJob(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var result = await dataExport.CancelAsync(userId, jobId, cancellationToken);
+        return result.Succeeded ? Ok(new { JobId = jobId, Status = "Cancelled" }) : Conflict(result.Errors);
+    }
+
     [HttpGet("me/export/jobs/{jobId}/download")]
+    [DeletionPendingAccess]
+    [DisableRequestTimeout]
     public async Task<IActionResult> DownloadExportJob(string jobId, CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
@@ -349,7 +404,15 @@ public class UsersController(
             });
         }
 
-        return File(stream, "application/json", fileName);
+        // The job is consumed when this download is successfully opened. The
+        // stream remains durable/lease-protected until disposed, and the
+        // response supports range processing when the provider exposes a
+        // seekable stream.
+        return File(
+            stream,
+            "application/json",
+            fileName,
+            enableRangeProcessing: true);
     }
 
     private static string MapExportDownloadError(string? code) => code switch
@@ -359,6 +422,7 @@ public class UsersController(
         DataExportDownloadErrors.Expired => "导出已过期",
         DataExportDownloadErrors.NotReady => "导出尚未就绪",
         DataExportDownloadErrors.BlobMissing => "导出文件缺失",
+        DataExportDownloadErrors.Cancelled => "导出已取消",
         _ => "无法下载",
     };
 
@@ -377,6 +441,52 @@ public class UsersController(
         return result.Succeeded
             ? Ok(new { Message = "验证码已发送至新邮箱" })
             : BadRequest(result.Errors);
+    }
+
+    [HttpPost("me/phone/request-change")]
+    [EnableRateLimiting("user-sensitive")]
+    public async Task<IActionResult> RequestPhoneChange(
+        [FromBody] RequestPhoneChangeRequest model, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var result = await userAccountService.RequestPhoneChangeAsync(
+            userId, model.NewPhoneNumber, cancellationToken);
+        if (result is null)
+            return NotFound();
+        return result.Succeeded
+            ? Ok(new { Message = "验证码已发送" })
+            : BadRequest(result.Errors);
+    }
+
+    [HttpPost("me/phone/confirm-change")]
+    [EnableRateLimiting("user-sensitive")]
+    public async Task<IActionResult> ConfirmPhoneChange(
+        [FromBody] ConfirmPhoneChangeRequest model, CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var result = await userAccountService.ConfirmPhoneChangeAsync(
+            userId, model.Code, cancellationToken);
+        if (result is null)
+            return NotFound();
+        return result.Succeeded
+            ? Ok(new { Message = "手机号已验证，所有会话已失效，请重新登录" })
+            : BadRequest(result.Errors);
+    }
+
+    [HttpPost("me/phone/cancel-change")]
+    public async Task<IActionResult> CancelPhoneChange(CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+
+        var result = await userAccountService.CancelPhoneChangeAsync(userId, cancellationToken);
+        if (result is null)
+            return NotFound();
+        return result.Succeeded ? Ok(new { Message = "已取消手机号变更" }) : BadRequest(result.Errors);
     }
 
     [HttpPost("me/email/confirm-change")]
@@ -414,12 +524,28 @@ public class UsersController(
         if (!TryGetCurrentUserId(out var userId))
             return Unauthorized();
 
-        var result = await userAccountService.ChangePasswordAsync(
-            userId, model.CurrentPassword, model.NewPassword, cancellationToken);
+        var sessionId = User.FindFirst(Core.Models.Auth.AuthClaimTypes.SessionId)?.Value;
+        var result = await userAccountService.ChangePasswordWithSessionAsync(
+            userId,
+            model.CurrentPassword,
+            model.NewPassword,
+            model.RefreshToken,
+            sessionId,
+            cancellationToken);
         if (result is null)
             return NotFound();
 
-        return result.Succeeded ? Ok(result) : BadRequest(result.Errors);
+        if (!result.Succeeded)
+            return BadRequest(result.Errors);
+
+        return Ok(new
+        {
+            Message = result.RequiresRelogin
+                ? "密码已修改，请重新登录"
+                : "密码已修改，当前会话已安全续签",
+            RequiresRelogin = result.RequiresRelogin,
+            Tokens = result.Tokens,
+        });
     }
 
     [HttpGet("me/sessions")]
@@ -430,7 +556,7 @@ public class UsersController(
 
         var sessions = await userAccountService.ListSessionsAsync(
             userId, deviceInfo.GetDeviceId(), cancellationToken);
-        return Ok(sessions);
+        return Ok(sessions.Select(HttpContractMapper.ToHttpContract).ToArray());
     }
 
     [HttpDelete("me/sessions/{deviceId}")]
@@ -457,10 +583,10 @@ public class UsersController(
             return BadRequest(new { Message = "缺少当前设备标识" });
 
         var count = await userAccountService.RevokeOtherSessionsAsync(userId, currentDevice, cancellationToken);
-        return Ok(new { Revoked = count });
+        return Ok(new RevokeSessionsResponse { Revoked = count });
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpDelete("{userId:long}")]
     public async Task<IActionResult> DeleteUser(long userId, CancellationToken cancellationToken)
     {
@@ -478,12 +604,12 @@ public class UsersController(
             ? Accepted(new
             {
                 Message = "用户已进入注销冷静期",
-                ScheduledAfter = AccountLifecycleService.CoolDown,
+                ScheduledAfter = AuthTimingDefaults.AccountDeletionCooldown,
             })
             : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpGet("admin/disabled")]
     public async Task<IActionResult> ListDisabled(
         [FromQuery] string? cursor = null,
@@ -491,7 +617,7 @@ public class UsersController(
         CancellationToken cancellationToken = default)
         => Ok(await userAccountService.ListDisabledUsersAsync(cursor, limit, cancellationToken));
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpPost("{userId:long}/disable")]
     public async Task<IActionResult> DisableUser(
         long userId, [FromBody] AdminReasonRequest? body, CancellationToken cancellationToken)
@@ -506,7 +632,7 @@ public class UsersController(
         return result.Succeeded ? Ok(new { Message = "用户已禁用" }) : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpPost("{userId:long}/enable")]
     public async Task<IActionResult> EnableUser(
         long userId, [FromBody] AdminReasonRequest? body, CancellationToken cancellationToken)
@@ -521,7 +647,7 @@ public class UsersController(
         return result.Succeeded ? Ok(new { Message = "用户已启用" }) : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpPost("{userId:long}/force-logout")]
     public async Task<IActionResult> ForceLogout(
         long userId, [FromBody] AdminReasonRequest? body, CancellationToken cancellationToken)
@@ -533,7 +659,7 @@ public class UsersController(
         return Ok(new { Revoked = count });
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpDelete("{userId:long}/roles/{roleName}")]
     public async Task<IActionResult> RemoveRole(
         long userId, string roleName, [FromBody] RemoveRoleRequest? body, CancellationToken cancellationToken)
@@ -547,7 +673,7 @@ public class UsersController(
         return result.Succeeded ? Ok(new { Message = "角色已移除，相关会话已失效" }) : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpPost("{userId:long}/roles")]
     public async Task<IActionResult> AssignRole(
         long userId, [FromBody] AssignRoleRequest body, CancellationToken cancellationToken)
@@ -561,7 +687,7 @@ public class UsersController(
         return result.Succeeded ? Ok(new { Message = "角色已分配，相关会话已失效" }) : BadRequest(result.Errors);
     }
 
-    [Authorize(Roles = "Admin")]
+    [Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
     [HttpGet("admin/audit-logs")]
     public async Task<IActionResult> QueryAuditLogs(
         [FromQuery] long? adminUserId = null,

@@ -100,7 +100,7 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         Assert.NotNull(ready);
         Assert.Equal(DataExportJobStatus.Ready, ready!.Status);
         Assert.False(string.IsNullOrWhiteSpace(ready.ObjectKey));
-        Assert.StartsWith($"{user.Id}/{jobId}-", ready.ObjectKey);
+        Assert.StartsWith($"candidates/{user.Id}/{jobId}-", ready.ObjectKey);
         Assert.NotEqual($"{user.Id}/{jobId}.json", ready.ObjectKey);
 
         var onDisk = await File.ReadAllBytesAsync(Path.Combine(root, ready.ObjectKey!.Replace('/', Path.DirectorySeparatorChar)));
@@ -153,11 +153,12 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             {
                 seed.DataExportJobs.Add(new DataExportJob
                 {
-                    Id = ids[i],
-                    UserId = new TsidGeneratorService().GenerateTsid(),
-                    Status = DataExportJobStatus.Pending,
-                    CreatedAt = now.AddMilliseconds(i),
-                });
+                Id = ids[i],
+                UserId = new TsidGeneratorService().GenerateTsid(),
+                Status = DataExportJobStatus.Pending,
+                CreatedAt = now.AddMilliseconds(i),
+                NextAttemptAt = now,
+            });
             }
             await seed.SaveChangesAsync();
         }
@@ -192,6 +193,50 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
                 .ExecuteDeleteAsync();
         }
     }
+
+    [SkippableFact]
+    public async Task ClaimOneNpgsql_ReclaimsExpiredCancelRequested_WithoutResumingExport()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        var id = Guid.NewGuid().ToString("N");
+        var now = DateTimeOffset.UtcNow;
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.DataExportJobs.Add(new DataExportJob
+            {
+                Id = id,
+                UserId = new TsidGeneratorService().GenerateTsid(),
+                Status = DataExportJobStatus.CancelRequested,
+                CreatedAt = now.AddMinutes(-1),
+                NextAttemptAt = now.AddMinutes(-1),
+                LeaseUntil = now.AddMinutes(-1),
+            });
+            await seed.SaveChangesAsync();
+        }
+
+        try
+        {
+            await using var db = postgres.CreateContext();
+            var claim = await DataExportWorker.ClaimOneNpgsqlAsync(
+                db,
+                "cancel-recovery-test",
+                Guid.NewGuid().ToString("N"),
+                now,
+                now.AddMinutes(2),
+                CancellationToken.None);
+
+            Assert.NotNull(claim);
+            Assert.Equal(id, claim!.Value.Job.Id);
+            Assert.Equal(DataExportJobStatus.CancelRequested, claim.Value.Job.Status);
+        }
+        finally
+        {
+            await using var cleanup = postgres.CreateContext();
+            await cleanup.DataExportJobs.Where(job => job.Id == id).ExecuteDeleteAsync();
+        }
+    }
+
     [SkippableFact]
     public async Task Export_OpenDownload_AllowsRetry_WhenBlobMissing()
     {
@@ -344,6 +389,137 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         await worker.StopAsync(CancellationToken.None);
         Assert.False(await db.DataExportJobs.AnyAsync(j => j.Id == jobId));
         Assert.False(File.Exists(Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar))));
+    }
+
+    [SkippableFact]
+    public async Task ConsumedPendingDelete_WorkerRetry_PreservesConsumedRow()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var user = await SeedAsync(db, "Passw0rd!");
+        var root = Path.Combine(Path.GetTempPath(), "chatapp-export-tests", Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new DataExportStorageOptions
+        {
+            LocalRootPath = root,
+            LeaseSeconds = 60,
+            PollIntervalMilliseconds = 100,
+            JobTtlHours = 24,
+            CleanupIntervalMinutes = 1,
+        });
+        var blob = CreateBlobStore(opts);
+        var objectKey = $"{user.Id}/consumed-retry-del.json";
+        await using (var ms = new MemoryStream("{}"u8.ToArray()))
+            await blob.WriteAsync(objectKey, ms);
+
+        var jobId = Guid.NewGuid().ToString("N");
+        db.DataExportJobs.Add(new DataExportJob
+        {
+            Id = jobId,
+            UserId = user.Id,
+            Status = DataExportJobStatus.ConsumedPendingDelete,
+            CreatedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            ObjectKey = objectKey,
+            ConsumedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            DownloadLeaseUntil = DateTimeOffset.UtcNow.AddMinutes(-1),
+            AttemptCount = 1,
+        });
+        await db.SaveChangesAsync();
+
+        var factory = new ExportTestScopeFactory(postgres, CreateTokenSessions(), blob, opts);
+        var worker = new DataExportWorker(
+            factory,
+            opts,
+            Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4, DataExport = 2 }),
+            new WorkerConcurrencyManager(Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4 })),
+            NullLogger<DataExportWorker>.Instance);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await worker.StartAsync(cts.Token);
+
+        DataExportJob? completed = null;
+        for (var i = 0; i < 40; i++)
+        {
+            db.ChangeTracker.Clear();
+            completed = await db.DataExportJobs.AsNoTracking()
+                .SingleOrDefaultAsync(j => j.Id == jobId, cts.Token);
+            if (completed?.Status == DataExportJobStatus.Consumed)
+                break;
+            await Task.Delay(200, cts.Token);
+        }
+
+        await worker.StopAsync(CancellationToken.None);
+        Assert.NotNull(completed);
+        Assert.Equal(DataExportJobStatus.Consumed, completed!.Status);
+        Assert.Null(completed.ObjectKey);
+        Assert.False(File.Exists(Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar))));
+    }
+
+    [SkippableFact]
+    public async Task PendingDelete_ExpiredLease_ConsumesClaimAttempt_AndDeadLetters()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
+        await using var db = postgres.CreateContext();
+        var user = await SeedAsync(db, "Passw0rd!");
+        var root = Path.Combine(Path.GetTempPath(), "chatapp-export-tests", Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new DataExportStorageOptions
+        {
+            LocalRootPath = root,
+            LeaseSeconds = 60,
+            PollIntervalMilliseconds = 100,
+            CleanupIntervalMinutes = 1,
+            MaxBlobDeleteAttempts = 2,
+        });
+        var realBlob = CreateBlobStore(opts);
+        var objectKey = user.Id + "/reclaim-dead-letter.json";
+        await using (var ms = new MemoryStream("{}"u8.ToArray()))
+            await realBlob.WriteAsync(objectKey, ms);
+
+        var jobId = Guid.NewGuid().ToString("N");
+        db.DataExportJobs.Add(new DataExportJob
+        {
+            Id = jobId,
+            UserId = user.Id,
+            Status = DataExportJobStatus.PendingDelete,
+            CreatedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            NextAttemptAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ObjectKey = objectKey,
+            AttemptCount = 1,
+            LeaseOwner = "crashed-export-delete",
+            LeaseToken = "crashed-lease",
+            LeaseUntil = DateTimeOffset.UtcNow.AddMinutes(-1),
+        });
+        await db.SaveChangesAsync();
+
+        var failing = new FailingDeleteBlobStore(realBlob);
+        var factory = new ExportTestScopeFactory(postgres, CreateTokenSessions(), failing, opts);
+        var worker = new DataExportWorker(
+            factory,
+            opts,
+            Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4, DataExport = 1 }),
+            new WorkerConcurrencyManager(Options.Create(new WorkerConcurrencyOptions { GlobalMaxConcurrency = 4 })),
+            NullLogger<DataExportWorker>.Instance);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await worker.StartAsync(cts.Token);
+
+        DataExportJob? dead = null;
+        for (var i = 0; i < 40; i++)
+        {
+            db.ChangeTracker.Clear();
+            dead = await db.DataExportJobs.AsNoTracking()
+                .SingleOrDefaultAsync(j => j.Id == jobId, cts.Token);
+            if (dead?.Status == DataExportJobStatus.DeleteDeadLetter)
+                break;
+            await Task.Delay(200, cts.Token);
+        }
+
+        await worker.StopAsync(CancellationToken.None);
+        Assert.NotNull(dead);
+        Assert.Equal(DataExportJobStatus.DeleteDeadLetter, dead!.Status);
+        Assert.Equal(2, dead.AttemptCount);
+        Assert.True(File.Exists(Path.Combine(root, objectKey.Replace('/', Path.DirectorySeparatorChar))));
     }
 
     [Fact]
@@ -605,6 +781,59 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
         Assert.Contains("ok", await reader.ReadToEndAsync(), StringComparison.Ordinal);
     }
 
+    [SkippableFact]
+    public async Task OpenDownload_ShortJobId_UsesSafeFileName()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+        await using var db = postgres.CreateContext();
+        var user = await SeedAsync(db, "Passw0rd!");
+        var userId = user.Id;
+
+        var root = Path.Combine(Path.GetTempPath(), "chatapp-export-tests", Guid.NewGuid().ToString("N"));
+        var exportOptions = Options.Create(new DataExportStorageOptions
+        {
+            LocalRootPath = root,
+            EncryptAtRest = false,
+        });
+        var blob = CreateBlobStore(exportOptions);
+        const string objectKey = "42/short.json";
+        await using (var content = new MemoryStream("{}"u8.ToArray()))
+            await blob.WriteAsync(objectKey, content);
+
+        db.DataExportJobs.Add(new DataExportJob
+        {
+            Id = "short",
+            UserId = userId,
+            Status = DataExportJobStatus.Ready,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ReadyAt = DateTimeOffset.UtcNow,
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            ObjectKey = objectKey,
+        });
+        await db.SaveChangesAsync();
+
+        try
+        {
+            var service = new DataExportService(
+                db,
+                trustedDevices: null!,
+                blobStore: blob,
+                options: exportOptions,
+                scopeFactory: null!,
+                logger: NullLogger<DataExportService>.Instance);
+
+            var (stream, fileName, error) = await service.OpenDownloadAsync(userId, "short");
+            Assert.Null(error);
+            Assert.Equal($"chatapp-export-{userId}-short.json", fileName);
+            Assert.NotNull(stream);
+            stream!.Dispose();
+        }
+        finally
+        {
+            await db.DataExportJobs.Where(j => j.Id == "short").ExecuteDeleteAsync();
+        }
+    }
+
     private sealed class FailingDeleteBlobStore(IDataExportBlobStore inner) : IDataExportBlobStore
     {
         public Task WriteAsync(string objectKey, Stream content, CancellationToken cancellationToken = default)
@@ -642,7 +871,6 @@ public sealed class DataExportPersistenceTests(PostgresTestFixture postgres, Red
             NullLogger<MfaService>.Instance);
         return new TrustedDeviceService(
             db,
-            security,
             hasher,
             mfa,
             redis.Cache,

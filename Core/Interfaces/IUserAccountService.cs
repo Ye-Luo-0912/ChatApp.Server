@@ -37,7 +37,31 @@ public interface IUserAccountService
 
     Task<AuthOperationResult?> CancelEmailChangeAsync(long userId, CancellationToken cancellationToken = default);
 
+    Task<AuthOperationResult?> RequestPhoneChangeAsync(
+        long userId, string newPhoneNumber, CancellationToken cancellationToken = default);
+
+    Task<AuthOperationResult?> ConfirmPhoneChangeAsync(
+        long userId, string code, CancellationToken cancellationToken = default);
+
+    Task<AuthOperationResult?> CancelPhoneChangeAsync(
+        long userId, CancellationToken cancellationToken = default);
+
     Task<AuthOperationResult?> ChangePasswordAsync(long userId, string currentPassword, string newPassword, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Changes the password and, when the caller supplies the refresh token
+    /// belonging to the current authenticated session, atomically reissues
+    /// that session after the security fence advances. Other sessions are
+    /// revoked durably. A null token result means the mutation succeeded but
+    /// the client must log in again.
+    /// </summary>
+    Task<SecurityMutationResponse?> ChangePasswordWithSessionAsync(
+        long userId,
+        string currentPassword,
+        string newPassword,
+        string? currentRefreshToken,
+        string? currentSessionId,
+        CancellationToken cancellationToken = default);
 
     Task<AuthOperationResult?> DisableAsync(long userId, string? reason, long? actorUserId, CancellationToken cancellationToken = default);
 
@@ -53,7 +77,7 @@ public interface IUserAccountService
         long userId, string roleName, long actorUserId, string? reason, bool confirmSelfDemotion = false,
         CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyList<SessionDeviceDto>> ListSessionsAsync(long userId, string? currentDeviceId, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<SessionDeviceProjection>> ListSessionsAsync(long userId, string? currentDeviceId, CancellationToken cancellationToken = default);
 
     Task RevokeSessionAsync(long userId, string deviceId, CancellationToken cancellationToken = default);
 

@@ -1,5 +1,5 @@
+using Core.Interfaces;
 using Core.Models.Export;
-using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -11,7 +11,7 @@ namespace ChatApp.Server.Controllers;
 /// <c>attachment.pending_delete</c> / <c>attachment.pending_scan</c>（meter: Infrastructure.Attachments）。
 /// </summary>
 [ApiController]
-[Authorize(Roles = "Admin")]
+[Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
 [Route("api/admin/ops")]
 public sealed class OpsController(IAttachmentOpsAdminService ops) : ControllerBase
 {

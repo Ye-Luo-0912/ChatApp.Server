@@ -467,6 +467,53 @@ public sealed class AccountCleanupSagaService(
         };
     }
 
+    public async Task<IReadOnlyList<AccountCleanupDeadLetterDto>> ListDeadLettersAsync(
+        int offset = 0,
+        int limit = 50,
+        CancellationToken cancellationToken = default)
+    {
+        offset = Math.Max(0, offset);
+        limit = Math.Clamp(limit, 1, 200);
+
+        return await db.AccountCleanupDeadLetters
+            .AsNoTracking()
+            .OrderByDescending(x => x.Id)
+            .Skip(offset)
+            .Take(limit)
+            .Select(x => new AccountCleanupDeadLetterDto(
+                x.Id,
+                x.EventId,
+                x.UserId,
+                x.ReasonCode,
+                x.Reason,
+                x.DeliveryCount,
+                x.CreatedAt))
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<AccountCleanupDeadLetterDto?> GetDeadLetterAsync(
+        long id,
+        CancellationToken cancellationToken = default)
+    {
+        if (id <= 0)
+            return null;
+
+        return await db.AccountCleanupDeadLetters
+            .AsNoTracking()
+            .Where(x => x.Id == id)
+            .Select(x => new AccountCleanupDeadLetterDto(
+                x.Id,
+                x.EventId,
+                x.UserId,
+                x.ReasonCode,
+                x.Reason,
+                x.DeliveryCount,
+                x.CreatedAt))
+            .SingleOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     public static string? TryGetSourceEventId(string completedEventId)
     {
         if (completedEventId.StartsWith(CompletedEventIdPrefix, StringComparison.Ordinal))

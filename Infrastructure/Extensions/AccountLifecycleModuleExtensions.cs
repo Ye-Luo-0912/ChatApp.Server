@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Integration;
 using Core.Interfaces;
+using Core.Models.Export;
 using Core.Settings;
 using Infrastructure.Services;
 using Infrastructure.Validation;
@@ -25,9 +26,13 @@ public static class AccountLifecycleModuleExtensions
         services.AddValidatedOptions<DataExportStorageOptions, DataExportStorageOptionsValidator>(
             config, DataExportStorageOptions.SectionName);
 
-        services.AddScoped<IAccountLifecycleService, AccountLifecycleService>();
+        services.AddScoped<AccountLifecycleService>();
+        services.AddScoped<IAccountLifecycleService>(
+            sp => sp.GetRequiredService<AccountLifecycleService>());
+        services.AddSingleton<ILeasedJobStore<AccountDeletionJob>, AccountDeletionJobStore>();
         services.AddScoped<AccountCleanupSagaService>();
         services.AddScoped<IAccountCleanupSagaService>(sp => sp.GetRequiredService<AccountCleanupSagaService>());
+        services.AddScoped<IDeadLetterAdminService, DeadLetterAdminService>();
         services.AddScoped<IUserRepository, UserRepository>();
         services.AddScoped<IUserAccountService, UserAccountService>();
         if (registerWorkerHostedServices)
@@ -60,14 +65,30 @@ public static class AccountLifecycleModuleExtensions
                     sp.GetRequiredService<IOptions<MessageEvidenceOptions>>(),
                     sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
                     sp.GetRequiredService<ILogger<RealtimeChatExportReader>>(),
-                    bus);
+                    bus,
+                    sp.GetRequiredService<RealtimePostgresDataSource>());
             }
 
             return new UnavailableRealtimeChatExportReader();
         });
         services.AddScoped<IDataExportService, DataExportService>();
+        services.AddSingleton<DataExportStagingBudget>();
+        services.AddSingleton<DataExportJobStore>();
+        services.AddSingleton<ILeasedJobStore<DataExportJob>>(sp =>
+            sp.GetRequiredService<DataExportJobStore>());
         if (registerWorkerHostedServices)
-            services.AddHostedService<DataExportWorker>();
+        {
+            // DataExportWorker keeps a legacy test/factory constructor for
+            // focused tests. Resolve the production kernel explicitly so the
+            // default DI constructor selector can never see two candidates.
+            services.AddHostedService(sp => new DataExportWorker(
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<DataExportJobStore>(),
+                sp.GetRequiredService<Infrastructure.Diagnostics.LeasedJobExecutor<DataExportJob>>(),
+                sp.GetRequiredService<IOptions<DataExportStorageOptions>>(),
+                sp.GetRequiredService<IOptions<WorkerConcurrencyOptions>>(),
+                sp.GetRequiredService<ILogger<DataExportWorker>>()));
+        }
 
         return services;
     }

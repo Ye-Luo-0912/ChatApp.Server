@@ -57,4 +57,13 @@ public interface IAccountCleanupSagaService
         int offset,
         int limit,
         CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<AccountCleanupDeadLetterDto>> ListDeadLettersAsync(
+        int offset = 0,
+        int limit = 50,
+        CancellationToken cancellationToken = default);
+
+    Task<AccountCleanupDeadLetterDto?> GetDeadLetterAsync(
+        long id,
+        CancellationToken cancellationToken = default);
 }

@@ -1,11 +1,9 @@
 using System.Security.Claims;
+using Core.Interfaces;
 using Core.Models.Export;
 using Core.Models.Security;
-using Infrastructure.Data;
-using Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
 
 namespace ChatApp.Server.Controllers;
 
@@ -14,11 +12,11 @@ namespace ChatApp.Server.Controllers;
 /// 查看积压、死信失败原因与重试次数，并支持安全重放（仅 Dead → Pending）。
 /// </summary>
 [ApiController]
-[Authorize(Roles = "Admin")]
+[Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
 [Route("api/admin/realtime-outbox")]
 public sealed class RealtimeOutboxAdminController(
     IRealtimeOutboxAdminService outbox,
-    UserDbContext db) : ControllerBase
+    IAdminAuditWriter auditWriter) : ControllerBase
 {
     /// <summary>积压与死信汇总（含最老 Pending 年龄）。</summary>
     [HttpGet("summary")]
@@ -61,12 +59,13 @@ public sealed class RealtimeOutboxAdminController(
         var (ok, error) = await outbox.ReplayDeadAsync(eventId, cancellationToken);
         if (ok)
         {
-            await WriteAuditAsync(
+            await auditWriter.WriteAsync(
                 adminId,
                 before?.TargetUserId,
                 "RealtimeOutboxReplay",
                 body?.Reason,
                 $"eventId={eventId};beforeStatus={before?.StatusName ?? "unknown"};afterStatus=Pending",
+                HttpContext.Connection.RemoteIpAddress?.ToString(),
                 cancellationToken);
             return Ok(new { eventId, status = "pending" });
         }
@@ -95,12 +94,13 @@ public sealed class RealtimeOutboxAdminController(
             return BadRequest(new { error = "empty_event_ids" });
 
         var result = await outbox.ReplayDeadBatchAsync(ids, cancellationToken);
-        await WriteAuditAsync(
+        await auditWriter.WriteAsync(
             adminId,
             targetUserId: null,
             "RealtimeOutboxReplayBatch",
             body.Reason,
             $"requested={result.Requested};replayed={result.Replayed};skipped={result.Skipped.Count}",
+            HttpContext.Connection.RemoteIpAddress?.ToString(),
             cancellationToken);
         return Ok(result);
     }
@@ -115,24 +115,4 @@ public sealed class RealtimeOutboxAdminController(
         return long.TryParse(raw, out adminId);
     }
 
-    private async Task WriteAuditAsync(
-        long adminId,
-        long? targetUserId,
-        string action,
-        string? reason,
-        string detail,
-        CancellationToken cancellationToken)
-    {
-        db.AdminAuditLogs.Add(new AdminAuditLog
-        {
-            AdminUserId = adminId,
-            TargetUserId = targetUserId,
-            Action = action,
-            Reason = reason,
-            Detail = detail,
-            ClientIp = HttpContext.Connection.RemoteIpAddress?.ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-        });
-        await db.SaveChangesAsync(cancellationToken);
-    }
 }

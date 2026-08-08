@@ -1,24 +1,21 @@
 using System.Security.Claims;
 using Core.Interfaces;
 using Core.Models.Export;
-using Core.Models.Security;
-using Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.EntityFrameworkCore;
 
 namespace ChatApp.Server.Controllers;
 
 /// <summary>
 /// 账号注销清理状态与修复中心（管理员）。
-/// 鉴权：<c>[Authorize(Roles = "Admin")]</c>（与 EmailOutbox / Users 管理端一致）。
+/// 鉴权：权威 Admin 策略（与 EmailOutbox / Users 管理端一致）。
 /// </summary>
 [ApiController]
-[Authorize(Roles = "Admin")]
+[Authorize(Policy = ChatApp.Server.Authorization.AuthoritativeAdminAuthorization.PolicyName)]
 [Route("api/admin/account-cleanup-saga")]
 public sealed class AccountCleanupSagaAdminController(
-    UserDbContext db,
-    IAccountCleanupSagaService sagaService) : ControllerBase
+    IAccountCleanupSagaService sagaService,
+    IAdminAuditWriter auditWriter) : ControllerBase
 {
     /// <summary>
     /// 列表：status=Pending|Completed|Failed|DeadLetter；可选 userId；offset/limit 分页。
@@ -62,23 +59,7 @@ public sealed class AccountCleanupSagaAdminController(
         [FromQuery] int offset = 0,
         CancellationToken cancellationToken = default)
     {
-        limit = Math.Clamp(limit, 1, 200);
-        offset = Math.Max(0, offset);
-        var items = await db.AccountCleanupDeadLetters.AsNoTracking()
-            .OrderByDescending(x => x.Id)
-            .Skip(offset)
-            .Take(limit)
-            .Select(x => new
-            {
-                x.Id,
-                x.EventId,
-                x.UserId,
-                x.ReasonCode,
-                x.Reason,
-                x.DeliveryCount,
-                x.CreatedAt,
-            })
-            .ToListAsync(cancellationToken);
+        var items = await sagaService.ListDeadLettersAsync(offset, limit, cancellationToken);
         return Ok(items);
     }
 
@@ -98,12 +79,13 @@ public sealed class AccountCleanupSagaAdminController(
         var result = await sagaService.TryReplayAsync(userId, cancellationToken);
         if (result.Outcome == AccountCleanupReplayOutcome.Replayed)
         {
-            await WriteAuditAsync(
+            await auditWriter.WriteAsync(
                 adminId,
                 userId,
                 "AccountCleanupSagaReplay",
                 body?.Reason,
                 $"beforeStatus={before?.SagaStatus ?? "none"};afterStatus={result.Item?.SagaStatus ?? "Pending"};outcome={result.Outcome}",
+                HttpContext.Connection.RemoteIpAddress?.ToString(),
                 cancellationToken);
         }
 
@@ -131,12 +113,13 @@ public sealed class AccountCleanupSagaAdminController(
         if (result.Outcome is not (AccountCleanupReconcileOutcome.NotFound
             or AccountCleanupReconcileOutcome.InvalidUser))
         {
-            await WriteAuditAsync(
+            await auditWriter.WriteAsync(
                 adminId,
                 userId,
                 "AccountCleanupSagaReconcile",
                 body?.Reason,
                 $"beforeStatus={before?.SagaStatus ?? "none"};outcome={result.Outcome};afterStatus={result.Item?.SagaStatus ?? "n/a"}",
+                HttpContext.Connection.RemoteIpAddress?.ToString(),
                 cancellationToken);
         }
 
@@ -158,8 +141,7 @@ public sealed class AccountCleanupSagaAdminController(
         if (!TryGetAdminId(out var adminId))
             return Unauthorized();
 
-        var dlq = await db.AccountCleanupDeadLetters.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+        var dlq = await sagaService.GetDeadLetterAsync(id, cancellationToken);
         if (dlq is null)
             return NotFound(new { Message = "未找到死信" });
 
@@ -167,12 +149,13 @@ public sealed class AccountCleanupSagaAdminController(
         var result = await sagaService.TryReplayAsync(dlq.UserId, cancellationToken);
         if (result.Outcome == AccountCleanupReplayOutcome.Replayed)
         {
-            await WriteAuditAsync(
+            await auditWriter.WriteAsync(
                 adminId,
                 dlq.UserId,
                 "AccountCleanupSagaReplayFromDeadLetter",
                 body?.Reason,
                 $"deadLetterId={id};beforeStatus={before?.SagaStatus ?? "none"};outcome={result.Outcome}",
+                HttpContext.Connection.RemoteIpAddress?.ToString(),
                 cancellationToken);
         }
 
@@ -193,24 +176,4 @@ public sealed class AccountCleanupSagaAdminController(
         return long.TryParse(raw, out adminId);
     }
 
-    private async Task WriteAuditAsync(
-        long adminId,
-        long? targetUserId,
-        string action,
-        string? reason,
-        string detail,
-        CancellationToken cancellationToken)
-    {
-        db.AdminAuditLogs.Add(new AdminAuditLog
-        {
-            AdminUserId = adminId,
-            TargetUserId = targetUserId,
-            Action = action,
-            Reason = reason,
-            Detail = detail,
-            ClientIp = HttpContext.Connection.RemoteIpAddress?.ToString(),
-            CreatedAt = DateTimeOffset.UtcNow,
-        });
-        await db.SaveChangesAsync(cancellationToken);
-    }
 }

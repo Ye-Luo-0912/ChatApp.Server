@@ -1,0 +1,17 @@
+{
+  "Rules": [
+    {
+      "ID": "delete-unpublished-export-candidates",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "candidates/"
+      },
+      "Expiration": {
+        "Days": 8
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}

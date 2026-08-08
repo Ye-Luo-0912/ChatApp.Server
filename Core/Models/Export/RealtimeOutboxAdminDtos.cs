@@ -31,3 +31,8 @@ public sealed record RealtimeOutboxListResponse(
     int Offset,
     int Limit,
     int Returned);
+
+public sealed record RealtimeOutboxBatchReplayResult(
+    int Requested,
+    int Replayed,
+    IReadOnlyList<string> Skipped);

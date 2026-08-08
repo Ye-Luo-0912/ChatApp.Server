@@ -12,9 +12,19 @@ public sealed class DataExportStorageOptions
 
     public int JobTtlHours { get; set; } = 24;
     public int LeaseSeconds { get; set; } = 120;
+    /// <summary>Maximum time a download stream may remain open before cleanup proceeds.</summary>
+    public int DownloadLeaseSeconds { get; set; } = 900;
+    /// <summary>单个导出作业的最大执行尝试次数。</summary>
+    public int MaxJobAttempts { get; set; } = 5;
     public int PollIntervalMilliseconds { get; set; } = 2000;
     /// <summary>过期作业与 blob 清理周期（分钟）。</summary>
     public int CleanupIntervalMinutes { get; set; } = 15;
+
+    /// <summary>本地 staging 目录的硬上限；S3 模式也需要该目录承载流式分段。</summary>
+    public long StagingMaxBytes { get; set; } = 4L * 1024 * 1024 * 1024;
+
+    /// <summary>单个用户导出的最终 JSON 上限。</summary>
+    public long MaxExportBytes { get; set; } = 1L * 1024 * 1024 * 1024;
 
     /// <summary>PendingDelete 墓碑最大重试次数（超过后仍保留行并继续打点告警）。</summary>
     public int MaxBlobDeleteAttempts { get; set; } = 20;

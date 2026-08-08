@@ -47,6 +47,16 @@ public sealed class DataExportStorageOptionsValidator(IHostEnvironment environme
             failures.Add("DataExport:LeaseSeconds 必须大于 0。");
         }
 
+        if (options.DownloadLeaseSeconds <= 0)
+        {
+            failures.Add("DataExport:DownloadLeaseSeconds 必须大于 0。");
+        }
+
+        if (options.MaxJobAttempts <= 0)
+        {
+            failures.Add("DataExport:MaxJobAttempts 必须大于 0。");
+        }
+
         if (options.PollIntervalMilliseconds <= 0)
         {
             failures.Add("DataExport:PollIntervalMilliseconds 必须大于 0。");
@@ -55,6 +65,32 @@ public sealed class DataExportStorageOptionsValidator(IHostEnvironment environme
         if (options.CleanupIntervalMinutes <= 0)
         {
             failures.Add("DataExport:CleanupIntervalMinutes 必须大于 0。");
+        }
+
+        if (options.StagingMaxBytes <= 0)
+        {
+            failures.Add("DataExport:StagingMaxBytes 必须大于 0。");
+        }
+
+        if (options.MaxExportBytes <= 0)
+        {
+            failures.Add("DataExport:MaxExportBytes 必须大于 0。");
+        }
+
+        if (options.MaxExportBytes > options.StagingMaxBytes)
+        {
+            failures.Add("DataExport:MaxExportBytes 不能大于 StagingMaxBytes。");
+        }
+
+        // During chat export the final JSON and the three side-stream files
+        // coexist in .staging. Each stream is bounded by MaxExportBytes, so a
+        // valid configuration must leave room for the four worst-case files.
+        if (options.MaxExportBytes > 0
+            && options.StagingMaxBytes > 0
+            && options.MaxExportBytes > options.StagingMaxBytes / 4)
+        {
+            failures.Add(
+                "DataExport:StagingMaxBytes 至少应为 MaxExportBytes 的 4 倍，以覆盖并行 staging 文件。");
         }
 
         if (options.MaxBlobDeleteAttempts <= 0)

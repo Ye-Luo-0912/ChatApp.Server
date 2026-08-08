@@ -121,6 +121,23 @@ public sealed class ChatExportWriteTests
         Assert.Equal(0, doc.RootElement.GetProperty("attachments").GetArrayLength());
     }
 
+    [Fact]
+    public async Task SequentialJsonWriter_EncodesSpecialPropertyNamesWithoutTemporaryJsonArray()
+    {
+        const string propertyName = "quote\" slash\\ line\n tab\t control\u0001 café 😀";
+
+        await using var stream = new MemoryStream();
+        var writer = new SequentialJsonObjectWriter(stream);
+        await writer.StartAsync();
+        await writer.WritePropertyAsync(propertyName, 42);
+        await writer.CompleteAsync();
+
+        using var doc = JsonDocument.Parse(stream.ToArray());
+        var property = doc.RootElement.EnumerateObject().Single();
+        Assert.Equal(propertyName, property.Name);
+        Assert.Equal(42, property.Value.GetInt32());
+    }
+
     private static async Task<byte[]> WriteExportAsync(
         IRealtimeChatExportReader reader,
         DataExportStorageOptions options)

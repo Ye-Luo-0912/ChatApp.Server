@@ -27,6 +27,7 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, 
     private readonly IRealtimeMessageBus? _bus;
     private readonly ILogger<RealtimeMessageEvidenceProvider> _logger;
     private readonly NpgsqlDataSource? _dataSource;
+    private readonly bool _ownsDataSource;
     private readonly MemoryCache _cache = new(new MemoryCacheOptions
     {
         SizeLimit = 4096,
@@ -39,11 +40,20 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, 
     public RealtimeMessageEvidenceProvider(
         IOptions<MessageEvidenceOptions> options,
         ILogger<RealtimeMessageEvidenceProvider> logger,
-        IRealtimeMessageBus? bus = null)
+        IRealtimeMessageBus? bus = null,
+        RealtimePostgresDataSource? sharedDataSource = null)
     {
         _options = options.Value;
-        if (!string.IsNullOrWhiteSpace(_options.RealtimeConnectionString))
+        if (sharedDataSource?.DataSource is { } shared)
+        {
+            _dataSource = shared;
+            _ownsDataSource = false;
+        }
+        else if (!string.IsNullOrWhiteSpace(_options.RealtimeConnectionString))
+        {
             _dataSource = NpgsqlDataSource.Create(_options.RealtimeConnectionString);
+            _ownsDataSource = true;
+        }
 
         _logger = logger;
         _bus = bus;
@@ -62,8 +72,15 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, 
             return null;
 
         var key = messageId.Trim();
+        // Report submission supplies the requesting participant. Evidence is
+        // persisted as a moderation snapshot, so a short ordinary cache hit
+        // must never return text from before an edit or recall. Keep the
+        // cache for non-authorization reads, while participant-scoped reads
+        // always query the authoritative source.
+        var authoritativeRead = requestingUserId is > 0;
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        if (_cache.TryGetValue<MessageEvidenceSnapshot>(key, out var cached))
+        if (!authoritativeRead
+            && _cache.TryGetValue<MessageEvidenceSnapshot>(key, out var cached))
         {
             _hits.Add(1);
             return cached;
@@ -94,11 +111,14 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, 
             {
                 _hits.Add(1);
                 var ttl = Math.Max(1, _options.CacheSeconds);
-                _cache.Set(key, snapshot, new MemoryCacheEntryOptions
+                if (!authoritativeRead)
                 {
-                    AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(ttl),
-                    Size = 1,
-                });
+                    _cache.Set(key, snapshot, new MemoryCacheEntryOptions
+                    {
+                        AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(ttl),
+                        Size = 1,
+                    });
+                }
             }
 
             Interlocked.Exchange(ref _consecutiveFailures, 0);
@@ -217,6 +237,7 @@ public sealed class RealtimeMessageEvidenceProvider : IMessageEvidenceProvider, 
     public void Dispose()
     {
         _cache.Dispose();
-        _dataSource?.Dispose();
+        if (_ownsDataSource)
+            _dataSource?.Dispose();
     }
 }

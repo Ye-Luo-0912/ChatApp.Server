@@ -56,4 +56,5 @@ public enum RoleMutationOutcome
     AlreadyHasRole = 3,
     RoleNotAssigned = 4,
     LastAdmin = 5,
+    SecurityVersionFailed = 6,
 }

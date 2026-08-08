@@ -6,8 +6,30 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Infrastructure.Services;
 
-public sealed class AdminAuditQuery(UserDbContext db) : IAdminAuditQuery
+public sealed class AdminAuditQuery(UserDbContext db) : IAdminAuditQuery, IAdminAuditWriter
 {
+    public async Task WriteAsync(
+        long adminUserId,
+        long? targetUserId,
+        string action,
+        string? reason,
+        string? detail,
+        string? clientIp,
+        CancellationToken cancellationToken = default)
+    {
+        db.AdminAuditLogs.Add(new AdminAuditLog
+        {
+            AdminUserId = adminUserId,
+            TargetUserId = targetUserId,
+            Action = action,
+            Reason = reason,
+            Detail = detail,
+            ClientIp = clientIp,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<CursorPage<AdminAuditLogDto>> QueryAsync(
         long? adminUserId,
         long? targetUserId,

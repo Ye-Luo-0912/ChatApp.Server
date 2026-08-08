@@ -20,21 +20,26 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
     private readonly DataExportStorageOptions _export;
     private readonly IRealtimeMessageBus? _bus;
     private readonly ILogger<RealtimeChatExportReader> _logger;
+    private readonly NpgsqlDataSource? _dataSource;
 
     public RealtimeChatExportReader(
         IOptions<MessageEvidenceOptions> evidence,
         IOptions<DataExportStorageOptions> export,
         ILogger<RealtimeChatExportReader> logger,
-        IRealtimeMessageBus? bus = null)
+        IRealtimeMessageBus? bus = null,
+        RealtimePostgresDataSource? sharedDataSource = null)
     {
         _evidence = evidence.Value;
         _export = export.Value;
         _bus = bus;
         _logger = logger;
+        _dataSource = sharedDataSource?.DataSource;
     }
 
     public bool IsAvailable =>
-        !string.IsNullOrWhiteSpace(ResolveConnectionString()) || _bus is not null;
+        _dataSource is not null
+        || !string.IsNullOrWhiteSpace(ResolveConnectionString())
+        || _bus is not null;
 
     public string UnavailableReason =>
         IsAvailable
@@ -52,8 +57,8 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         take = Math.Clamp(take, 1, Math.Max(1, _export.ChatExportPageSize));
 
         var cs = ResolveConnectionString();
-        if (!string.IsNullOrWhiteSpace(cs))
-            return await ReadFromPostgresAsync(cs!, userId, beforeReceivedAtMs, beforeMessageId, take, cancellationToken)
+        if (_dataSource is not null || !string.IsNullOrWhiteSpace(cs))
+            return await ReadFromPostgresAsync(_dataSource, cs, userId, beforeReceivedAtMs, beforeMessageId, take, cancellationToken)
                 .ConfigureAwait(false);
 
         if (_bus is not null)
@@ -72,9 +77,9 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         maxMessages = Math.Max(1, maxMessages);
 
         var cs = ResolveConnectionString();
-        if (!string.IsNullOrWhiteSpace(cs))
+        if (_dataSource is not null || !string.IsNullOrWhiteSpace(cs))
         {
-            await foreach (var msg in StreamFromPostgresAsync(cs!, userId, maxMessages, cancellationToken)
+            await foreach (var msg in StreamFromPostgresAsync(_dataSource, cs, userId, maxMessages, cancellationToken)
                                .ConfigureAwait(false))
                 yield return msg;
             yield break;
@@ -124,7 +129,8 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
     }
 
     private async IAsyncEnumerable<ChatExportMessage> StreamFromPostgresAsync(
-        string connectionString,
+        NpgsqlDataSource? dataSource,
+        string? connectionString,
         long userId,
         int maxMessages,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -132,8 +138,9 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         var schema = string.IsNullOrWhiteSpace(_evidence.Schema) ? "realtime" : _evidence.Schema.Trim();
         var table = $"\"{schema}\".\"messages\"";
 
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var conn = dataSource is not null
+            ? await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false)
+            : await OpenLegacyConnectionAsync(connectionString!, cancellationToken).ConfigureAwait(false);
 
         // 单连接连续读：UNION ALL 两侧各取上限，外层再 LIMIT，避免分页 N 次往返。
         await using var cmd = new NpgsqlCommand(
@@ -196,7 +203,8 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
     }
 
     private async Task<ChatExportPage> ReadFromPostgresAsync(
-        string connectionString,
+        NpgsqlDataSource? dataSource,
+        string? connectionString,
         long userId,
         long? beforeReceivedAtMs,
         string? beforeMessageId,
@@ -207,8 +215,9 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         var table = $"\"{schema}\".\"messages\"";
         var fetch = take + 1;
 
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var conn = dataSource is not null
+            ? await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false)
+            : await OpenLegacyConnectionAsync(connectionString!, cancellationToken).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"""
              SELECT
@@ -294,6 +303,15 @@ public sealed class RealtimeChatExportReader : IRealtimeChatExportReader
         }
 
         return new ChatExportPage(items, hasMore, nextAt, nextId);
+    }
+
+    private static async Task<NpgsqlConnection> OpenLegacyConnectionAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        return connection;
     }
 
     private async Task<ChatExportPage> ReadFromBusAsync(

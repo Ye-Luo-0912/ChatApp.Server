@@ -1,5 +1,6 @@
 using Core.Models.Identity;
 using Core.Models.Security;
+using System.Text.Json.Serialization;
 
 namespace Core.Models.User;
 
@@ -12,9 +13,7 @@ public sealed class UpdateProfileRequest
     public string? Region { get; set; }
     public DateTime? Birthday { get; set; }
     public bool? Gender { get; set; }
-    public FriendRequestPolicy? FriendRequestPolicy { get; set; }
     public bool? AllowBeSearched { get; set; }
-    public bool? NotifyFriendRequests { get; set; }
     public bool? NotifySecurityEmail { get; set; }
 }
 
@@ -31,6 +30,10 @@ public sealed class AvatarPresignResponse
     public string ObjectKey { get; init; } = string.Empty;
     public string Ticket { get; init; } = string.Empty;
     public DateTimeOffset ExpiresAt { get; init; }
+
+    /// <summary>预签名 PUT 所需的 Content-Type、SSE 与候选对象标签。</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyDictionary<string, string>? UploadHeaders { get; init; }
 }
 
 public sealed class ConfirmAvatarRequest
@@ -40,6 +43,15 @@ public sealed class ConfirmAvatarRequest
     /// <summary>S3 预签名上传后确认时必填；须与 CreateUploadTicket 返回的 ticket 一致。</summary>
     public string? Ticket { get; set; }
 }
+
+public sealed record AvatarFinalizationStatusDto(
+    long SagaId,
+    string ObjectKey,
+    string? PublicUrl,
+    string Status,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    string? ErrorCode);
 
 public sealed class TrustDeviceRequest
 {
@@ -103,6 +115,7 @@ public sealed class PublicUserSearchResult
     public string? UserName { get; init; }
     public string? AvatarUrl { get; init; }
     public string? Signature { get; init; }
+    public int RelevanceScore { get; init; }
 }
 
 public sealed class AssignRoleRequest

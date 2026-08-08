@@ -1,14 +1,12 @@
-﻿using System.ComponentModel.DataAnnotations;
-using Core.Models.Identity;
+using System.ComponentModel.DataAnnotations;
 
 namespace ChatApp.Server.Models.Requests;
 
 public class UpdateCurrentUserRequest
 {
-    [Phone]
     public string? PhoneNumber { get; set; }
 
-    [StringLength(32, MinimumLength = 3)]
+    [StringLength(256)]
     public string? UserName { get; set; }
 
     [StringLength(500)]
@@ -21,13 +19,22 @@ public class UpdateCurrentUserRequest
 
     public bool? Gender { get; set; }
 
-    public FriendRequestPolicy? FriendRequestPolicy { get; set; }
-
     public bool? AllowBeSearched { get; set; }
 
-    public bool? NotifyFriendRequests { get; set; }
-
     public bool? NotifySecurityEmail { get; set; }
+}
+
+public class RequestPhoneChangeRequest
+{
+    [Required]
+    public string NewPhoneNumber { get; set; } = string.Empty;
+}
+
+public class ConfirmPhoneChangeRequest
+{
+    [Required]
+    [StringLength(8, MinimumLength = 4)]
+    public string Code { get; set; } = string.Empty;
 }
 
 public class ChangePasswordRequest
@@ -38,6 +45,12 @@ public class ChangePasswordRequest
     [Required]
     [MinLength(6)]
     public string NewPassword { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional current-session refresh token. When supplied, the server
+    /// atomically rotates this session after the security fence advances.
+    /// </summary>
+    public string? RefreshToken { get; set; }
 }
 
 public class RequestEmailChangeRequest
