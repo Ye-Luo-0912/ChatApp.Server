@@ -1,10 +1,14 @@
+using System.Buffers;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Core.Interfaces.Cache;
+using Core.Settings;
 using Infrastructure.Serialization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 namespace ChatApp.Server.Filters;
 
@@ -41,7 +45,7 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
 
         var bodyHash = await HashBodyAsync(http.Request, http.RequestAborted).ConfigureAwait(false);
         var userId = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? "anon";
-        var stateKey = $"idem:{userId}:{http.Request.Method}:{http.Request.Path}:{idempotencyKey}";
+        var stateKey = BuildStateKey(http, userId, idempotencyKey);
         var values = http.RequestServices.GetRequiredService<ICacheValueStore>();
         var atomic = http.RequestServices.GetRequiredService<IAtomicCacheStore>();
 
@@ -69,8 +73,9 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
 
         using var renewCts = CancellationTokenSource.CreateLinkedTokenSource(http.RequestAborted);
         var renewTask = RenewAsync(atomic, stateKey, processingJson, renewCts.Token);
+        Exception? renewFailure = null;
 
-        ResourceExecutedContext executed;
+        ResourceExecutedContext? executed = null;
         try
         {
             executed = await next().ConfigureAwait(false);
@@ -86,18 +91,48 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
             {
                 // Expected when the request finishes.
             }
+            catch (Exception ex)
+            {
+                // A renewal failure makes the cache lease uncertain; it must
+                // never turn a committed controller action into HTTP 500.
+                renewFailure = ex;
+                http.RequestServices
+                    .GetRequiredService<ILogger<IdempotentAttribute>>()
+                    .LogWarning(ex, "幂等键续租失败，进入 LeaseUncertain 状态 Key={Key}", stateKey);
+            }
         }
+
+        if (executed is null)
+            return;
 
         if (executed.Exception is not null && !executed.ExceptionHandled)
         {
-            await atomic.TryStringCompareAndDeleteAsync(
-                stateKey, processingJson, CancellationToken.None).ConfigureAwait(false);
+            if (renewFailure is null)
+            {
+                await atomic.TryStringCompareAndDeleteAsync(
+                    stateKey, processingJson, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                await MarkUncertainAsync(atomic, stateKey, processingJson, bodyHash)
+                    .ConfigureAwait(false);
+            }
             return;
         }
 
         if (executed.Result is ObjectResult { Value: not null } result
             && (result.StatusCode ?? StatusCodes.Status200OK) is >= 200 and < 300)
         {
+            if (renewFailure is not null)
+            {
+                // The controller result is authoritative, but the cache lease
+                // is not. Never overwrite a committed business result with a
+                // 500 merely because the idempotency lease was lost.
+                await MarkUncertainAsync(atomic, stateKey, processingJson, bodyHash)
+                    .ConfigureAwait(false);
+                return;
+            }
+
             var statusCode = result.StatusCode ?? StatusCodes.Status200OK;
             var completed = new IdemRecord
             {
@@ -108,17 +143,35 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
                 Owner = processing.Owner,
             };
             var completedJson = JsonSerializer.Serialize(completed, AppJsonOptions.Default);
-            _ = await atomic.TryStringCompareAndSetAsync(
+            var finalized = await atomic.TryStringCompareAndSetAsync(
                 stateKey,
                 processingJson,
                 completedJson,
                 CompletedTtl,
                 CancellationToken.None).ConfigureAwait(false);
+            if (!finalized)
+            {
+                http.RequestServices
+                    .GetRequiredService<ILogger<IdempotentAttribute>>()
+                    .LogWarning(
+                        "幂等完成记录写入失败，业务结果保持成功但状态为 LeaseUncertain Key={Key}",
+                        stateKey);
+                await MarkUncertainAsync(atomic, stateKey, processingJson, bodyHash)
+                    .ConfigureAwait(false);
+            }
             return;
         }
 
-        await atomic.TryStringCompareAndDeleteAsync(
-            stateKey, processingJson, CancellationToken.None).ConfigureAwait(false);
+        if (renewFailure is null)
+        {
+            await atomic.TryStringCompareAndDeleteAsync(
+                stateKey, processingJson, CancellationToken.None).ConfigureAwait(false);
+        }
+        else
+        {
+            await MarkUncertainAsync(atomic, stateKey, processingJson, bodyHash)
+                .ConfigureAwait(false);
+        }
     }
 
     private static bool TryReplayOrReject(
@@ -148,8 +201,87 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
             return true;
         }
 
-        context.Result = new ConflictObjectResult(new { Message = "相同请求正在处理中" });
+        context.Result = new ConflictObjectResult(new
+        {
+            Message = record.State == IdemState.LeaseUncertain
+                ? "相同请求的业务结果可能已经提交，请查询业务状态后再重试"
+                : "相同请求正在处理中",
+        });
         return true;
+    }
+
+    private static async Task MarkUncertainAsync(
+        IAtomicCacheStore atomic,
+        string stateKey,
+        string processingJson,
+        string bodyHash)
+    {
+        var uncertain = JsonSerializer.Serialize(
+            new IdemRecord
+            {
+                State = IdemState.LeaseUncertain,
+                BodyHash = bodyHash,
+                Owner = "uncertain",
+            },
+            AppJsonOptions.Default);
+        try
+        {
+            await atomic.TryStringCompareAndSetAsync(
+                    stateKey,
+                    processingJson,
+                    uncertain,
+                    CompletedTtl,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // The cache failure is already represented by an uncertain lease;
+            // the business endpoint result remains authoritative.
+        }
+    }
+
+    private static string BuildStateKey(
+        HttpContext http,
+        string userId,
+        string rawKey)
+    {
+        var security = http.RequestServices
+            .GetRequiredService<IOptions<SecurityOptions>>()
+            .Value;
+        var secret = security.SecretEncryptionKey;
+        if (string.IsNullOrWhiteSpace(secret))
+            throw new InvalidOperationException("Security:SecretEncryptionKey 必须用于幂等键哈希");
+
+        var secretByteCount = Encoding.UTF8.GetByteCount(secret);
+        var keyByteCount = Encoding.UTF8.GetByteCount(rawKey);
+        byte[]? rentedSecret = null;
+        byte[]? rentedKey = null;
+        try
+        {
+            Span<byte> secretBytes = secretByteCount <= 512
+                ? stackalloc byte[secretByteCount]
+                : (rentedSecret = ArrayPool<byte>.Shared.Rent(secretByteCount))
+                    .AsSpan(0, secretByteCount);
+            Span<byte> keyBytes = keyByteCount <= 512
+                ? stackalloc byte[keyByteCount]
+                : (rentedKey = ArrayPool<byte>.Shared.Rent(keyByteCount))
+                    .AsSpan(0, keyByteCount);
+            Encoding.UTF8.GetBytes(secret, secretBytes);
+            Encoding.UTF8.GetBytes(rawKey, keyBytes);
+
+            Span<byte> digest = stackalloc byte[HMACSHA256.HashSizeInBytes];
+            HMACSHA256.HashData(secretBytes, keyBytes, digest);
+            var keyHash = Convert.ToHexString(digest);
+            return $"idem:{userId}:{http.Request.Method}:{http.Request.Path}:{keyHash}";
+        }
+        finally
+        {
+            if (rentedSecret is not null)
+                ArrayPool<byte>.Shared.Return(rentedSecret);
+            if (rentedKey is not null)
+                ArrayPool<byte>.Shared.Return(rentedKey);
+        }
     }
 
     private static async Task<string> HashBodyAsync(
@@ -183,7 +315,7 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
                     key, processingJson, ProcessingTtl, cancellationToken)
                 .ConfigureAwait(false))
             {
-                return;
+                throw new IdempotencyLeaseLostException();
             }
         }
     }
@@ -209,6 +341,11 @@ public sealed class IdempotentAttribute : Attribute, IAsyncResourceFilter
     {
         Processing,
         Completed,
+        LeaseUncertain,
+    }
+
+    private sealed class IdempotencyLeaseLostException : Exception
+    {
     }
 
     private sealed class IdemRecord

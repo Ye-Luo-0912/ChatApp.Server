@@ -26,6 +26,33 @@ public interface IMfaService
     Task<bool> TryVerifyAndConsumeTotpForUserAsync(
         ApplicationUser user, string code, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Claims a TOTP time-step for a mutation. A caller must restore the claim
+    /// when its database mutation rolls back; a successful commit leaves the
+    /// replay-prevention marker in place until its TTL expires.
+    /// </summary>
+    Task<MfaVerificationClaim?> TryClaimTotpForUserAsync(
+        ApplicationUser user, string code, CancellationToken cancellationToken = default);
+
+    Task RestoreTotpClaimAsync(
+        MfaVerificationClaim claim, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 将恢复码从可用列表移动到持久化 Claim。调用方必须完成或恢复该 Claim。
+    /// </summary>
+    Task<MfaRecoveryCodeClaim?> TryClaimRecoveryCodeForUserAsync(
+        long userId, string code, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 完成恢复码 Claim。成功时推进账号安全版本，并返回新版本。
+    /// </summary>
+    Task<long?> CompleteRecoveryCodeClaimAsync(
+        MfaRecoveryCodeClaim claim, CancellationToken cancellationToken = default);
+
+    /// <summary>业务失败时恢复恢复码；不会延长其 Claim 截止时间。</summary>
+    Task<bool> RestoreRecoveryCodeClaimAsync(
+        MfaRecoveryCodeClaim claim, CancellationToken cancellationToken = default);
+
     Task<bool> TryConsumeRecoveryCodeAsync(long userId, string code, CancellationToken cancellationToken = default);
 
     /// <summary>重新生成恢复码（需密码 + 当前 TOTP/恢复码）。</summary>

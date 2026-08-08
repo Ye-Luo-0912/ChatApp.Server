@@ -51,7 +51,7 @@ public sealed class SecurityEventStore(
     public void StageLoginEvents(IReadOnlyList<SecurityEvent> events)
     {
         if (events.Count == 0) return;
-        db.SecurityEvents.AddRange(events);
+        db.LoginAuditOutbox.AddRange(events.Select(ToLoginAuditOutbox));
     }
 
     public async Task TryRecordLoginEventsAsync(
@@ -60,7 +60,7 @@ public sealed class SecurityEventStore(
         if (events.Count == 0) return;
         try
         {
-            db.SecurityEvents.AddRange(events);
+            db.LoginAuditOutbox.AddRange(events.Select(ToLoginAuditOutbox));
             await db.SaveChangesAsync(cancellationToken);
         }
         catch (Exception ex)
@@ -74,4 +74,19 @@ public sealed class SecurityEventStore(
             }
         }
     }
+
+    private static LoginAuditOutboxItem ToLoginAuditOutbox(SecurityEvent securityEvent)
+        => new()
+        {
+            UserId = securityEvent.UserId,
+            EventType = securityEvent.EventType,
+            DeviceId = securityEvent.DeviceId,
+            SessionId = securityEvent.SessionId,
+            ClientIp = securityEvent.ClientIp,
+            Location = securityEvent.Location,
+            Detail = securityEvent.Detail,
+            ActorUserId = securityEvent.ActorUserId,
+            CreatedAt = securityEvent.CreatedAt,
+            UpdatedAt = securityEvent.CreatedAt,
+        };
 }

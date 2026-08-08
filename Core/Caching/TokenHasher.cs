@@ -1,5 +1,4 @@
-using System.Security.Cryptography;
-using System.Text;
+using Core.Models.Token;
 
 namespace Core.Caching;
 
@@ -25,14 +24,7 @@ public static class TokenHasher
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
 
-        Span<byte> hashBytes = stackalloc byte[32];
-        SHA256.HashData(Encoding.UTF8.GetBytes(token), hashBytes);
-
-        // TrimEnd('=') 去掉填充；替换 +/为 -_ 保证 key 中不含特殊字符
-        return Convert.ToBase64String(hashBytes)
-            .TrimEnd('=')
-            .Replace('+', '-')
-            .Replace('/', '_');
+        return TokenBufferEncoding.Sha256Utf8ToBase64Url(token);
     }
 
     /// <summary>

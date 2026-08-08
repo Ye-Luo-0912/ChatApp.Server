@@ -1,6 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
-
 namespace Core.Models.Token;
 
 /// <summary>设备凭据的生成、格式校验和摘要计算。</summary>
@@ -11,11 +8,10 @@ public static class DeviceCredentialHelper
     private const int MaxEncodedLength = 128;
 
     public static string Create()
-        => Convert.ToBase64String(RandomNumberGenerator.GetBytes(CredentialBytes))
-            .Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        => TokenBufferEncoding.CreateBase64Url(CredentialBytes);
 
     public static string ComputeHash(string credential)
-        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(credential)));
+        => TokenBufferEncoding.Sha256Utf8ToHex(credential);
 
     public static bool IsValid(string? credential)
     {

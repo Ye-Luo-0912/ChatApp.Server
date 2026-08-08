@@ -23,12 +23,12 @@ public interface ISecurityEventStore
     Task RecordManyAsync(IReadOnlyList<SecurityEvent> events, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// 登录热路径：仅挂起事件到 DbContext，不单独 SaveChanges。
+    /// 登录热路径：挂起 durable audit-outbox rows 到 DbContext，不单独 SaveChanges。
     /// </summary>
     void StageLoginEvents(IReadOnlyList<SecurityEvent> events);
 
     /// <summary>
-    /// 登录热路径：批量尽力写入，失败只记日志不抛出。
+    /// 兼容旧调用方：写入 durable audit-outbox，失败只记日志不抛出。
     /// </summary>
     Task TryRecordLoginEventsAsync(IReadOnlyList<SecurityEvent> events, CancellationToken cancellationToken = default);
 }

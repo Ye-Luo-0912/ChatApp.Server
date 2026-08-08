@@ -14,6 +14,7 @@ using Infrastructure.Data;
 using Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace Infrastructure.Services.Auth;
@@ -37,12 +38,17 @@ public class AuthService(
     ITrustedDeviceService trustedDevices,
     ILoginRiskAnalyzer loginRiskAnalyzer,
     IOptions<RealtimeGatewayOptions> realtimeGatewayOptions,
-    ILogger<AuthService> logger) : IAuthService
+    ILogger<AuthService> logger,
+    IAuthSnapshotStore? authSnapshots = null,
+    ISecurityVersionAdvancer? securityVersions = null,
+    ISecurityMutationCoordinator? securityMutations = null,
+    IOptions<ProfileOptions>? profileOptions = null,
+    ISecurityOperationGrantStore? securityOperationGrants = null) : IAuthService
 {
     private const int MaxFailedAccessAttempts = 5;
     private const int MaxMfaAttempts = 5;
-    private const string AuthSnapshotKeyPrefix = "auth:snapshot:";
-    private static readonly TimeSpan AuthSnapshotTtl = TimeSpan.FromSeconds(30);
+    private const string LegacyAuthSnapshotKeyPrefix = "auth:snapshot:";
+    private static readonly TimeSpan LegacyAuthSnapshotTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LockoutDuration = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan MfaChallengeTtl = TimeSpan.FromMinutes(5);
 
@@ -54,6 +60,14 @@ public class AuthService(
     private readonly IDeviceInfo _deviceInfo = deviceInfo;
     private readonly IEmailVerificationService _emailVerificationService = emailVerificationService;
     private readonly RealtimeGatewayOptions _realtimeGateway = realtimeGatewayOptions.Value;
+    private readonly IAuthSnapshotStore? _authSnapshots = authSnapshots;
+    private readonly ISecurityOperationGrantStore? _securityOperationGrants = securityOperationGrants;
+    private readonly ProfileOptions _profile = profileOptions?.Value ?? new ProfileOptions();
+    private readonly ISecurityMutationCoordinator _securityMutationCoordinator =
+        securityMutations ?? new SecurityMutationCoordinator(
+            db,
+            securityVersions ?? new SecurityVersionAdvancer(db),
+            NullLogger<SecurityMutationCoordinator>.Instance);
 
     /// <inheritdoc />
     public async Task<LoginResult> LoginAsync(
@@ -82,25 +96,52 @@ public class AuthService(
                 return LoginResult.Fail("检测到异常登录，请先重置或修改密码后再登录", LoginCheckStatus.NotAllowed);
             }
 
-            string? rotatedTrustedToken = null;
             if (user.TwoFactorEnabled && !string.IsNullOrWhiteSpace(user.TotpSecret))
             {
                 // 仅高熵可信设备令牌可跳过 MFA；绝不信任可伪造的 X-Device-Id。
                 if (!string.IsNullOrWhiteSpace(trustedDeviceToken))
                 {
-                    var (trusted, rotated) = await trustedDevices.ValidateAndRotateAsync(
-                        user.Id, trustedDeviceToken, rotate: true, cancellationToken);
+                    // Validate first. Rotation is deliberately deferred until
+                    // the complete login has issued its session and token pair;
+                    // a failed token issuance must not consume the only client
+                    // copy of the trusted-device credential.
+                    var (trusted, _) = await trustedDevices.ValidateAndRotateAsync(
+                        user.Id, trustedDeviceToken, rotate: false, cancellationToken);
                     if (trusted)
                     {
                         _logger.LogInformation("用户 {UserId} 经可信设备令牌跳过 MFA", user.Id);
                         AuthSecurityMetrics.RecordLogin("trusted_skip_mfa");
-                        rotatedTrustedToken = rotated;
-                        return await CompleteLoginAsync(user, account, cancellationToken, rotatedTrustedToken);
+                        var login = await CompleteLoginAsync(user, account, cancellationToken);
+                        if (login.IsSuccess)
+                        {
+                            try
+                            {
+                                var (_, rotated) = await trustedDevices.ValidateAndRotateAsync(
+                                    user.Id, trustedDeviceToken, rotate: true, CancellationToken.None);
+                                if (!string.IsNullOrWhiteSpace(rotated))
+                                    login.TrustedDeviceToken = rotated;
+                            }
+                            catch (Exception ex)
+                            {
+                                // The login result is already authoritative.
+                                // The durable security fence and the device
+                                // row CAS keep this failure safe.
+                                _logger.LogWarning(
+                                    ex,
+                                    "用户 {UserId} 登录成功但可信设备令牌轮换失败",
+                                    user.Id);
+                            }
+                        }
+
+                        return login;
                     }
                 }
 
-                var mfaToken = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
-                    .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+                var mfaToken = _securityOperationGrants is null
+                    ? TokenBufferEncoding.CreateBase64Url(32)
+                    : await _securityOperationGrants
+                        .IssueAsync(user.Id, "mfa-login", MfaChallengeTtl, cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
                 var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, mfaToken);
                 await cache.StringSetAsync(key, user.Id.ToString(), MfaChallengeTtl, cancellationToken);
                 _logger.LogInformation("用户 {UserId} 需要 MFA 验证", user.Id);
@@ -109,7 +150,7 @@ public class AuthService(
             }
 
             AuthSecurityMetrics.RecordLogin("success");
-            return await CompleteLoginAsync(user, account, cancellationToken, rotatedTrustedToken);
+            return await CompleteLoginAsync(user, account, cancellationToken);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -129,6 +170,7 @@ public class AuthService(
         var token = mfaToken.Trim();
         var key = CacheKeyBuilder.WithPrefix(CacheConstants.MfaPendingPrefix, token);
         var attemptsKey = CacheKeyBuilder.WithPrefix(CacheConstants.MfaAttemptsPrefix, token);
+        SecurityOperationGrant? mfaGrant = null;
 
         var attempts = await atomicCache.StringIncrementAsync(
             attemptsKey, MfaChallengeTtl, cancellationToken);
@@ -139,40 +181,215 @@ public class AuthService(
             return LoginResult.Fail("MFA 尝试次数过多，请重新登录", LoginCheckStatus.NotAllowed);
         }
 
-        var userIdRaw = await cache.StringGetAsync(key, cancellationToken: cancellationToken);
-        if (string.IsNullOrWhiteSpace(userIdRaw) || !long.TryParse(userIdRaw, out var userId))
-            return LoginResult.Fail("MFA 挑战已过期，请重新登录", LoginCheckStatus.InvalidCredentials);
+        long userId;
+        if (_securityOperationGrants is not null)
+        {
+            mfaGrant = await _securityOperationGrants
+                .ClaimAsync(token, "mfa-login", cancellationToken)
+                .ConfigureAwait(false);
+            if (mfaGrant is null)
+                return LoginResult.Fail("MFA 挑战已过期，请重新登录", LoginCheckStatus.InvalidCredentials);
+
+            userId = mfaGrant.UserId;
+        }
+        else
+        {
+            var userIdRaw = await cache.StringGetAsync(key, cancellationToken: cancellationToken);
+            if (string.IsNullOrWhiteSpace(userIdRaw) || !long.TryParse(userIdRaw, out userId))
+                return LoginResult.Fail("MFA 挑战已过期，请重新登录", LoginCheckStatus.InvalidCredentials);
+        }
 
         var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
         if (user is null || !user.TwoFactorEnabled || string.IsNullOrWhiteSpace(user.TotpSecret))
+        {
+            if (mfaGrant is not null)
+                await _securityOperationGrants!.RestoreAsync(mfaGrant, CancellationToken.None)
+                    .ConfigureAwait(false);
             return LoginResult.Fail("MFA 不可用", LoginCheckStatus.InvalidCredentials);
+        }
 
-        var ok = await mfaService.TryVerifyAndConsumeTotpForUserAsync(user, code, cancellationToken)
-                     .ConfigureAwait(false)
-                 || await mfaService.TryConsumeRecoveryCodeAsync(userId, code, cancellationToken)
-                     .ConfigureAwait(false);
-        if (!ok)
+        var totpClaim = await mfaService.TryClaimTotpForUserAsync(user, code, cancellationToken)
+            .ConfigureAwait(false);
+        MfaRecoveryCodeClaim? recoveryClaim = null;
+        if (totpClaim is null)
+        {
+            recoveryClaim = await mfaService.TryClaimRecoveryCodeForUserAsync(
+                    userId, code, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (totpClaim is null && recoveryClaim is null)
+        {
+            if (mfaGrant is not null)
+                await _securityOperationGrants!.RestoreAsync(mfaGrant, CancellationToken.None)
+                    .ConfigureAwait(false);
             return LoginResult.Fail("验证码或恢复码无效", LoginCheckStatus.InvalidCredentials);
-
-        // MFA 成功即视为登录校验通过，清零此前密码失败计数，避免遗留锁定状态。
-        if (user.AccessFailedCount != 0 || user.LockoutEnd is not null)
-        {
-            user.AccessFailedCount = 0;
-            user.LockoutEnd = null;
         }
 
-        await cache.RemoveAsync(key, cancellationToken);
-        await cache.RemoveAsync(attemptsKey, cancellationToken);
-        AuthSecurityMetrics.RecordLogin("mfa_success");
-        var login = await CompleteLoginAsync(
-            user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
-        if (login.IsSuccess)
+        var loginIssued = false;
+        async Task RestoreClaimsAsync()
         {
-            await trustedDevices.MarkRecentMfaAsync(
-                userId, login.SessionId, _deviceInfo.GetDeviceId(), cancellationToken);
+            if (mfaGrant is not null)
+            {
+                try
+                {
+                    await _securityOperationGrants!.RestoreAsync(mfaGrant, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "MFA 安全操作 Grant 恢复失败 UserId={UserId}", userId);
+                }
+            }
+
+            if (recoveryClaim is not null)
+            {
+                try
+                {
+                    await mfaService.RestoreRecoveryCodeClaimAsync(
+                            recoveryClaim, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "MFA 恢复码 Claim 恢复失败 UserId={UserId} ClaimId={ClaimId}",
+                        userId,
+                        recoveryClaim.Id);
+                }
+            }
+
+            if (totpClaim is not null)
+            {
+                try
+                {
+                    await mfaService.RestoreTotpClaimAsync(totpClaim, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "MFA TOTP Claim 恢复失败 UserId={UserId}", userId);
+                }
+            }
         }
 
-        return login;
+        try
+        {
+            // MFA 成功即视为登录校验通过，清零此前密码失败计数，避免遗留锁定状态。
+            // 对恢复码路径，Claim 完成会在同一安全变更事务中保存这些字段并推进版本；
+            // TOTP 兼容路径保留原有 fenced 保存顺序。
+            if (user.AccessFailedCount != 0 || user.LockoutEnd is not null)
+            {
+                var hadLockout = user.LockoutEnd is not null;
+                var hadFailedCount = user.AccessFailedCount != 0;
+                user.AccessFailedCount = 0;
+                user.LockoutEnd = null;
+                if ((hadLockout || hadFailedCount) && recoveryClaim is null)
+                {
+                    user.SecurityStamp = Guid.NewGuid().ToString();
+                    var ownsTransaction = _db.Database.IsRelational()
+                                          && _db.Database.CurrentTransaction is null;
+                    await using var transaction = ownsTransaction
+                        ? await _db.Database.BeginTransactionAsync(cancellationToken)
+                            .ConfigureAwait(false)
+                        : null;
+                var mutation = await _securityMutationCoordinator.ExecuteAsync(
+                        userId,
+                        SecurityEventType.LockoutCleared,
+                        "mfa-login-lockout-cleared",
+                        static _ => Task.CompletedTask,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (!mutation.Succeeded)
+                {
+                        if (transaction is not null)
+                            await transaction.RollbackAsync(CancellationToken.None)
+                                .ConfigureAwait(false);
+                        await RestoreClaimsAsync().ConfigureAwait(false);
+                        return LoginResult.Fail(
+                            "MFA 状态更新失败，请稍后重试",
+                            LoginCheckStatus.Overloaded);
+                    }
+
+                    if (transaction is not null)
+                        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            if (recoveryClaim is not null)
+            {
+                if (await mfaService.CompleteRecoveryCodeClaimAsync(
+                            recoveryClaim, cancellationToken)
+                        .ConfigureAwait(false) is null)
+                {
+                    await RestoreClaimsAsync().ConfigureAwait(false);
+                    return LoginResult.Fail(
+                        "MFA 状态更新失败，请稍后重试",
+                        LoginCheckStatus.Overloaded);
+                }
+            }
+
+            await cache.RemoveAsync(key, cancellationToken).ConfigureAwait(false);
+            await cache.RemoveAsync(attemptsKey, cancellationToken).ConfigureAwait(false);
+            AuthSecurityMetrics.RecordLogin("mfa_success");
+            var login = await CompleteLoginAsync(
+                user, user.UserName ?? user.Email ?? userId.ToString(), cancellationToken);
+            if (!login.IsSuccess)
+            {
+                // The recovery-code completion advanced the durable security
+                // version before token issuance so the new session carries
+                // the correct fence. If issuance still returns a failed
+                // result, restore the claim instead of burning the code.
+                await RestoreClaimsAsync().ConfigureAwait(false);
+                return login;
+            }
+            loginIssued = true;
+
+            try
+            {
+                await trustedDevices.MarkRecentMfaAsync(
+                    userId, login.SessionId, _deviceInfo.GetDeviceId(), cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Recent-MFA is an optimization for subsequent step-up. It
+                // must never turn an already-issued login into HTTP 500.
+                _logger.LogWarning(ex, "MFA 登录成功但最近 MFA 标记写入失败 UserId={UserId}", userId);
+            }
+
+            if (mfaGrant is not null)
+            {
+                try
+                {
+                    if (!await _securityOperationGrants!.CompleteAsync(
+                                mfaGrant,
+                                CancellationToken.None)
+                            .ConfigureAwait(false))
+                    {
+                        _logger.LogWarning("MFA 登录成功但安全操作 Grant 未完成 UserId={UserId}", userId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Login is already authoritative; an incomplete grant is
+                    // bounded by its expiry and can never be replayed after
+                    // this claimed transition.
+                    _logger.LogWarning(ex, "MFA 登录成功但安全操作 Grant 完成失败 UserId={UserId}", userId);
+                }
+            }
+
+            return login;
+        }
+        catch
+        {
+            // A completed recovery claim is still reversible until the login
+            // pair has been successfully issued. This covers exceptions from
+            // token/session creation after the claim transaction committed.
+            if (!loginIssued)
+                await RestoreClaimsAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<LoginResult> CompleteLoginAsync(
@@ -279,6 +496,11 @@ public class AuthService(
         }
 
         securityEventStore.StageLoginEvents(loginEvents);
+        // Persist the lightweight risk signal in the same SaveChanges unit as
+        // the login audit rows. No API-local bounded queue can silently drop a
+        // signal during a burst or process restart.
+        loginRiskAnalyzer.Enqueue(new LoginRiskWorkItem(
+            user.Id, currentIp, currentDevice, isNewDevice, tokens.SessionId, ipChanged));
         try
         {
             await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -286,21 +508,50 @@ public class AuthService(
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
+            var riskWasStaged = _db.ChangeTracker.Entries<LoginRiskOutboxItem>()
+                .Any(e => e.State is EntityState.Added or EntityState.Modified);
+            if (riskWasStaged)
+            {
+                AuthSecurityMetrics.RecordLoginRiskDropped();
+                try
+                {
+                    // The token pair was provisioned before the login audit
+                    // transaction. A durable risk outbox is part of the
+                    // successful-login boundary, so do not return a pair when
+                    // that boundary failed. Cleanup is best effort because the
+                    // original cache failure may be the cause of this error.
+                    await _tokenService.RevokeRefreshTokenAsync(
+                            user.Id.ToString(),
+                            tokens.RefreshToken,
+                            CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogWarning(
+                        cleanupEx,
+                        "登录附属写入失败后撤销临时会话失败 UserId={UserId} SessionId={SessionId}",
+                        user.Id,
+                        tokens.SessionId);
+                }
+
+                throw new IdentityException("登录安全记录暂时不可用，请稍后重试", ex);
+            }
+
             _logger.LogWarning(ex, "用户 {UserId} 登录附属写入失败（LastLogin/安全事件/通知），不影响发令牌", user.Id);
             foreach (var entry in _db.ChangeTracker.Entries()
                          .Where(e => e.State is EntityState.Added or EntityState.Modified)
                          .ToList())
             {
-                if (entry.Entity is SecurityEvent or Core.Models.Notifications.NotificationOutboxItem)
+                if (entry.Entity is SecurityEvent
+                    or LoginAuditOutboxItem
+                    or LoginRiskOutboxItem
+                    or Core.Models.Notifications.NotificationOutboxItem)
                     entry.State = EntityState.Detached;
                 else if (entry.Entity is ApplicationUser)
                     entry.State = EntityState.Unchanged;
             }
         }
-
-        // 地理/ASN 风险分析移出登录热路径；IP 变化仅作为信号传入。
-        loginRiskAnalyzer.Enqueue(new LoginRiskWorkItem(
-            user.Id, currentIp, currentDevice, isNewDevice, tokens.SessionId, ipChanged));
 
         return LoginResult.Success(
             user,
@@ -339,7 +590,13 @@ public class AuthService(
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
             return UserRegistrationResult.Fail([], "账号或者密码不能为空");
 
-        var name       = string.IsNullOrWhiteSpace(username) ? email : username.Trim();
+        var explicitName = !string.IsNullOrWhiteSpace(username);
+        var name = explicitName ? username!.Trim() : email;
+        if (explicitName
+            && (name.Length < _profile.UserNameMinLength
+                || name.Length > _profile.UserNameMaxLength
+                || !IsValidUserNameCharacters(name)))
+            return UserRegistrationResult.Fail([], "用户名长度或格式不符合要求");
         var normalizedEmail = email.Trim().ToUpperInvariant();
         var normalizedName  = name.ToUpperInvariant();
 
@@ -358,6 +615,7 @@ public class AuthService(
             NormalizedEmail    = normalizedEmail,
             EmailConfirmed     = true,
             PasswordHash   = await _passwordHasher.HashPasswordAsync(password, cancellationToken),
+            PasswordHashVersion = _passwordHasher.CurrentHashVersion,
             SecurityStamp  = Guid.NewGuid().ToString(),
             LockoutEnabled = true
         };
@@ -397,7 +655,10 @@ public class AuthService(
 
             if (user.MustChangePassword
                 || (user.BanUntil.HasValue && user.BanUntil.Value > DateTimeOffset.UtcNow)
-                || (user.LockoutEnabled && user.LockoutEnd.HasValue && user.LockoutEnd.Value > DateTimeOffset.UtcNow))
+                || (user.LockoutEnabled && user.LockoutEnd.HasValue && user.LockoutEnd.Value > DateTimeOffset.UtcNow)
+                || (user.DeletionScheduledAt.HasValue
+                    && user.DeletionScheduledAt.Value <= DateTimeOffset.UtcNow)
+                || user.AccountState == AccountState.Deleted)
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
             var roles = await GetRolesAsync(user, cancellationToken);
@@ -409,9 +670,11 @@ public class AuthService(
                 return TokenPairResult.Fail(AuthErrorType.InvalidCredentials);
 
             return TokenPairResult.Success(
-                rotated.Value.accessToken,
-                rotated.Value.refreshToken,
-                rotated.Value.deviceCredential);
+                rotated.Value.AccessToken,
+                rotated.Value.AccessTokenExpiresAtUtc,
+                rotated.Value.RefreshToken,
+                rotated.Value.RefreshTokenExpiresAtUtc,
+                rotated.Value.DeviceCredential);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -439,52 +702,139 @@ public class AuthService(
         if (newPassword.Length < 6)
             return AuthOperationResult.Fail("WeakPassword", "密码长度至少 6 位");
 
-        var verify = await _emailVerificationService.VerifyEmailCodeAsync(
+        var (verify, emailClaim) = await _emailVerificationService.ClaimEmailCodeAsync(
             email, code, EmailCodePurpose.ResetPassword, cancellationToken);
         if (!verify.IsSuccess)
             return AuthOperationResult.Fail("InvalidCode", verify.ErrorMessage ?? "验证码无效或已过期");
 
-        var normalized = email.Trim().ToUpperInvariant();
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.NormalizedEmail == normalized, cancellationToken);
-        if (user is null)
-            return AuthOperationResult.Fail("UserNotFound", "用户不存在");
+        var committed = false;
+        try
+        {
+            var normalized = email.Trim().ToUpperInvariant();
+            var user = await _db.Users.FirstOrDefaultAsync(
+                u => u.NormalizedEmail == normalized, cancellationToken);
+            if (user is null)
+            {
+                await _emailVerificationService.RestoreEmailCodeAsync(emailClaim!, cancellationToken);
+                return AuthOperationResult.Fail("UserNotFound", "用户不存在");
+            }
 
-        user.PasswordHash = await _passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
-        user.SecurityStamp = Guid.NewGuid().ToString();
-        user.AdvanceSecurityVersion();
-        user.AccessFailedCount = 0;
-        user.LockoutEnd = null;
-        user.MustChangePassword = false;
+            user.PasswordHash = await _passwordHasher.HashPasswordAsync(newPassword, cancellationToken);
+            user.PasswordHashVersion = _passwordHasher.CurrentHashVersion;
+            user.SecurityStamp = Guid.NewGuid().ToString();
+            user.AccessFailedCount = 0;
+            user.LockoutEnd = null;
+            user.MustChangePassword = false;
 
-        await _db.SaveChangesAsync(cancellationToken);
-        await _sessionStore.RevokeAllSessionsAsync(user.Id.ToString(), cancellationToken: cancellationToken);
-        await trustedDevices.RevokeAllAsync(user.Id, cancellationToken);
+            var ownsTransaction = _db.Database.IsRelational()
+                                  && _db.Database.CurrentTransaction is null;
+            await using var transaction = ownsTransaction
+                ? await _db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false)
+                : null;
+            var mutation = await _securityMutationCoordinator.ExecuteAsync(
+                    user.Id,
+                    SecurityEventType.PasswordChanged,
+                    "password-reset",
+                    static _ => Task.CompletedTask,
+                    cancellationToken,
+                    options: new SecurityMutationOptions(RevokeTrustedDevices: true))
+                .ConfigureAwait(false);
+            if (!mutation.Succeeded)
+            {
+                if (transaction is not null)
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                await _emailVerificationService.RestoreEmailCodeAsync(emailClaim!, cancellationToken);
+                return AuthOperationResult.Fail("UpdateFailed", "用户安全版本无法推进");
+            }
+            if (transaction is not null)
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            committed = true;
 
-        await securityNotifications.NotifyAsync(
-            user.Id, "PasswordChanged", "密码已重置",
-            "您的账号密码已通过邮箱验证码重置，全部可信设备已失效。", preferEmail: true, cancellationToken);
+            try
+            {
+                await _emailVerificationService.CompleteEmailCodeAsync(
+                    emailClaim!, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "密码重置已提交但验证码完成清理失败 UserId={UserId}", user.Id);
+            }
 
-        _logger.LogInformation("用户 {UserId} 通过邮箱验证码重置密码，已撤销全部会话与可信设备", user.Id);
-        return AuthOperationResult.Success();
+            try
+            {
+                await _sessionStore.RevokeAllSessionsAsync(
+                        user.Id.ToString(),
+                        cancellationToken: CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "密码重置后的会话清理暂不可用 UserId={UserId}", user.Id);
+            }
+
+            try
+            {
+                await trustedDevices.RevokeAllAsync(user.Id, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // RevokeTrustedDevices is also carried by the committed
+                // security revocation outbox; this call is only the low
+                // latency best-effort path.
+                _logger.LogWarning(ex, "密码重置后的可信设备清理暂不可用 UserId={UserId}", user.Id);
+            }
+
+            await securityNotifications.NotifyAsync(
+                user.Id, "PasswordChanged", "密码已重置",
+                "您的账号密码已通过邮箱验证码重置，全部可信设备已失效。", preferEmail: true, cancellationToken);
+
+            _logger.LogInformation("用户 {UserId} 通过邮箱验证码重置密码，已撤销全部会话与可信设备", user.Id);
+            return AuthOperationResult.Success();
+        }
+        catch
+        {
+            if (!committed)
+            {
+                try
+                {
+                    await _emailVerificationService.RestoreEmailCodeAsync(
+                        emailClaim!, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception restoreError)
+                {
+                    _logger.LogWarning(restoreError, "密码重置失败后恢复邮箱验证码失败");
+                }
+            }
+            throw;
+        }
     }
 
     private async Task<IList<string>> GetRolesAsync(ApplicationUser user, CancellationToken cancellationToken)
     {
-        var cacheKey = AuthSnapshotKeyPrefix + user.Id;
-        try
+        if (_authSnapshots is not null)
         {
-            var cached = await cache.GetAsync<UserAuthSnapshot>(cacheKey, cancellationToken)
+            var cached = await _authSnapshots.GetAsync(user.Id, cancellationToken)
                 .ConfigureAwait(false);
-            if (cached is not null
-                && cached.UserId == user.Id
-                && cached.SecurityVersion == user.SecurityVersion)
-            {
+            if (cached is not null && cached.SecurityVersion == user.SecurityVersion)
                 return cached.Roles;
-            }
         }
-        catch (CacheUnavailableException)
+        else
         {
-            // 角色缓存是派生数据；Redis 故障时回退 PostgreSQL，不能阻断登录。
+            try
+            {
+                var cached = await cache.GetAsync<UserAuthSnapshot>(
+                        LegacyAuthSnapshotKeyPrefix + user.Id, cancellationToken)
+                    .ConfigureAwait(false);
+                if (cached is not null
+                    && cached.UserId == user.Id
+                    && cached.SecurityVersion == user.SecurityVersion)
+                    return cached.Roles;
+            }
+            catch (CacheUnavailableException)
+            {
+                // Legacy direct-construction test path only.
+            }
         }
 
         var roles = await _db.UserRoles
@@ -492,27 +842,63 @@ public class AuthService(
             .Select(ur => ur.Role.Name!)
             .ToListAsync(cancellationToken);
 
-        try
+        var snapshot = CreateSnapshot(user, [.. roles]);
+        if (_authSnapshots is not null)
         {
-            await cache.SetAsync(
-                    cacheKey,
-                    new UserAuthSnapshot
-                    {
-                        UserId = user.Id,
-                        SecurityVersion = user.SecurityVersion,
-                        Roles = [.. roles],
-                    },
-                    AuthSnapshotTtl,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            await _authSnapshots.SetAsync(snapshot, cancellationToken).ConfigureAwait(false);
         }
-        catch (CacheUnavailableException)
+        else
         {
-            // 角色缓存写失败同样只影响命中率。
+            try
+            {
+                await cache.SetAsync(
+                        LegacyAuthSnapshotKeyPrefix + user.Id,
+                        snapshot,
+                        LegacyAuthSnapshotTtl,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (CacheUnavailableException)
+            {
+                // Legacy direct-construction test path only.
+            }
         }
 
         return roles;
     }
+
+    private static bool IsValidUserNameCharacters(string value)
+    {
+        foreach (var ch in value)
+        {
+            if (!((ch is >= 'a' and <= 'z')
+                  || (ch is >= 'A' and <= 'Z')
+                  || (ch is >= '0' and <= '9')
+                  || ch == '_'))
+                return false;
+        }
+
+        return value.Length > 0;
+    }
+
+    private static UserAuthSnapshot CreateSnapshot(
+        ApplicationUser user,
+        string[] roles) => new()
+        {
+            UserId = user.Id,
+            UserName = user.UserName,
+            SecurityVersion = user.SecurityVersion,
+            AccountState = user.DeletionScheduledAt is { } scheduledAt
+                             && scheduledAt > DateTimeOffset.UtcNow
+                ? AccountState.DeletionPending
+                : user.AccountState,
+            Roles = roles,
+            RolesLoaded = true,
+            LockoutEnabled = user.LockoutEnabled,
+            LockoutEnd = user.LockoutEnd,
+            BanUntil = user.BanUntil,
+            DeletionScheduledAt = user.DeletionScheduledAt,
+        };
 
     private async Task<(LoginCheckStatus Status, ApplicationUser? User)> VerifyUserCredentialsAsync(string account,
         string password, CancellationToken cancellationToken)
@@ -528,7 +914,9 @@ public class AuthService(
         if (user.BanUntil.HasValue && user.BanUntil.Value > DateTimeOffset.UtcNow)
             return (LoginCheckStatus.NotAllowed, null);
 
-        if (user.DeletionScheduledAt.HasValue && user.DeletionScheduledAt.Value <= DateTimeOffset.UtcNow)
+        if (user.AccountState == AccountState.Deleted
+            || (user.DeletionScheduledAt.HasValue
+                && user.DeletionScheduledAt.Value <= DateTimeOffset.UtcNow))
             return (LoginCheckStatus.NotAllowed, null);
 
         if (user.LockoutEnabled
@@ -572,11 +960,37 @@ public class AuthService(
             if (failedState.LockoutEnabled && failedState.AccessFailedCount >= MaxFailedAccessAttempts)
             {
                 var lockoutEnd = DateTimeOffset.UtcNow.Add(LockoutDuration);
-                await _db.Users
-                    .Where(u => u.Id == user.Id)
+                var ownsTransaction = _db.Database.IsRelational()
+                                      && _db.Database.CurrentTransaction is null;
+                await using var transaction = ownsTransaction
+                    ? await _db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false)
+                    : null;
+                var lockoutRows = await _db.Users
+                    .Where(u => u.Id == user.Id
+                                && (u.LockoutEnd == null || u.LockoutEnd <= DateTimeOffset.UtcNow))
                     .ExecuteUpdateAsync(
-                        s => s.SetProperty(u => u.LockoutEnd, lockoutEnd),
+                        s => s.SetProperty(u => u.LockoutEnd, lockoutEnd)
+                            .SetProperty(u => u.SecurityStamp, Guid.NewGuid().ToString()),
                         cancellationToken);
+                if (lockoutRows == 1)
+                {
+                    var mutation = await _securityMutationCoordinator.ExecuteAsync(
+                            user.Id,
+                            SecurityEventType.AccountLocked,
+                            "password-lockout",
+                            static _ => Task.CompletedTask,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!mutation.Succeeded)
+                    {
+                        if (transaction is not null)
+                            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                        return (LoginCheckStatus.Overloaded, null);
+                    }
+
+                    if (transaction is not null)
+                        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
                 _logger.LogWarning("登录失败：连续错误已达上限，账号已锁定。UserId={UserId}", user.Id);
                 return (LoginCheckStatus.LockedOut, null);
             }
@@ -584,6 +998,18 @@ public class AuthService(
             _logger.LogWarning("登录失败：密码错误。UserId={UserId}, FailedCount={Count}",
                 user.Id, failedState.AccessFailedCount);
             return (LoginCheckStatus.InvalidCredentials, null);
+        }
+
+        if (!string.IsNullOrWhiteSpace(user.PasswordHash)
+            && _passwordHasher.NeedsRehash(user.PasswordHash, user.PasswordHashVersion))
+        {
+            // Keep the plaintext only for this verification call. If the
+            // later login persistence fails, the old version remains and the
+            // next successful login retries safely.
+            user.PasswordHash = await _passwordHasher
+                .HashPasswordAsync(password, cancellationToken)
+                .ConfigureAwait(false);
+            user.PasswordHashVersion = _passwordHasher.CurrentHashVersion;
         }
 
         user.AccessFailedCount = 0;

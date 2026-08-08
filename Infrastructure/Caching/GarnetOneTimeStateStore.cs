@@ -15,8 +15,33 @@ namespace Infrastructure.Caching;
 /// </summary>
 public sealed class GarnetOneTimeStateStore : IOneTimeStateStore
 {
+    private const string ClaimScript = """
+        if redis.call('EXISTS', KEYS[2]) == 1 then
+          return nil
+        end
+        local value = redis.call('GET', KEYS[1])
+        if not value then
+          return nil
+        end
+        redis.call('DEL', KEYS[1])
+        redis.call('SET', KEYS[2], value, 'PX', ARGV[1])
+        return value
+        """;
+    private const string RestoreClaimScript = """
+        local value = redis.call('GET', KEYS[2])
+        if not value then
+          return 0
+        end
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+          return 0
+        end
+        redis.call('SET', KEYS[1], value, 'PX', ARGV[1])
+        redis.call('DEL', KEYS[2])
+        return 1
+        """;
     private const string CompareDeleteScript = """
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
+        local current = redis.call('GET', KEYS[1])
+        if current == ARGV[1] or current == ARGV[2] then
           return redis.call('DEL', KEYS[1])
         end
         return 0
@@ -105,6 +130,98 @@ public sealed class GarnetOneTimeStateStore : IOneTimeStateStore
         }
     }
 
+    public async Task<OneTimeStateClaim<T>?> TryClaimAsync<T>(
+        string key,
+        string claimKey,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        ArgumentException.ThrowIfNullOrEmpty(claimKey);
+        var ttl = expiresAt - DateTimeOffset.UtcNow;
+        if (ttl <= TimeSpan.Zero)
+            return null;
+
+        try
+        {
+            var result = await _redis.GetDatabase()
+                .ScriptEvaluateAsync(
+                    ClaimScript,
+                    [NormalizeKey(key), NormalizeKey(claimKey)],
+                    [Math.Max(1, (long)ttl.TotalMilliseconds)])
+                .ConfigureAwait(false);
+            var bytes = (byte[]?)result;
+            if (bytes is not { Length: > 0 })
+                return null;
+
+            var payload = _serializer.Deserialize<T>(bytes);
+            return payload is null
+                ? null
+                : new OneTimeStateClaim<T>(claimKey, payload, expiresAt);
+        }
+        catch (RedisConnectionException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 失败：Garnet 不可用", ex);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 失败：Garnet 超时", ex);
+        }
+    }
+
+    public async Task<bool> CompleteClaimAsync(
+        string claimKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(claimKey))
+            return false;
+        try
+        {
+            return await _redis.GetDatabase()
+                .KeyDeleteAsync(NormalizeKey(claimKey))
+                .ConfigureAwait(false);
+        }
+        catch (RedisConnectionException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 完成失败：Garnet 不可用", ex);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 完成失败：Garnet 超时", ex);
+        }
+    }
+
+    public async Task<bool> RestoreClaimAsync(
+        string key,
+        string claimKey,
+        DateTimeOffset originalExpiresAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(claimKey))
+            return false;
+        var ttl = originalExpiresAt - DateTimeOffset.UtcNow;
+        if (ttl <= TimeSpan.Zero)
+            return false;
+        try
+        {
+            var result = await _redis.GetDatabase()
+                .ScriptEvaluateAsync(
+                    RestoreClaimScript,
+                    [NormalizeKey(key), NormalizeKey(claimKey)],
+                    [Math.Max(1, (long)ttl.TotalMilliseconds)])
+                .ConfigureAwait(false);
+            return (long)result == 1;
+        }
+        catch (RedisConnectionException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 恢复失败：Garnet 不可用", ex);
+        }
+        catch (RedisTimeoutException ex)
+        {
+            throw new Core.Exceptions.CacheUnavailableException("一次性状态 Claim 恢复失败：Garnet 超时", ex);
+        }
+    }
+
     public async Task RestoreAsync<T>(
         string key,
         T payload,
@@ -153,7 +270,15 @@ public sealed class GarnetOneTimeStateStore : IOneTimeStateStore
         try
         {
             var result = await _redis.GetDatabase()
-                .ScriptEvaluateAsync(CompareDeleteScript, [fullKey], [expectedValue])
+                // String payloads are normally stored through ISerializer and
+                // therefore arrive as JSON strings ("123456"). Older callers
+                // and a few operational tools may have written the same value
+                // as a raw Redis string. Accept both representations while
+                // keeping the comparison and deletion atomic.
+                .ScriptEvaluateAsync(
+                    CompareDeleteScript,
+                    [fullKey],
+                    [expectedValue, _serializer.Serialize(expectedValue)])
                 .ConfigureAwait(false);
             return (long)result == 1;
         }

@@ -323,7 +323,6 @@ public sealed class TrustedDeviceSecurityTests(PostgresTestFixture postgres, Red
 
         return new TrustedDeviceService(
             db,
-            security,
             hasher,
             mfa,
             redis.Cache,

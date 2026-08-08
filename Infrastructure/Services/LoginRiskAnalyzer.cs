@@ -1,63 +1,51 @@
-using System.Threading.Channels;
 using Core.Interfaces;
 using Core.Models.Security;
 using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Core.Settings;
 
 namespace Infrastructure.Services;
 
+/// <summary>
+/// Login-risk boundary. API requests only append a durable outbox row through
+/// the current UserDbContext; the Worker calls <see cref="AnalyzeAsync"/>.
+/// </summary>
 public sealed class LoginRiskAnalyzer(
-    IServiceScopeFactory scopeFactory,
-    ILogger<LoginRiskAnalyzer> logger) : BackgroundService, ILoginRiskAnalyzer
+    UserDbContext db,
+    IGeoLocationService geo,
+    ISecurityNotificationService notify,
+    ILogger<LoginRiskAnalyzer> logger,
+    IOptions<LoginRiskOptions> riskOptions) : ILoginRiskAnalyzer
 {
-    private readonly Channel<LoginRiskWorkItem> _channel =
-        Channel.CreateBounded<LoginRiskWorkItem>(new BoundedChannelOptions(2_000)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-            SingleWriter = false,
-        });
-
     public void Enqueue(LoginRiskWorkItem item)
     {
-        if (!_channel.Writer.TryWrite(item))
-            logger.LogDebug("登录风险队列已满，丢弃最旧项");
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        await foreach (var item in _channel.Reader.ReadAllAsync(stoppingToken))
+        var now = DateTimeOffset.UtcNow;
+        db.LoginRiskOutbox.Add(new LoginRiskOutboxItem
         {
-            try
-            {
-                await AnalyzeAsync(item, stoppingToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "登录风险分析失败 UserId={UserId}", item.UserId);
-            }
-        }
+            UserId = item.UserId,
+            ClientIp = item.ClientIp,
+            DeviceId = item.DeviceId,
+            IsNewDevice = item.IsNewDevice,
+            IpChanged = item.IpChanged,
+            SessionId = item.SessionId,
+            RuleVersion = Math.Max(1, riskOptions.Value.RuleVersion),
+            CreatedAt = now,
+            UpdatedAt = now,
+            NextAttemptAt = now,
+        });
     }
 
-    private async Task AnalyzeAsync(LoginRiskWorkItem item, CancellationToken cancellationToken)
+    public async Task AnalyzeAsync(
+        LoginRiskOutboxItem item,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(item.ClientIp))
             return;
 
         if (item.IpChanged)
             AuthSecurityMetrics.RecordRisk("ip_changed");
-
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var geo = scope.ServiceProvider.GetRequiredService<IGeoLocationService>();
-        var db = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-        var notify = scope.ServiceProvider.GetRequiredService<ISecurityNotificationService>();
 
         var location = await geo.GetLocationAsync(item.ClientIp, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(location) || location == "未知")
@@ -141,7 +129,7 @@ public sealed class LoginRiskAnalyzer(
             SessionId = item.SessionId,
             ClientIp = item.ClientIp,
             Location = location,
-            Detail = $"async-geo loc={location}; ipChanged={item.IpChanged}",
+            Detail = $"async-geo rule=v{Math.Max(1, item.RuleVersion)}; loc={location}; ipChanged={item.IpChanged}",
             CreatedAt = DateTimeOffset.UtcNow,
         });
         await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);

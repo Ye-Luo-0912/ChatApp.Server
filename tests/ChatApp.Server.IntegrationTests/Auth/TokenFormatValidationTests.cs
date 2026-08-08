@@ -7,6 +7,7 @@ using Infrastructure.Services.Auth;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
+using System.Text.Json;
 using Xunit;
 
 namespace ChatApp.Server.IntegrationTests.Auth;
@@ -85,9 +86,11 @@ public sealed class TokenFormatValidationTests(RedisTestFixture redis)
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task GeneratedTokens_RemainAcceptedByFormatValidation()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         var service = CreateTokenService();
         var user = new ApplicationUser { Id = 702, UserName = "token-format-valid" };
 
@@ -95,6 +98,25 @@ public sealed class TokenFormatValidationTests(RedisTestFixture redis)
 
         Assert.NotNull(await service.GetAccessTokenAsync(issued.AccessToken));
         Assert.True(await service.ValidateRefreshTokenAsync(user.Id.ToString(), issued.RefreshToken));
+    }
+
+    [Fact]
+    public void NewAccessTokenPayload_DoesNotDuplicateUserClaims()
+    {
+        var payload = new AccessTokenData
+        {
+            UserId = 704,
+            ExpiresAtMs = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeMilliseconds(),
+            SessionId = "session",
+            DeviceIdHash = 1,
+            SecurityVersion = 2,
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+
+        Assert.DoesNotContain("\"n\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"r\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"a\"", json, StringComparison.Ordinal);
     }
 
     private TokenService CreateTokenService(AccessTokenL1InvalidationBus? bus = null)

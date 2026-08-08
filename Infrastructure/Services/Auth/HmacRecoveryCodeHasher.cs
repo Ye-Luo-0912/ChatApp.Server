@@ -1,8 +1,10 @@
 using System.Diagnostics;
+using System.Buffers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Core.Interfaces;
+using Core.Models.Token;
 using Core.Settings;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -35,6 +37,8 @@ public interface IRecoveryCodeHasher
 public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
 {
     private const int EntropyBytes = 16; // 128-bit
+    private const int StackNormalizedChars = 128;
+    private const int StackUtf8Bytes = 256;
     private readonly Dictionary<int, byte[]> _keysByVersion;
     private readonly int _currentVersion;
     private readonly IAuthCpuLimiter _cpuLimiter;
@@ -79,17 +83,32 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
 
     public string GeneratePlainCode()
     {
-        var bytes = RandomNumberGenerator.GetBytes(EntropyBytes);
         // 分组便于人工录入：XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX
-        var hex = Convert.ToHexString(bytes);
-        return $"{hex[..8]}-{hex[8..16]}-{hex[16..24]}-{hex[24..32]}";
+        return TokenBufferEncoding.CreateGroupedHex(EntropyBytes, groupBytes: 4);
     }
 
     public string Hash(string plainCode)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(plainCode);
-        var digest = ComputeHmac(_keysByVersion[_currentVersion], Normalize(plainCode));
-        return $"v{_currentVersion}:{Base64Url(digest)}";
+        char[]? rentedChars = null;
+        Span<char> normalized = plainCode.Length <= StackNormalizedChars
+            ? stackalloc char[StackNormalizedChars]
+            : (rentedChars = ArrayPool<char>.Shared.Rent(plainCode.Length)).AsSpan(0, plainCode.Length);
+        try
+        {
+            var normalizedLength = NormalizeInto(plainCode, normalized);
+            Span<byte> digest = stackalloc byte[32];
+            ComputeHmac(
+                _keysByVersion[_currentVersion],
+                normalized[..normalizedLength],
+                digest);
+            return $"v{_currentVersion}:{TokenBufferEncoding.EncodeBase64Url(digest)}";
+        }
+        finally
+        {
+            if (rentedChars is not null)
+                ArrayPool<char>.Shared.Return(rentedChars, clearArray: true);
+        }
     }
 
     public async Task<bool> VerifyAsync(
@@ -106,17 +125,14 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
             || !_keysByVersion.TryGetValue(version, out var key))
             return false;
 
-        byte[] expected;
-        try
-        {
-            expected = FromBase64Url(payload);
-        }
-        catch
-        {
+        Span<byte> expected = stackalloc byte[32];
+        if (!TryDecodeBase64Url(payload, expected, out var expectedLength)
+            || expectedLength != expected.Length)
             return false;
-        }
 
-        var actual = ComputeHmac(key, Normalize(plainCode));
+        Span<byte> actual = stackalloc byte[32];
+        if (!TryComputeNormalizedHmac(key, plainCode, actual))
+            return false;
         return CryptographicOperations.FixedTimeEquals(actual, expected);
     }
 
@@ -211,29 +227,104 @@ public sealed class HmacRecoveryCodeHasher : IRecoveryCodeHasher
         }
     }
 
-    private static string Normalize(string code)
-        => code.Trim().Replace("-", "", StringComparison.Ordinal).ToUpperInvariant();
-
     private static byte[] Derive(string material) => SHA256.HashData(Encoding.UTF8.GetBytes("recovery:" + material));
 
-    private static byte[] ComputeHmac(byte[] key, string normalizedPlain)
+    private static int NormalizeInto(string code, Span<char> destination)
     {
-        using var hmac = new HMACSHA256(key);
-        return hmac.ComputeHash(Encoding.UTF8.GetBytes(normalizedPlain));
+        var start = 0;
+        var end = code.Length;
+        while (start < end && char.IsWhiteSpace(code[start]))
+            start++;
+        while (end > start && char.IsWhiteSpace(code[end - 1]))
+            end--;
+
+        var written = 0;
+        for (var i = start; i < end; i++)
+        {
+            if (code[i] == '-')
+                continue;
+            if (written >= destination.Length)
+                throw new ArgumentException("恢复码过长", nameof(code));
+            destination[written++] = char.ToUpperInvariant(code[i]);
+        }
+
+        return written;
     }
 
-    private static string Base64Url(byte[] data)
-        => Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-
-    private static byte[] FromBase64Url(string value)
+    private static void ComputeHmac(
+        byte[] key,
+        ReadOnlySpan<char> normalizedPlain,
+        Span<byte> destination)
     {
-        var s = value.Replace('-', '+').Replace('_', '/');
-        switch (s.Length % 4)
+        var byteCount = Encoding.UTF8.GetByteCount(normalizedPlain);
+        byte[]? rented = null;
+        Span<byte> utf8 = byteCount <= StackUtf8Bytes
+            ? stackalloc byte[byteCount]
+            : (rented = ArrayPool<byte>.Shared.Rent(byteCount)).AsSpan(0, byteCount);
+        try
         {
-            case 2: s += "=="; break;
-            case 3: s += "="; break;
+            var written = Encoding.UTF8.GetBytes(normalizedPlain, utf8);
+            HMACSHA256.HashData(key, utf8[..written], destination);
         }
-        return Convert.FromBase64String(s);
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+        }
+    }
+
+    private static bool TryComputeNormalizedHmac(
+        byte[] key,
+        string plainCode,
+        Span<byte> destination)
+    {
+        if (plainCode.Length <= StackNormalizedChars)
+        {
+            Span<char> normalized = stackalloc char[StackNormalizedChars];
+            var length = NormalizeInto(plainCode, normalized);
+            ComputeHmac(key, normalized[..length], destination);
+            return true;
+        }
+
+        var rented = ArrayPool<char>.Shared.Rent(plainCode.Length);
+        try
+        {
+            var length = NormalizeInto(plainCode, rented);
+            ComputeHmac(key, rented.AsSpan(0, length), destination);
+            return true;
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(rented, clearArray: true);
+        }
+    }
+
+    private static bool TryDecodeBase64Url(
+        string value,
+        Span<byte> destination,
+        out int written)
+    {
+        written = 0;
+        if (value.Length > 128)
+            return false;
+
+        Span<char> normalized = stackalloc char[128];
+        var length = value.Length;
+        for (var i = 0; i < length; i++)
+        {
+            normalized[i] = value[i] switch
+            {
+                '-' => '+',
+                '_' => '/',
+                _ => value[i],
+            };
+        }
+
+        while (length % 4 != 0)
+            normalized[length++] = '=';
+
+        return Convert.TryFromBase64Chars(
+            normalized[..length], destination, out written);
     }
 
     private static bool TrySplitVersioned(string value, out int version, out string payload)

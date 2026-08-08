@@ -21,7 +21,22 @@ public interface IAccessTokenStore
     Task<AccessTokenData?> GetAccessTokenAsync(string token, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 查询请求头中已有的 token 字符串切片。生产实现应复用该内存切片，
+    /// 避免认证热路径为了构造 token key 再创建 substring。
+    /// </summary>
+    Task<AccessTokenData?> GetAccessTokenAsync(
+        ReadOnlyMemory<char> token,
+        CancellationToken cancellationToken = default)
+        => GetAccessTokenAsync(token.ToString(), cancellationToken);
+
+    /// <summary>
     /// 立即撤销访问令牌，使其在到期前失效（适用于主动登出场景）。
     /// </summary>
     Task RevokeAccessTokenAsync(string token, CancellationToken cancellationToken = default);
+
+    /// <summary>撤销请求头中已有的 token 字符串切片。</summary>
+    Task RevokeAccessTokenAsync(
+        ReadOnlyMemory<char> token,
+        CancellationToken cancellationToken = default)
+        => RevokeAccessTokenAsync(token.ToString(), cancellationToken);
 }

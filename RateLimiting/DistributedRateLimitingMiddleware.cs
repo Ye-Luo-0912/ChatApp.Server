@@ -72,8 +72,8 @@ public sealed class RateLimitPolicyProvider : IRateLimitPolicyProvider
             TimeSpan.FromSeconds(Math.Max(1, rate.UserSensitiveWindowSeconds)), failOpen,
             [new("k", ExtractUserOrIpAsync)]);
 
-        // Friendship mutations receive their own user-keyed bucket, so they do
-        // not consume or bypass quotas for unrelated sensitive operations.
+        // 好友写操作使用独立的命名策略，但沿用同一组按用户分区的安全限额。
+        // 不能让控制器端点引用一个未注册的策略，也不能退回到全局/IP 分区。
         policies["friendship-write"] = new RateLimitPolicy(
             "friendship-write", rate.UserSensitivePermitLimit,
             TimeSpan.FromSeconds(Math.Max(1, rate.UserSensitiveWindowSeconds)), failOpen,

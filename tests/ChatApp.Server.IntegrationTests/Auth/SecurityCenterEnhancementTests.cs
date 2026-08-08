@@ -112,7 +112,7 @@ public sealed class SecurityCenterEnhancementTests(PostgresTestFixture postgres,
             NullLogger<TokenService>.Instance);
 
         var trusted = new TrustedDeviceService(
-            db, security, AuthTestFactories.CreatePasswordHasher(), CreateMfa(db), redis.Cache, redis.Cache,
+            db, AuthTestFactories.CreatePasswordHasher(), CreateMfa(db), redis.Cache, redis.Cache,
             new FixedDeviceInfo(deviceId),
             new Microsoft.AspNetCore.Http.HttpContextAccessor(),
             Options.Create(new TrustedDeviceOptions()),

@@ -5,4 +5,6 @@ public static class AuthClaimTypes
 {
     public const string SessionId = "sid";
     public const string DeviceIdHash = "didh";
+    public const string AccountState = "account_state";
+    public const string DeletionScheduledAt = "deletion_scheduled_at";
 }

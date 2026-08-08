@@ -40,7 +40,21 @@ public interface ITokenService : ITokenGenerator, IAccessTokenStore, IRefreshTok
     /// 失败（令牌无效、设备不匹配、已被并发消费）时返回 <see langword="null"/>。
     /// </para>
     /// </summary>
-    /// <returns>成功时返回新签发的 (accessToken, refreshToken)；失败返回 <see langword="null"/>。</returns>
-    Task<(string accessToken, string refreshToken, string? deviceCredential)?> IssueRefreshTokensAsync(
+    /// <returns>成功时返回新签发的令牌、实际过期时间和轮换后的设备凭据；失败返回 <see langword="null"/>。</returns>
+    Task<TokenRotationResult?> IssueRefreshTokensAsync(
         string userId, string oldRefreshToken, ApplicationUser user, IList<string> roles, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 在同一安全变更完成后原子轮换当前会话的刷新令牌。旧刷新令牌的
+    /// SecurityVersion 可以是变更前版本，但仍必须通过 token CAS、设备绑定
+    /// 和 session 关联校验；其它会话由业务层显式撤销。
+    /// </summary>
+    Task<TokenRotationResult?>
+        ReissueSessionAfterSecurityMutationAsync(
+            string userId,
+            string oldRefreshToken,
+            ApplicationUser user,
+            IList<string> roles,
+            string? expectedSessionId = null,
+            CancellationToken cancellationToken = default);
 }

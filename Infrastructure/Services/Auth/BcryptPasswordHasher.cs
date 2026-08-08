@@ -10,6 +10,8 @@ public sealed class BcryptPasswordHasher(IAuthCpuLimiter cpuLimiter) : IPassword
 {
     private const int WorkFactor = 10;
 
+    public int CurrentHashVersion => 1;
+
     public async Task<string> HashPasswordAsync(string password, CancellationToken cancellationToken = default)
     {
         await cpuLimiter.EnterAsync("hash", cancellationToken).ConfigureAwait(false);
@@ -39,5 +41,19 @@ public sealed class BcryptPasswordHasher(IAuthCpuLimiter cpuLimiter) : IPassword
         {
             cpuLimiter.Exit("verify", sw.Elapsed.TotalMilliseconds);
         }
+    }
+
+    public bool NeedsRehash(string passwordHash, int storedVersion)
+    {
+        if (storedVersion < CurrentHashVersion || string.IsNullOrWhiteSpace(passwordHash))
+            return true;
+
+        // BCrypt encodes its work factor as the third '$'-delimited part.
+        // Unknown or malformed formats are upgrade candidates after the
+        // verifier has accepted them.
+        var parts = passwordHash.Split('$');
+        return parts.Length < 4
+               || !int.TryParse(parts[2], out var rounds)
+               || rounds < WorkFactor;
     }
 }

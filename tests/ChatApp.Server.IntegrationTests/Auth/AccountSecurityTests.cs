@@ -100,7 +100,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
     }
 
     [SkippableFact]
-    public async Task ChangePassword_RevokesOtherDevices()
+    public async Task ChangePassword_RevokesAllDevices_WhenSecurityVersionChanges()
     {
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
 
@@ -116,8 +116,7 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
         Assert.True(result!.Succeeded);
 
         var sessions = await CreateTokenService("keep-device").ListSessionsAsync(user.Id.ToString());
-        Assert.Single(sessions);
-        Assert.Equal("keep-device", sessions[0].DeviceId);
+        Assert.Empty(sessions);
     }
 
     [SkippableFact]
@@ -256,7 +255,6 @@ public sealed class AccountSecurityTests(PostgresTestFixture postgres, RedisTest
             NullLogger<MfaService>.Instance);
         return new TrustedDeviceService(
             db,
-            security,
             hasher,
             mfa,
             cache,

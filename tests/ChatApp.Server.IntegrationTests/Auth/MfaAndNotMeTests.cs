@@ -212,7 +212,7 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var step2 = await auth.VerifyMfaAsync(step1.MfaToken!, totp);
         Assert.True(step2.IsSuccess);
         Assert.True(step2.RequiresRecoveryCodeRegeneration);
-        Assert.True(await db.SecurityEvents.AnyAsync(e =>
+        Assert.True(await db.LoginAuditOutbox.AnyAsync(e =>
             e.UserId == user.Id && e.EventType == SecurityEventType.MfaRecoveryCodesUpgradeRequired));
     }
 
@@ -317,10 +317,30 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var login = await auth.LoginAsync(user.UserName!, password);
         Assert.True(login.IsSuccess);
 
-        var evt = await db.SecurityEvents.AsNoTracking()
+        // Login audit is intentionally delivered through a durable outbox.
+        // Project the pending record here to exercise the account action with
+        // the same event shape that the worker writes.
+        var audit = await db.LoginAuditOutbox.AsNoTracking()
             .Where(e => e.UserId == user.Id && e.EventType == SecurityEventType.LoginSuccess)
             .OrderByDescending(e => e.Id)
             .FirstAsync();
+        db.SecurityEvents.Add(new Core.Models.Security.SecurityEvent
+        {
+            UserId = audit.UserId,
+            EventType = audit.EventType,
+            DeviceId = audit.DeviceId,
+            SessionId = audit.SessionId,
+            ClientIp = audit.ClientIp,
+            Location = audit.Location,
+            Detail = audit.Detail,
+            ActorUserId = audit.ActorUserId,
+            SourceLoginAuditOutboxId = audit.Id,
+            CreatedAt = audit.CreatedAt,
+        });
+        await db.SaveChangesAsync();
+        var evt = await db.SecurityEvents.AsNoTracking()
+            .Where(e => e.UserId == user.Id && e.SourceLoginAuditOutboxId == audit.Id)
+            .SingleAsync();
 
         var (account, _, sessions) = CreateAccount(db);
         var result = await account.ReportNotMeAsync(user.Id, evt.Id);
@@ -420,7 +440,6 @@ public sealed class MfaAndNotMeTests(PostgresTestFixture postgres, RedisTestFixt
         var mfa = new MfaService(db, hasher, CreateRecoveryHasher(), CreateMfaProtector(), security, redis.Cache, NullLogger<MfaService>.Instance);
         return new TrustedDeviceService(
             db,
-            security,
             hasher,
             mfa,
             redis.Cache,

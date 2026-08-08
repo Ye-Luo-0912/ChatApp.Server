@@ -13,9 +13,11 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
 {
     private const int ConcurrentRefreshCount = 100;
 
-    [Fact]
+    [SkippableFact]
     public async Task IssueRefreshTokensAsync_ConcurrentCalls_OnlyOneSucceeds()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         const string deviceId = "device-integration-fixed";
         const long userId = 42;
 
@@ -43,7 +45,7 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
             }
 
             Interlocked.Increment(ref successes);
-            Interlocked.CompareExchange(ref winnerRefreshToken, result.Value.refreshToken, null);
+            Interlocked.CompareExchange(ref winnerRefreshToken, result.Value.RefreshToken, null);
         });
 
         await Task.WhenAll(tasks);
@@ -59,9 +61,11 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
         Assert.True(await tokenService.ValidateRefreshTokenAsync(userId.ToString(), winnerRefreshToken!));
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task IssueRefreshTokensAsync_SecondSequentialCall_Fails()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         const string deviceId = "device-sequential";
         const long userId = 7;
 
@@ -74,15 +78,19 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
         var first = await tokenService.IssueRefreshTokensAsync(
             userId.ToString(), login.RefreshToken, user, roles);
         Assert.NotNull(first);
+        Assert.True(first.Value.AccessTokenExpiresAtUtc > DateTime.UtcNow.AddMinutes(25));
+        Assert.True(first.Value.RefreshTokenExpiresAtUtc > DateTime.UtcNow.AddDays(2));
 
         var second = await tokenService.IssueRefreshTokensAsync(
             userId.ToString(), login.RefreshToken, user, roles);
         Assert.Null(second);
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task IssueRefreshTokensAsync_SecurityVersionMismatch_RejectsOrphanedRefreshToken()
     {
+        Skip.If(!redis.IsAvailable, redis.SkipReason);
+
         const string deviceId = "device-security-version";
         const long userId = 7007;
 
@@ -91,7 +99,10 @@ public sealed class RefreshTokenRotationTests(RedisTestFixture redis)
         IList<string> roles = ["User"];
 
         var login = await tokenService.IssueLoginTokensAsync(user, roles);
-        user.AdvanceSecurityVersion();
+        // The production path advances this value with the database atomic primitive.
+        // This test uses an in-memory user snapshot, so mutate the fixture to model
+        // the version change without reintroducing the removed domain mutator.
+        user.SecurityVersion++;
 
         var rotated = await tokenService.IssueRefreshTokensAsync(
             userId.ToString(), login.RefreshToken, user, roles);

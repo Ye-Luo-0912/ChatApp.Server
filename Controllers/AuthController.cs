@@ -1,15 +1,21 @@
 using ChatApp.Server.Models.Requests;
+using ChatApp.Server.Models;
 using Core.Exceptions;
 using Core.Interfaces;
 using Core.Models;
 using Core.Models.Auth;
 using Core.Models.Token;
-using Infrastructure.Models.Email;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using ChatApp.Server.RateLimiting;
+using ChatApp.Server.Authorization;
+using LoginRequest = ChatApp.Contracts.Http.Auth.LoginRequest;
+using LogoutRequest = ChatApp.Contracts.Http.Auth.LogoutRequest;
+using RegisterRequest = ChatApp.Contracts.Http.Auth.RegisterRequest;
+using RefreshTokenRequest = ChatApp.Contracts.Http.Auth.RefreshTokenRequest;
+using SendEmailCodeRequest = ChatApp.Contracts.Http.Auth.SendEmailCodeRequest;
 
 namespace ChatApp.Server.Controllers;
 
@@ -22,7 +28,6 @@ namespace ChatApp.Server.Controllers;
 public class AuthController(
     IAuthService authService,
     IMfaService mfaService,
-    ITrustedDeviceService trustedDevices,
     ILogger<AuthController> logger,
     IEmailVerificationService emailVerificationService) : BaseApiController
 {
@@ -43,11 +48,12 @@ public class AuthController(
         {
             var trusted = Request.Headers["X-Trusted-Device-Token"].FirstOrDefault();
             var result = await authService.LoginAsync(model.Username, model.Password, trusted, cancellationToken);
+            var response = result.ToHttpContract();
             if (result.IsSuccess)
-                return Ok(result);
+                return Ok(response);
             if (result.LoginCheckStatus == LoginCheckStatus.Overloaded)
-                return StatusCode(StatusCodes.Status503ServiceUnavailable, result);
-            return BadRequest(result);
+                return StatusCode(StatusCodes.Status503ServiceUnavailable, response);
+            return BadRequest(response);
         }
         catch (IdentityException ex)
         {
@@ -69,7 +75,8 @@ public class AuthController(
         try
         {
             var result = await authService.VerifyMfaAsync(model.MfaToken, model.Code, cancellationToken);
-            return result.IsSuccess ? Ok(result) : BadRequest(result);
+            var response = result.ToHttpContract();
+            return result.IsSuccess ? Ok(response) : BadRequest(response);
         }
         catch (IdentityException ex)
         {
@@ -82,6 +89,7 @@ public class AuthController(
     /// 用户登出。
     /// </summary>
     [Authorize]
+    [DeletionPendingAccess]
     [HttpPost("logout")]
     public async Task<IActionResult> Logout([FromBody] LogoutRequest request, CancellationToken cancellationToken)
     {
@@ -120,26 +128,40 @@ public class AuthController(
             if (await authService.IsEmailRegisteredAsync(model.Email, ct))
                 return BadRequest(new { Message = "该邮箱已经被注册过了" });
 
-            var verifyResult = await emailVerificationService.VerifyEmailCodeAsync(
+            var (verifyResult, emailClaim) = await emailVerificationService.ClaimEmailCodeAsync(
                 model.Email, model.Code, EmailCodePurpose.Register, ct);
             if (!verifyResult.IsSuccess)
                 return BadRequest(new { Message = verifyResult.ErrorMessage });
 
-            var result = await authService.RegisterAsync(model.Username, model.Email, model.Password, ct);
+            UserRegistrationResult result;
+            try
+            {
+                result = await authService.RegisterAsync(model.Username, model.Email, model.Password, ct);
+                if (result.IsSuccess)
+                    await emailVerificationService.CompleteEmailCodeAsync(emailClaim!, ct);
+                else
+                    await emailVerificationService.RestoreEmailCodeAsync(emailClaim!, ct);
+            }
+            catch
+            {
+                try
+                {
+                    await emailVerificationService.RestoreEmailCodeAsync(emailClaim!, ct);
+                }
+                catch (Exception restoreError)
+                {
+                    logger.LogWarning(restoreError, "注册业务失败后恢复邮箱验证码失败");
+                }
+                throw;
+            }
 
             return result.IsSuccess
                 ? CreatedAtAction(
                     nameof(UsersController.GetUserByName),
                     "Users",
                     new { username = result.Username },
-                    new
-                    {
-                        result.IsSuccess,
-                        result.UserId,
-                        result.Username,
-                        result.Message
-                    })
-                : BadRequest(new { result.Errors, result.Message });
+                    result.ToHttpContract())
+                : BadRequest(result.ToHttpContract());
         }
         catch (IdentityException ex)
         {
@@ -158,7 +180,7 @@ public class AuthController(
     public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequest model, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(model.RefreshToken) || model.UserId <= 0)
-            return BadRequest(TokenPairResult.Fail(AuthErrorType.InvalidCredentials));
+            return BadRequest(TokenPairResult.Fail(AuthErrorType.InvalidCredentials).ToHttpContract());
 
         try
         {
@@ -171,7 +193,8 @@ public class AuthController(
                     model.UserId, result.ErrorType);
             }
 
-            return result.IsSuccess ? Ok(result) : BadRequest(result);
+            var response = result.ToHttpContract();
+            return result.IsSuccess ? Ok(response) : BadRequest(response);
         }
         catch (IdentityException ex)
         {
@@ -198,7 +221,8 @@ public class AuthController(
             return BadRequest("该邮箱已经被注册");
 
         var result = await emailVerificationService.SendEmailCodeAsync(email, EmailCodePurpose.Register, ct);
-        return result.IsSuccess ? Ok(result) : BadRequest(result);
+        var response = result.ToHttpContract();
+        return result.IsSuccess ? Ok(response) : BadRequest(response);
     }
 
     /// <summary>
@@ -219,7 +243,7 @@ public class AuthController(
             var result = await emailVerificationService.SendEmailCodeAsync(
                 request.Email, EmailCodePurpose.ResetPassword, ct);
             if (!result.IsSuccess)
-                return BadRequest(result);
+                return BadRequest(result.ToHttpContract());
         }
 
         return Ok(new { Message = "若该邮箱已注册，验证码将很快送达" });
@@ -306,8 +330,10 @@ public class AuthController(
         if (!result.Succeeded)
             return BadRequest(result.Errors);
 
-        await trustedDevices.RevokeAllAsync(userId, cancellationToken);
-        return Ok(new { Message = "MFA 已关闭，全部可信设备已失效" });
+        // MfaService coordinates the security-version fence and durable
+        // trusted-device/session revocation outbox.  The controller must not
+        // perform a second best-effort revoke after the transaction.
+        return Ok(new { Message = "MFA 已关闭，所有会话和可信设备将在安全变更后失效" });
     }
 
     /// <summary>重新生成恢复码（旧码全部作废）。</summary>

@@ -1,3 +1,5 @@
+using Core.Caching;
+
 namespace Core.Interfaces.Cache;
 
 /// <summary>
@@ -27,6 +29,28 @@ public interface IOneTimeStateStore
     /// </summary>
     Task<T?> TryConsumeAsync<T>(
         string key,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Atomically moves a value to a durable claim key. A pre-existing claim
+    /// blocks a second claimant until it is completed or the original expiry
+    /// is reached.
+    /// </summary>
+    Task<OneTimeStateClaim<T>?> TryClaimAsync<T>(
+        string key,
+        string claimKey,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> CompleteClaimAsync(
+        string claimKey,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Moves an uncompleted claim back to the original key.</summary>
+    Task<bool> RestoreClaimAsync(
+        string key,
+        string claimKey,
+        DateTimeOffset originalExpiresAt,
         CancellationToken cancellationToken = default);
 
     /// <summary>

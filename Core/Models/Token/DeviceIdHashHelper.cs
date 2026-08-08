@@ -27,7 +27,7 @@ public static class DeviceIdHashHelper
         byte[]? rented = null;
         Span<byte> utf8 = byteCount <= StackUtf8Limit
             ? stackalloc byte[byteCount]
-            : (rented = ArrayPool<byte>.Shared.Rent(byteCount));
+            : (rented = ArrayPool<byte>.Shared.Rent(byteCount)).AsSpan(0, byteCount);
 
         try
         {

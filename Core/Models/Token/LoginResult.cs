@@ -31,7 +31,7 @@ public sealed class LoginResult
     public bool IsUnusualLocation { get; init; }
 
     /// <summary>登录时轮换后的可信设备令牌（明文仅此一次）；客户端应覆盖本地存储。</summary>
-    public string? TrustedDeviceToken { get; init; }
+    public string? TrustedDeviceToken { get; set; }
 
     /// <summary>登录时签发的设备凭据明文；客户端应安全保存并在刷新时携带。</summary>
     public string? DeviceCredential { get; init; }
@@ -63,6 +63,8 @@ public sealed class LoginResult
     public bool Gender { get; init; }
     public string? Region { get; init; }
     public UserStatus Status { get; init; }
+    public AccountState AccountState { get; init; }
+    public DateTimeOffset? DeletionScheduledAt { get; init; }
 
     // ---------- 实时通信连接端点 ----------
     public ServerEndPoint? Server { get; init; }
@@ -116,34 +118,46 @@ public sealed class LoginResult
         string? trustedDeviceToken = null,
         bool requiresRecoveryCodeRegeneration = false,
         string? deviceCredential = null
-    ) => new()
+    )
     {
-        IsSuccess = true,
-        LoginCheckStatus = LoginCheckStatus.Success,
-        LoginAt                  = DateTimeOffset.UtcNow,
-        PreviousLoginDate        = previousLoginDate,
-        ClientIp                 = clientIp,
-        IsNewDevice              = isNewDevice,
-        IsUnusualLocation        = isUnusualLocation,
-        TrustedDeviceToken       = trustedDeviceToken,
-        DeviceCredential         = deviceCredential,
-        RequiresRecoveryCodeRegeneration = requiresRecoveryCodeRegeneration,
-        SessionId                = sessionId,
-        DeviceIdHash             = deviceIdHash,
-        UserId                   = user.Id,
-        UserName                 = user.UserName,
-        Email                    = user.Email,
-        AvatarUrl                = user.AvatarUrl,
-        Signature                = user.Signature,
-        Gender                   = user.Gender,
-        Region                   = user.Region,
-        Status                   = user.Status,
-        AccessToken              = accessToken,
-        AccessTokenExpiresAtUtc  = accessTokenExpiresAtUtc,
-        RefreshToken             = refreshToken,
-        RefreshTokenExpiresAtUtc = refreshTokenExpiresAtUtc,
-        Server                   = server
-    };
+        var now = DateTimeOffset.UtcNow;
+        var effectiveState = user.AccountState == AccountState.Deleted
+            ? AccountState.Deleted
+            : user.DeletionScheduledAt is { } scheduledAt && scheduledAt > now
+                ? AccountState.DeletionPending
+                : user.AccountState;
+
+        return new LoginResult
+        {
+            IsSuccess = true,
+            LoginCheckStatus = LoginCheckStatus.Success,
+            LoginAt                  = now,
+            PreviousLoginDate        = previousLoginDate,
+            ClientIp                 = clientIp,
+            IsNewDevice              = isNewDevice,
+            IsUnusualLocation        = isUnusualLocation,
+            TrustedDeviceToken       = trustedDeviceToken,
+            DeviceCredential         = deviceCredential,
+            RequiresRecoveryCodeRegeneration = requiresRecoveryCodeRegeneration,
+            SessionId                = sessionId,
+            DeviceIdHash             = deviceIdHash,
+            UserId                   = user.Id,
+            UserName                 = user.UserName,
+            Email                   = user.Email,
+            AvatarUrl               = user.AvatarUrl,
+            Signature               = user.Signature,
+            Gender                  = user.Gender,
+            Region                  = user.Region,
+            Status                  = user.Status,
+            AccountState            = effectiveState,
+            DeletionScheduledAt     = user.DeletionScheduledAt,
+            AccessToken             = accessToken,
+            AccessTokenExpiresAtUtc = accessTokenExpiresAtUtc,
+            RefreshToken             = refreshToken,
+            RefreshTokenExpiresAtUtc = refreshTokenExpiresAtUtc,
+            Server                   = server
+        };
+    }
 }
 
 /// <summary>

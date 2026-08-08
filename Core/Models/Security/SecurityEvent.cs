@@ -27,6 +27,12 @@ public enum SecurityEventType : short
     MfaRecoveryCodesUpgradeRequired = 22,
     /// <summary>用户拒绝某次可疑登录（仅撤销该次设备会话，不强制改密）。</summary>
     LoginRejected = 23,
+    MfaRecoveryCodeUsed = 24,
+    AccountDeletionCancelled = 25,
+    AccountBanned = 26,
+    LockoutCleared = 27,
+    AccountLocked = 28,
+    PhoneNumberChanged = 29,
 }
 
 /// <summary>持久化安全事件（不依赖会过期的 Redis 会话）。</summary>
@@ -41,5 +47,10 @@ public sealed class SecurityEvent
     public string? Location { get; set; }
     public string? Detail { get; set; }
     public string? ActorUserId { get; set; }
+    /// <summary>
+    /// Idempotency fence for the durable login-audit outbox. Null is allowed
+    /// for security events written by synchronous security mutations.
+    /// </summary>
+    public long? SourceLoginAuditOutboxId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

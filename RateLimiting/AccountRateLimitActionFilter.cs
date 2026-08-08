@@ -1,4 +1,4 @@
-using ChatApp.Server.Models.Requests;
+using ChatApp.Contracts.Http.Auth;
 using Core.Interfaces;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;

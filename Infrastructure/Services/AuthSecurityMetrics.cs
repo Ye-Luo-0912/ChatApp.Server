@@ -33,10 +33,32 @@ public static class AuthSecurityMetrics
 
     private static readonly Counter<long> RiskSignals =
         RiskMeter.CreateCounter<long>("login_risk.signals", "events", "异步登录风险信号");
+    private static readonly Counter<long> LoginRiskDropped =
+        RiskMeter.CreateCounter<long>("login_risk.dropped", "events", "登录风险信号未能持久化的次数");
+    private static long _loginRiskBacklog;
+    private static long _loginRiskOldestAgeMs;
     private static readonly Counter<long> SessionChurnEvictions =
         AuthMeter.CreateCounter<long>("auth.session_churn_evictions", "sessions", "因用户会话上限淘汰的旧会话");
     private static readonly Counter<long> TokenL1Operations =
         AuthMeter.CreateCounter<long>("auth.token_l1", "ops", "访问令牌 L1 命中、未命中和驱逐");
+    private static readonly Counter<long> AuthFenceL1Operations =
+        AuthMeter.CreateCounter<long>("auth.fence_l1", "ops", "用户认证 fence L1 命中、未命中和驱逐");
+    private static readonly Counter<long> AuthFenceRemoteOperations =
+        AuthMeter.CreateCounter<long>("auth.fence_remote", "ops", "用户认证 fence 的 Garnet/权威读取");
+    private static long _authFenceL1Hits;
+    private static long _authFenceL1Misses;
+    private static long _authFenceGarnetReads;
+    private static long _authFencePostgresReads;
+    private static readonly Counter<long> InvalidationReconnects =
+        AuthMeter.CreateCounter<long>("auth.invalidation.reconnects", "events", "认证 L1 失效订阅成功次数");
+    private static readonly Counter<long> InvalidationQueueDrops =
+        AuthMeter.CreateCounter<long>("auth.invalidation.queue_drops", "events", "认证 L1 失效发布队列丢弃次数");
+    private static readonly Counter<long> InvalidationPublishFailures =
+        AuthMeter.CreateCounter<long>("auth.invalidation.publish_failures", "events", "认证 L1 失效 Pub/Sub 发布失败次数");
+    private static readonly Histogram<double> InvalidationLag =
+        AuthMeter.CreateHistogram<double>("auth.invalidation.lag", "ms", "认证 L1 失效从发布到消费的延迟");
+    private static long _accessTokenSubscriberConnected;
+    private static long _authFenceSubscriberConnected;
 
     private static readonly Meter CleanupMeter = new("Infrastructure.AccountCleanup");
     private static readonly Counter<long> CleanupOps =
@@ -45,6 +67,8 @@ public static class AuthSecurityMetrics
     private static readonly Counter<long> ExportBlobDeletes =
         ExportMeter.CreateCounter<long>("data_export.blob_delete", "ops", "导出 blob 删除结果");
     private static long _exportPendingDelete;
+    private static long _exportStagingBytes;
+    private static long _exportStagingReservedBytes;
 
     private static readonly Meter AttachmentMeter = new("Infrastructure.Attachments");
     private static readonly Counter<long> AttachmentBlobDeletes =
@@ -53,8 +77,12 @@ public static class AuthSecurityMetrics
         AttachmentMeter.CreateCounter<long>("attachment.scan", "ops", "附件内容扫描状态变迁");
     private static readonly Counter<long> AttachmentUploadReservations =
         AttachmentMeter.CreateCounter<long>("attachment.upload_reservation", "ops", "附件上传配额预留结果");
+    private static readonly Counter<long> AttachmentScanStagingRejectedCounter =
+        AttachmentMeter.CreateCounter<long>(
+            "attachment.scan.staging_rejected", "jobs", "扫描 staging 字节预算不足");
     private static long _attachmentPendingDelete;
     private static long _attachmentPendingScan;
+    private static long _attachmentScanStagingBytes;
 
     static AuthSecurityMetrics()
     {
@@ -73,6 +101,16 @@ public static class AuthSecurityMetrics
             () => Volatile.Read(ref _exportPendingDelete),
             "jobs",
             "blob 删除失败墓碑数（告警钩子）");
+        ExportMeter.CreateObservableGauge(
+            "data_export.staging_bytes",
+            () => Volatile.Read(ref _exportStagingBytes),
+            "bytes",
+            "当前导出 staging 目录占用字节数");
+        ExportMeter.CreateObservableGauge(
+            "data_export.staging_reserved_bytes",
+            () => Volatile.Read(ref _exportStagingReservedBytes),
+            "bytes",
+            "当前导出 Worker 已预留的 staging 字节数");
         AttachmentMeter.CreateObservableGauge(
             "attachment.pending_delete",
             () => Volatile.Read(ref _attachmentPendingDelete),
@@ -83,6 +121,26 @@ public static class AuthSecurityMetrics
             () => Volatile.Read(ref _attachmentPendingScan),
             "jobs",
             "附件内容扫描待处理作业数（告警钩子）");
+        AttachmentMeter.CreateObservableGauge(
+            "attachment.scan.staging_current_bytes",
+            () => Volatile.Read(ref _attachmentScanStagingBytes),
+            "bytes",
+            "扫描临时文件的当前字节预留量");
+        RiskMeter.CreateObservableGauge(
+            "login_risk.backlog",
+            () => Volatile.Read(ref _loginRiskBacklog),
+            "jobs",
+            "登录风险 Outbox 到期积压量");
+        RiskMeter.CreateObservableGauge(
+            "login_risk.oldest_age_ms",
+            () => Volatile.Read(ref _loginRiskOldestAgeMs),
+            "ms",
+            "登录风险 Outbox 最老到期作业年龄");
+        AuthMeter.CreateObservableGauge(
+            "auth.invalidation.subscriber_connected",
+            ObserveInvalidationSubscribers,
+            "state",
+            "认证 L1 失效 Pub/Sub 订阅连接状态（1=connected, 0=disconnected）");
     }
 
     public static void RecordLogin(string outcome)
@@ -123,11 +181,84 @@ public static class AuthSecurityMetrics
     public static void RecordRisk(string signal)
         => RiskSignals.Add(1, new KeyValuePair<string, object?>("signal", signal));
 
+    public static void RecordLoginRiskDropped()
+        => LoginRiskDropped.Add(1);
+
+    public static void SetLoginRiskBacklog(long backlog, DateTimeOffset? oldestCreatedAt)
+    {
+        Interlocked.Exchange(ref _loginRiskBacklog, Math.Max(0, backlog));
+        var age = oldestCreatedAt is { } created
+            ? Math.Max(0, (long)DateTimeOffset.UtcNow.Subtract(created).TotalMilliseconds)
+            : 0;
+        Interlocked.Exchange(ref _loginRiskOldestAgeMs, age);
+    }
+
     public static void RecordSessionChurnEviction()
         => SessionChurnEvictions.Add(1);
 
     public static void RecordTokenL1(string operation)
         => TokenL1Operations.Add(1, new KeyValuePair<string, object?>("operation", operation));
+
+    public static void RecordAuthFenceL1(string operation)
+    {
+        AuthFenceL1Operations.Add(1, new KeyValuePair<string, object?>("operation", operation));
+        if (string.Equals(operation, "hit", StringComparison.Ordinal))
+            Interlocked.Increment(ref _authFenceL1Hits);
+        else if (string.Equals(operation, "miss", StringComparison.Ordinal))
+            Interlocked.Increment(ref _authFenceL1Misses);
+    }
+
+    public static void RecordAuthFenceRemote(string operation)
+    {
+        AuthFenceRemoteOperations.Add(1, new KeyValuePair<string, object?>("operation", operation));
+        if (operation.StartsWith("garnet", StringComparison.Ordinal))
+            Interlocked.Increment(ref _authFenceGarnetReads);
+        else if (operation.StartsWith("postgres", StringComparison.Ordinal))
+            Interlocked.Increment(ref _authFencePostgresReads);
+    }
+
+    public static AuthFenceMetricSnapshot GetAuthFenceSnapshot()
+        => new(
+            Interlocked.Read(ref _authFenceL1Hits),
+            Interlocked.Read(ref _authFenceL1Misses),
+            Interlocked.Read(ref _authFenceGarnetReads),
+            Interlocked.Read(ref _authFencePostgresReads));
+
+    public static void RecordInvalidationReconnect(string bus)
+        => InvalidationReconnects.Add(1, new KeyValuePair<string, object?>("bus", bus));
+
+    public static void RecordInvalidationQueueDrop(string bus)
+        => InvalidationQueueDrops.Add(1, new KeyValuePair<string, object?>("bus", bus));
+
+    public static void RecordInvalidationPublishFailure(string bus)
+        => InvalidationPublishFailures.Add(1, new KeyValuePair<string, object?>("bus", bus));
+
+    public static void RecordInvalidationLag(string bus, long publishedAtUnixMilliseconds)
+    {
+        if (publishedAtUnixMilliseconds <= 0)
+            return;
+
+        var lag = Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - publishedAtUnixMilliseconds);
+        InvalidationLag.Record(lag, new KeyValuePair<string, object?>("bus", bus));
+    }
+
+    public static void SetInvalidationSubscriberConnected(string bus, bool connected)
+    {
+        if (string.Equals(bus, "access_token", StringComparison.Ordinal))
+            Interlocked.Exchange(ref _accessTokenSubscriberConnected, connected ? 1 : 0);
+        else if (string.Equals(bus, "auth_fence", StringComparison.Ordinal))
+            Interlocked.Exchange(ref _authFenceSubscriberConnected, connected ? 1 : 0);
+    }
+
+    private static IEnumerable<Measurement<long>> ObserveInvalidationSubscribers()
+    {
+        yield return new Measurement<long>(
+            Volatile.Read(ref _accessTokenSubscriberConnected),
+            new KeyValuePair<string, object?>("bus", "access_token"));
+        yield return new Measurement<long>(
+            Volatile.Read(ref _authFenceSubscriberConnected),
+            new KeyValuePair<string, object?>("bus", "auth_fence"));
+    }
 
     public static void RecordAccountCleanup(string outcome, int count = 1)
         => CleanupOps.Add(count, new KeyValuePair<string, object?>("outcome", outcome));
@@ -137,6 +268,12 @@ public static class AuthSecurityMetrics
 
     public static void ExportPendingDeleteDelta(int delta)
         => Interlocked.Add(ref _exportPendingDelete, delta);
+
+    public static void SetExportStagingBytes(long bytes)
+        => Interlocked.Exchange(ref _exportStagingBytes, Math.Max(0, bytes));
+
+    public static void SetExportStagingReservedBytes(long bytes)
+        => Interlocked.Exchange(ref _exportStagingReservedBytes, Math.Max(0, bytes));
 
     public static void AttachmentBlobDelete(string outcome)
         => AttachmentBlobDeletes.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
@@ -152,4 +289,16 @@ public static class AuthSecurityMetrics
 
     public static void AttachmentPendingScanDelta(int delta)
         => Interlocked.Add(ref _attachmentPendingScan, delta);
+
+    public static void SetAttachmentScanStagingBytes(long bytes)
+        => Interlocked.Exchange(ref _attachmentScanStagingBytes, Math.Max(0, bytes));
+
+    public static void AttachmentScanStagingRejected()
+        => AttachmentScanStagingRejectedCounter.Add(1);
+
+    public readonly record struct AuthFenceMetricSnapshot(
+        long L1Hits,
+        long L1Misses,
+        long GarnetReads,
+        long PostgresReads);
 }

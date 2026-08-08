@@ -1,9 +1,10 @@
 namespace Core.Models.Token;
 
 /// <summary>
-/// 对外暴露的登录设备视图。
+/// Core projection of a login session. This is not an HTTP wire DTO; the Host
+/// maps it to the versioned <c>ChatApp.Contracts.Http.Sessions.SessionDevice</c>.
 /// </summary>
-public sealed class SessionDeviceDto
+public sealed class SessionDeviceProjection
 {
     public string DeviceId { get; init; } = string.Empty;
     public string? DeviceName { get; init; }
@@ -17,7 +18,7 @@ public sealed class SessionDeviceDto
     public int RefreshCount { get; init; }
     public bool IsCurrent { get; init; }
 
-    public static SessionDeviceDto From(SessionRecord session, bool isCurrent) => new()
+    public static SessionDeviceProjection From(SessionRecord session, bool isCurrent) => new()
     {
         DeviceId = session.DeviceId,
         DeviceName = session.DeviceName,

@@ -22,7 +22,9 @@ public sealed class SecurityNotificationService(
             Body = Truncate(body, 2000),
             PreferEmail = preferEmail,
             Status = NotificationOutboxStatus.Pending,
-            IdempotencyKey = $"{userId}:{type}:{now.ToUnixTimeMilliseconds()}:{Guid.NewGuid():N}"[..88],
+            IdempotencyKey = Truncate(
+                $"{userId}:{type}:{now.ToUnixTimeMilliseconds()}:{Guid.NewGuid():N}",
+                88),
             CreatedAt = now,
             UpdatedAt = now,
             NextAttemptAt = now,

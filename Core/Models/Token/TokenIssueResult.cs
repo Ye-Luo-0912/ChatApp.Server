@@ -21,4 +21,16 @@
         /// <summary>登录时签发的设备凭据明文；仅返回一次，服务端不持久化明文。</summary>
         public string? DeviceCredential { get; init; }
     }
+
+    /// <summary>
+    /// Exact result of an atomic refresh-token rotation. Expiries are captured
+    /// by the token service from the same issuance timestamp as the persisted
+    /// access/refresh records, so HTTP callers never have to reconstruct them.
+    /// </summary>
+    public readonly record struct TokenRotationResult(
+        string AccessToken,
+        DateTime AccessTokenExpiresAtUtc,
+        string RefreshToken,
+        DateTime RefreshTokenExpiresAtUtc,
+        string? DeviceCredential);
 }

@@ -8,6 +8,13 @@ public sealed class TrustedDevice
     public long Id { get; set; }
     public long UserId { get; set; }
 
+    /// <summary>
+    /// Security fence captured when this device was trusted. A password/MFA/
+    /// role or other security mutation therefore invalidates the device even
+    /// if the asynchronous trusted-device cleanup is delayed.
+    /// </summary>
+    public long SecurityVersion { get; set; } = 1;
+
     /// <summary>可选的客户端设备标签（仅展示，不可用于鉴权）。</summary>
     public string? DeviceIdHint { get; set; }
 
