@@ -1,7 +1,15 @@
 .idea/
 bin/
 obj/
-/packages/
+/.nuget/
+/packages/*
+!/packages/ChatApp.Auth.Contracts.0.3.0.nupkg
+!/packages/ChatApp.Contracts.Http.0.3.0.nupkg
+!/packages/ChatApp.Realtime.Contracts.2.2.0.nupkg
+!/packages/ChatApp.Realtime.Integration.2.3.0.nupkg
+!/packages/ChatApp.Realtime.Contracts.2.3.0.nupkg
+!/packages/ChatApp.Realtime.Integration.3.0.0.nupkg
+!/packages/ChatApp.Realtime.Outbox.EntityFrameworkCore.1.0.0.nupkg
 riderModule.iml
 /_ReSharper.Caches/
 .env
@@ -31,3 +39,5 @@ tmp_*.txt
 tmp_*.csproj.txt
 # Visual Studio IDE snapshots (HierarchyCache / CopilotSnapshots / .suo etc.)
 .vs/
+# Local decompilation recovery scratch (not part of the source tree)
+.decomp-recovery/
