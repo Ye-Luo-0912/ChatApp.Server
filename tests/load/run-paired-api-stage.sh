@@ -124,6 +124,11 @@ wait_for_api
     mixed-workload.k6.js > paired-baseline-warmup.log 2>&1 || true
   for round in $(seq 1 "$rounds"); do
     echo "=== paired baseline round ${round}/${rounds} ==="
+    # 每轮重新生成预设令牌：warmup/上一轮的启动刷新与 401 刷新会轮换并撤销
+    # tokens.json 中的令牌（服务端安全设计），跨进程复用会命中已撤销令牌。
+    # 真实客户端本地持久化令牌且单进程独享，不存在此问题；压测按轮次隔离令牌。
+    TOKEN_PORT="$baseline_port" TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
+      node generate-preset-tokens.mjs
     k6 run \
       -e BASE_URL="http://127.0.0.1:${baseline_port}" \
       -e TOKENS_FILE=./tokens.json \
