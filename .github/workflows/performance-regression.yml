@@ -190,6 +190,18 @@ jobs:
           PGDATABASE: "ChatAppDatabase"
         run: bash tests/load/run-paired-api-stage.sh
 
+      - name: Upload paired baseline diagnostics
+        if: github.event_name != 'pull_request' && steps.comparison.outputs.mode == 'paired' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-baseline-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ChatApp.Server/tests/load/paired-baseline.log
+            ChatApp.Server/tests/load/paired-baseline-warmup.log
+            ChatApp.Server/tests/load/paired-baseline-*-summary.json
+
       - name: Reset Garnet before candidate
         if: github.event_name != 'pull_request' && steps.comparison.outputs.mode == 'paired'
         run: |

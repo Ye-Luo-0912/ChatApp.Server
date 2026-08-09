@@ -26,8 +26,15 @@ fi
 # psql 调用：直连或通过 docker exec 进入 postgres 容器
 run_psql() {
   if [ "${USE_DOCKER:-0}" = "1" ]; then
+    # 共享 runner 上可能同时存在多个 postgres:16.8 服务容器（并发 job），
+    # 按 ancestor 模糊匹配会选中别的 job 的容器，导致 INSERT 落错库。
+    # 显式端口映射 5432 的容器必然属于本 job（迁移/重置均直连该端口）。
     local cid
-    cid=$(docker ps -q --filter ancestor=postgres:16.8 | head -n 1)
+    cid=$(docker ps -q --filter publish=5432 | head -n 1)
+    if [ -z "$cid" ]; then
+      echo "未找到映射宿主 5432 端口的 postgres 容器，回退 ancestor 匹配" >&2
+      cid=$(docker ps -q --filter ancestor=postgres:16.8 | head -n 1)
+    fi
     if [ -z "$cid" ]; then
       echo "未找到 postgres 容器" >&2
       exit 1

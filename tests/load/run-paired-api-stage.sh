@@ -92,9 +92,12 @@ reset_database
 (
   cd "$worktree"
   dotnet ef database update --project Infrastructure --startup-project Infrastructure --context UserDbContext
-  USE_DOCKER=1 SEED_COUNT=60 TEST_USER_PREFIX=loaduser \
-    PGUSER="$database_user" PGDATABASE="$database_name" PGHOST="$database_host" \
-    PGPASSWORD="$database_password" bash tests/load/seed-users.sh
+# 直连 psql 播种（不走 docker exec）：baseline 工作树中的旧 seed-users.sh
+# 使用 ancestor 模糊匹配容器，共享 runner 上并发 job 的 postgres:16.8
+# 容器会干扰匹配；psql 直连 5432 与迁移/重置保持同一实例。
+SEED_COUNT=60 TEST_USER_PREFIX=loaduser \
+  PGUSER="$database_user" PGDATABASE="$database_name" PGHOST="$database_host" \
+  PGPASSWORD="$database_password" bash tests/load/seed-users.sh
 )
 
 (
