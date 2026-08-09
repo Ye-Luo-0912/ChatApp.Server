@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "commit": "784a6f69b2213524e2738c78c37cae16e61a0042",
+  "commit": "5ab6f9d2e7f0620a27c48da7035ff6738ca7efb4",
   "runner": "local-windows-docker",
   "generated_at": "2026-08-03T04:19:57.380Z",
   "runtime": "steady 15m RATE=20; API role=Api; PostgreSQL/Garnet Docker; k6 2.1.0; AuthFence L1=1s Garnet=60s",
