@@ -45,6 +45,9 @@ jobs:
       EmailSettings__Host: "localhost"
       EmailSettings__SenderEmail: "noreply@localhost"
       EmailSettings__Password: "dummy"
+      # Performance 环境按生产校验手机验证回调；CI 无真实网关，用占位 HTTPS URL。
+      PhoneVerification__WebhookUrl: "https://sms.local/webhook"
+      PhoneVerification__AuthorizationToken: "dummy"
       ASPNETCORE_ENVIRONMENT: "Performance"
       # Stage Gate measures the HTTP process only. Background jobs run in a
       # separate Worker deployment and must not contaminate API counters.
