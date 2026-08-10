@@ -41,9 +41,9 @@
       },
       "ChatApp.Realtime.Outbox.EntityFrameworkCore": {
         "type": "Direct",
-        "requested": "[1.0.0, )",
-        "resolved": "1.0.0",
-        "contentHash": "Y8a7L1B8ble/7wyZ1x4mV7B8nhhgPYfZMUB+pew/2KnfvNcHPw5WKrRcPAGw08MT/Sk5upSj4flC0/U+X1Iesg==",
+        "requested": "[1.0.1, )",
+        "resolved": "1.0.1",
+        "contentHash": "hFqkQVLO/rFEDH1RD+q0808NRTC3+autAZ6f3u423DK4Har20YvONFJIGzHuTeivXlxUz2JJbCgo+OYMRPz7JQ==",
         "dependencies": {
           "ChatApp.Realtime.Contracts": "2.3.0",
           "Microsoft.EntityFrameworkCore.Relational": "10.0.5"

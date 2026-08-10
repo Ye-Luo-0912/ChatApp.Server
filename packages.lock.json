@@ -370,7 +370,7 @@
           "ChatApp.Auth.Contracts": "[0.3.0, )",
           "ChatApp.Realtime.Contracts": "[2.5.2, )",
           "ChatApp.Realtime.Integration": "[3.1.3, )",
-          "ChatApp.Realtime.Outbox.EntityFrameworkCore": "[1.0.0, )",
+          "ChatApp.Realtime.Outbox.EntityFrameworkCore": "[1.0.1, )",
           "Core": "[1.0.0, )",
           "MailKit": "[4.16.0, )",
           "NLog.Extensions.Logging": "[6.1.2, )",
@@ -421,9 +421,9 @@
       },
       "ChatApp.Realtime.Outbox.EntityFrameworkCore": {
         "type": "CentralTransitive",
-        "requested": "[1.0.0, )",
-        "resolved": "1.0.0",
-        "contentHash": "Y8a7L1B8ble/7wyZ1x4mV7B8nhhgPYfZMUB+pew/2KnfvNcHPw5WKrRcPAGw08MT/Sk5upSj4flC0/U+X1Iesg==",
+        "requested": "[1.0.1, )",
+        "resolved": "1.0.1",
+        "contentHash": "hFqkQVLO/rFEDH1RD+q0808NRTC3+autAZ6f3u423DK4Har20YvONFJIGzHuTeivXlxUz2JJbCgo+OYMRPz7JQ==",
         "dependencies": {
           "ChatApp.Realtime.Contracts": "2.3.0",
           "Microsoft.EntityFrameworkCore.Relational": "10.0.5"
