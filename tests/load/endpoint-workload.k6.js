@@ -200,7 +200,9 @@ function requestForScenario(session) {
       return http.post(
         `${BASE_URL}/api/attachments/presign`,
         JSON.stringify({
-          contentType: __ENV.ATTACHMENT_CONTENT_TYPE || 'application/octet-stream',
+          // Keep the default fixture aligned with appsettings.json. CI may
+          // still override this to exercise another explicitly allowed type.
+          contentType: __ENV.ATTACHMENT_CONTENT_TYPE || 'image/png',
           contentLength: Number(__ENV.ATTACHMENT_BYTES || 1024),
           originalName: 'k6-performance.bin',
         }),
