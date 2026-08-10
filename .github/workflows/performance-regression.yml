@@ -52,6 +52,10 @@ jobs:
       # 的 8 并发/500ms 会误报 Overloaded(503) 拉高 error 率。
       PasswordHashing__MaxConcurrentOperations: "64"
       PasswordHashing__AcquireTimeoutMilliseconds: "2000"
+      # This stage measures endpoint capacity. Keep production-sensitive
+      # throttles out of the sample; production appsettings remain unchanged.
+      RateLimiting__UserSensitivePermitLimit: "10000"
+      RateLimiting__UserSensitiveWindowSeconds: "60"
       ASPNETCORE_ENVIRONMENT: "Performance"
       # Stage Gate measures the HTTP process only. Background jobs run in a
       # separate Worker deployment and must not contaminate API counters.
@@ -344,16 +348,11 @@ jobs:
               # 轮换会撤销 tokens.json 中的访问令牌，跨进程复用会命中已撤销令牌。
               TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
                 node generate-preset-tokens.mjs
-              # Presign is intentionally create-only and does not auto-complete
-              # an upload. Keep this route below the default per-user pending
-              # quota; the other read routes remain at 20 req/s.
-              scenario_rate=20
-              if [ "$scenario" = "attachment-ticket" ]; then scenario_rate=5; fi
               k6 run \
                 -e BASE_URL=http://127.0.0.1:5088 \
                 -e TOKENS_FILE=./tokens.json \
                 -e SCENARIO="$scenario" \
-                -e RATE="$scenario_rate" -e DURATION="$PERF_ENDPOINT_DURATION" \
+                -e RATE=20 -e DURATION="$PERF_ENDPOINT_DURATION" \
                 --out json="endpoint-${scenario}-${round}.json" \
                 endpoint-workload.k6.js
               node extract-summary.mjs \
