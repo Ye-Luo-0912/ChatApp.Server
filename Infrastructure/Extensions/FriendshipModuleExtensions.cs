@@ -1,5 +1,7 @@
 using Core.Interfaces;
+using Core.Settings;
 using Infrastructure.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Infrastructure.Extensions;
@@ -10,9 +12,14 @@ namespace Infrastructure.Extensions;
 public static class FriendshipModuleExtensions
 {
     /// <summary>注册好友关系服务。</summary>
-    public static IServiceCollection AddFriendshipModule(this IServiceCollection services)
+    public static IServiceCollection AddFriendshipModule(
+        this IServiceCollection services,
+        IConfiguration configuration)
     {
+        services.Configure<RelationshipProjectionExportOptions>(
+            configuration.GetSection(RelationshipProjectionExportOptions.SectionName));
         services.AddScoped<IFriendshipService, FriendshipService>();
+        services.AddScoped<RelationshipProjectionSnapshotReader>();
         return services;
     }
 }

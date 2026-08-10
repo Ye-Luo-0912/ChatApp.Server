@@ -1,6 +1,7 @@
 .idea/
 bin/
 obj/
+**/.artifacts/
 /.nuget/
 /packages/*
 !/packages/ChatApp.Auth.Contracts.0.3.0.nupkg
@@ -10,6 +11,9 @@ obj/
 !/packages/ChatApp.Realtime.Contracts.2.3.0.nupkg
 !/packages/ChatApp.Realtime.Integration.3.0.0.nupkg
 !/packages/ChatApp.Realtime.Outbox.EntityFrameworkCore.1.0.0.nupkg
+!/packages/ChatApp.Realtime.Contracts.2.5.2.nupkg
+!/packages/ChatApp.Realtime.Integration.3.1.3.nupkg
+!/packages/ChatApp.Realtime.Outbox.EntityFrameworkCore.1.0.1.nupkg
 riderModule.iml
 /_ReSharper.Caches/
 .env

@@ -25,25 +25,25 @@
       },
       "ChatApp.Realtime.Contracts": {
         "type": "Direct",
-        "requested": "[2.3.0, )",
-        "resolved": "2.3.0",
-        "contentHash": "+ddxSgDX7ZZ+JunsqbocmPd1AXJKCRijO+GU+Qr6wbNSNc9AoSelBPhyzBIusYr5Ruey0Eb638c9n6aKnG0cgA=="
+        "requested": "[2.5.2, )",
+        "resolved": "2.5.2",
+        "contentHash": "wVCBRuZHkenkGetg+A8NFUHDiSmNsLCMEZ18EGaFKmOvwgllqjcTFGMZCAT/py4mIyD9uXqnXk+HVEASTAQakg=="
       },
       "ChatApp.Realtime.Integration": {
         "type": "Direct",
-        "requested": "[3.0.0, )",
-        "resolved": "3.0.0",
-        "contentHash": "D8ll3qlm9CeN6Jd+sf8I8YuNL+dDzgwbEepcYczwcsRi9tJFfeB7N26TjzYWnYl1FvdH7fpCUi7eiX1tRVAlrQ==",
+        "requested": "[3.1.3, )",
+        "resolved": "3.1.3",
+        "contentHash": "wrqwIG1qO0RRP8g5DyyxP4CKaN0iXz3EGWNcaWXnznCIN6H9YE7tqqtNje7KvLAwt00k/oKty8Eram9WdI3ohg==",
         "dependencies": {
-          "ChatApp.Realtime.Contracts": "2.3.0",
+          "ChatApp.Realtime.Contracts": "2.5.1",
           "NATS.Client.JetStream": "2.8.0"
         }
       },
       "ChatApp.Realtime.Outbox.EntityFrameworkCore": {
         "type": "Direct",
-        "requested": "[1.0.0, )",
-        "resolved": "1.0.0",
-        "contentHash": "Y8a7L1B8ble/7wyZ1x4mV7B8nhhgPYfZMUB+pew/2KnfvNcHPw5WKrRcPAGw08MT/Sk5upSj4flC0/U+X1Iesg==",
+        "requested": "[1.0.1, )",
+        "resolved": "1.0.1",
+        "contentHash": "hFqkQVLO/rFEDH1RD+q0808NRTC3+autAZ6f3u423DK4Har20YvONFJIGzHuTeivXlxUz2JJbCgo+OYMRPz7JQ==",
         "dependencies": {
           "ChatApp.Realtime.Contracts": "2.3.0",
           "Microsoft.EntityFrameworkCore.Relational": "10.0.5"

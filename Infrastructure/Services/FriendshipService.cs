@@ -1,4 +1,8 @@
 using System.Linq.Expressions;
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Integration.Outbox;
+using ChatApp.Realtime.Integration.Serialization;
 using Core.Interfaces;
 using Core.Interfaces.Cache;
 using Core.Models.Common;
@@ -8,6 +12,8 @@ using Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
+using Npgsql;
+using NpgsqlTypes;
 
 namespace Infrastructure.Services;
 
@@ -50,8 +56,336 @@ public class FriendshipService(
     private const int MaxPageLimit = 100;
     private const int MaxFriendGroups = 100;
 
+    private const string FriendRequestResource = "friend-request";
+    private const string FriendshipResource = "friendship";
+    private const string BlockedUserResource = "blocked-user";
+
 
     private readonly ILogger<FriendshipService> _logger = logger;
+
+    private sealed record RelationshipNotificationSpec(
+        RealtimeEventType EventType,
+        RelationshipProjectionListType ListType,
+        long OwnerUserId,
+        long ActorUserId,
+        long SubjectUserId,
+        string Resource,
+        string Action,
+        string ResourceId,
+        string? Message,
+        RelationshipProjectionOperation Operation);
+
+    private static void AddFriendRequestPairChanged(
+        List<RelationshipNotificationSpec> notifications,
+        long actorUserId,
+        long otherUserId,
+        string action,
+        string? message)
+    {
+        // A pair has at most one effective pending request. Use a direction-independent
+        // projection key so reciprocal send/accept and block cleanup delete the same item
+        // that the original request inserted.
+        var resourceId = actorUserId <= otherUserId
+            ? $"{actorUserId}:{otherUserId}"
+            : $"{otherUserId}:{actorUserId}";
+        var operation = string.Equals(action, "Pending", StringComparison.Ordinal)
+            ? RelationshipProjectionOperation.Upsert
+            : RelationshipProjectionOperation.Delete;
+        notifications.Add(new RelationshipNotificationSpec(
+            RealtimeEventType.FriendRequestListChanged,
+            RelationshipProjectionListType.FriendRequests,
+            actorUserId,
+            actorUserId,
+            otherUserId,
+            FriendRequestResource,
+            action,
+            resourceId,
+            message,
+            operation));
+        notifications.Add(new RelationshipNotificationSpec(
+            RealtimeEventType.FriendRequestListChanged,
+            RelationshipProjectionListType.FriendRequests,
+            otherUserId,
+            actorUserId,
+            actorUserId,
+            FriendRequestResource,
+            action,
+            resourceId,
+            message,
+            operation));
+    }
+
+    private static void AddFriendPairChanged(
+        List<RelationshipNotificationSpec> notifications,
+        long actorUserId,
+        long otherUserId,
+        string action)
+    {
+        var operation = string.Equals(action, "Upsert", StringComparison.Ordinal)
+            ? RelationshipProjectionOperation.Upsert
+            : RelationshipProjectionOperation.Delete;
+        AddFriendListChanged(
+            notifications,
+            actorUserId,
+            actorUserId,
+            otherUserId,
+            action,
+            operation);
+        AddFriendListChanged(
+            notifications,
+            otherUserId,
+            actorUserId,
+            actorUserId,
+            action,
+            operation);
+    }
+
+    private static void AddFriendListChanged(
+        List<RelationshipNotificationSpec> notifications,
+        long ownerUserId,
+        long actorUserId,
+        long subjectUserId,
+        string action,
+        RelationshipProjectionOperation operation)
+    {
+        notifications.Add(new RelationshipNotificationSpec(
+            RealtimeEventType.FriendListChanged,
+            RelationshipProjectionListType.Friends,
+            ownerUserId,
+            actorUserId,
+            subjectUserId,
+            FriendshipResource,
+            action,
+            subjectUserId.ToString(),
+            null,
+            operation));
+    }
+
+    private static void AddBlockedListChanged(
+        List<RelationshipNotificationSpec> notifications,
+        long ownerUserId,
+        long subjectUserId,
+        string action,
+        RelationshipProjectionOperation operation) =>
+        notifications.Add(new RelationshipNotificationSpec(
+            RealtimeEventType.BlockedListChanged,
+            RelationshipProjectionListType.BlockedUsers,
+            ownerUserId,
+            ownerUserId,
+            subjectUserId,
+            BlockedUserResource,
+            action,
+            subjectUserId.ToString(),
+            null,
+            operation));
+
+    private static List<RelationshipNotificationSpec> CreateSendOutcomeNotifications(
+        SendFriendRequestOutcome outcome,
+        long requesterId,
+        long targetUserId,
+        string? message)
+    {
+        var notifications = new List<RelationshipNotificationSpec>(4);
+        switch (outcome)
+        {
+            case SendFriendRequestOutcome.RequestSent:
+            case SendFriendRequestOutcome.RestoredDirectly:
+                AddFriendRequestPairChanged(
+                    notifications, requesterId, targetUserId, "Pending", message);
+                break;
+            case SendFriendRequestOutcome.AcceptedDirectly:
+                AddFriendRequestPairChanged(
+                    notifications, requesterId, targetUserId, "Accepted", message);
+                AddFriendPairChanged(notifications, requesterId, targetUserId, "Upsert");
+                break;
+            case SendFriendRequestOutcome.FriendshipRestored:
+                AddFriendPairChanged(notifications, requesterId, targetUserId, "Upsert");
+                break;
+        }
+
+        return notifications;
+    }
+
+    /// <summary>
+    /// Allocates one contiguous version per affected owner/list and stages its delta in the
+    /// current business transaction. PostgreSQL performs all allocations in one command and
+    /// locks streams in stable order; the EF path is retained for in-memory tests.
+    /// </summary>
+    private async Task StageRelationshipNotificationsAsync(
+        IReadOnlyList<RelationshipNotificationSpec> notifications,
+        long occurredAtMs,
+        CancellationToken ct)
+    {
+        if (notifications.Count == 0)
+            return;
+
+        var duplicateStream = notifications
+            .GroupBy(item => (item.OwnerUserId, item.ListType))
+            .FirstOrDefault(group => group.Count() != 1);
+        if (duplicateStream is not null)
+        {
+            throw new InvalidOperationException(
+                $"A relationship mutation emitted more than one delta for stream " +
+                $"({duplicateStream.Key.OwnerUserId}, {duplicateStream.Key.ListType}).");
+        }
+
+        var versions = await AllocateRelationshipProjectionVersionsAsync(
+                notifications, occurredAtMs, ct)
+            .ConfigureAwait(false);
+
+        for (var index = 0; index < notifications.Count; index++)
+        {
+            var notification = notifications[index];
+            var version = versions[index];
+            var eventId = RelationshipEventIdFactory.CreateRelationshipProjectionEventId(
+                notification.OwnerUserId,
+                notification.ListType,
+                version);
+            var delta = new RelationshipProjectionDelta
+            {
+                EventId = eventId,
+                OwnerUserId = notification.OwnerUserId,
+                ListType = notification.ListType,
+                Version = version,
+                Operation = notification.Operation,
+                ResourceId = notification.ResourceId,
+                SubjectUserId = notification.SubjectUserId,
+                ActorUserId = notification.ActorUserId,
+                State = notification.Operation == RelationshipProjectionOperation.Upsert
+                    ? notification.ListType switch
+                    {
+                        RelationshipProjectionListType.FriendRequests => "Pending",
+                        RelationshipProjectionListType.Friends => "Accepted",
+                        RelationshipProjectionListType.BlockedUsers => "Blocked",
+                        _ => throw new ArgumentOutOfRangeException()
+                    }
+                    : notification.Action,
+                Message = notification.Message,
+                OccurredAtMs = occurredAtMs
+            };
+            var payload = new RealtimeDomainNotificationPayload
+            {
+                Resource = notification.Resource,
+                Action = notification.Action,
+                ResourceId = notification.ResourceId,
+                Message = notification.Message,
+                Projection = delta
+            };
+            var evt = new RealtimeEvent
+            {
+                EventId = eventId,
+                Type = notification.EventType,
+                TargetUserId = notification.OwnerUserId,
+                ActorUserId = notification.ActorUserId,
+                PayloadJson = RealtimeWireSerializer.Serialize(payload),
+                OccurredAtMs = occurredAtMs
+            };
+            context.RealtimeOutbox.Add(RealtimeIntegrationOutboxItem.FromEvent(evt));
+        }
+    }
+
+    private async Task<long[]> AllocateRelationshipProjectionVersionsAsync(
+        IReadOnlyList<RelationshipNotificationSpec> notifications,
+        long occurredAtMs,
+        CancellationToken ct)
+    {
+        if (string.Equals(
+                context.Database.ProviderName,
+                "Npgsql.EntityFrameworkCore.PostgreSQL",
+                StringComparison.Ordinal))
+        {
+            var transaction = context.Database.CurrentTransaction
+                ?? throw new InvalidOperationException(
+                    "Relationship projection versions require the owning business transaction.");
+            var connection = context.Database.GetDbConnection() as NpgsqlConnection
+                ?? throw new InvalidOperationException("The configured PostgreSQL connection is not Npgsql.");
+            var dbTransaction = transaction.GetDbTransaction() as NpgsqlTransaction
+                ?? throw new InvalidOperationException("The current PostgreSQL transaction is not Npgsql.");
+
+            const string sql = """
+                WITH input AS (
+                    SELECT owner_user_id, list_type, ordinal
+                    FROM unnest(@owners::bigint[], @list_types::smallint[], @ordinals::integer[])
+                        AS value(owner_user_id, list_type, ordinal)
+                ), allocated AS (
+                    INSERT INTO "T_RelationshipProjectionVersion"
+                        ("OwnerUserId", "ListType", "Version", "UpdatedAtMs")
+                    SELECT owner_user_id, list_type, 1, @occurred_at_ms
+                    FROM input
+                    ORDER BY owner_user_id, list_type
+                    ON CONFLICT ("OwnerUserId", "ListType") DO UPDATE
+                    SET "Version" = "T_RelationshipProjectionVersion"."Version" + 1,
+                        "UpdatedAtMs" = EXCLUDED."UpdatedAtMs"
+                    RETURNING "OwnerUserId", "ListType", "Version"
+                )
+                SELECT input.ordinal, allocated."Version"
+                FROM input
+                JOIN allocated
+                  ON allocated."OwnerUserId" = input.owner_user_id
+                 AND allocated."ListType" = input.list_type
+                ORDER BY input.ordinal;
+                """;
+
+            var owners = notifications.Select(item => item.OwnerUserId).ToArray();
+            var listTypes = notifications.Select(item => (short)item.ListType).ToArray();
+            var ordinals = Enumerable.Range(0, notifications.Count).ToArray();
+            var versions = new long[notifications.Count];
+            var assigned = new bool[notifications.Count];
+
+            await using var command = new NpgsqlCommand(sql, connection, dbTransaction);
+            command.Parameters.AddWithValue(
+                "owners", NpgsqlDbType.Array | NpgsqlDbType.Bigint, owners);
+            command.Parameters.AddWithValue(
+                "list_types", NpgsqlDbType.Array | NpgsqlDbType.Smallint, listTypes);
+            command.Parameters.AddWithValue(
+                "ordinals", NpgsqlDbType.Array | NpgsqlDbType.Integer, ordinals);
+            command.Parameters.AddWithValue(
+                "occurred_at_ms", NpgsqlDbType.Bigint, occurredAtMs);
+
+            await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var ordinal = reader.GetInt32(0);
+                if ((uint)ordinal >= (uint)versions.Length || assigned[ordinal])
+                    throw new InvalidOperationException("Projection version allocation returned an invalid ordinal.");
+                versions[ordinal] = reader.GetInt64(1);
+                assigned[ordinal] = true;
+            }
+
+            if (assigned.Any(value => !value))
+                throw new InvalidOperationException("Projection version allocation returned an incomplete result.");
+            return versions;
+        }
+
+        var fallbackVersions = new long[notifications.Count];
+        for (var index = 0; index < notifications.Count; index++)
+        {
+            var notification = notifications[index];
+            var key = new object[] { notification.OwnerUserId, (byte)notification.ListType };
+            var row = await context.RelationshipProjectionVersions.FindAsync(key, ct)
+                .ConfigureAwait(false);
+            if (row is null)
+            {
+                row = new RelationshipProjectionVersion
+                {
+                    OwnerUserId = notification.OwnerUserId,
+                    ListType = (byte)notification.ListType,
+                    Version = 1,
+                    UpdatedAtMs = occurredAtMs
+                };
+                context.RelationshipProjectionVersions.Add(row);
+            }
+            else
+            {
+                row.Version = checked(row.Version + 1);
+                row.UpdatedAtMs = occurredAtMs;
+            }
+
+            fallbackVersions[index] = row.Version;
+        }
+
+        return fallbackVersions;
+    }
 
     /// <summary>
     /// Starts the transaction that owns a relationship write and, for PostgreSQL,
@@ -304,6 +638,12 @@ public class FriendshipService(
             if (!result.IsSuccess)
                 return result;
 
+            var occurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var notifications = CreateSendOutcomeNotifications(
+                result.Outcome, requesterId, targetUserId, message);
+            await StageRelationshipNotificationsAsync(notifications, occurredAtMs, ct)
+                .ConfigureAwait(false);
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(requesterId, targetUserId).ConfigureAwait(false);
             return result;
@@ -533,6 +873,14 @@ public class FriendshipService(
             if (!result.Succeeded)
                 return result;
 
+            var occurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var notifications = new List<RelationshipNotificationSpec>(4);
+            AddFriendRequestPairChanged(
+                notifications, acceptorId, requesterId, "Accepted", null);
+            AddFriendPairChanged(notifications, acceptorId, requesterId, "Upsert");
+            await StageRelationshipNotificationsAsync(notifications, occurredAtMs, ct)
+                .ConfigureAwait(false);
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(acceptorId, requesterId).ConfigureAwait(false);
             return result;
@@ -676,6 +1024,23 @@ public class FriendshipService(
                 }
             }
 
+            var occurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var notifications = new List<RelationshipNotificationSpec>(6);
+            AddFriendRequestPairChanged(
+                notifications, declinerId, requesterId, "Declined", null);
+            if (blockAfterDecline)
+            {
+                AddBlockedListChanged(
+                    notifications,
+                    declinerId,
+                    requesterId,
+                    "Blocked",
+                    RelationshipProjectionOperation.Upsert);
+                AddFriendPairChanged(notifications, declinerId, requesterId, "Delete");
+            }
+
+            await StageRelationshipNotificationsAsync(notifications, occurredAtMs, ct)
+                .ConfigureAwait(false);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
 
@@ -730,6 +1095,14 @@ public class FriendshipService(
 
             request.Status = RequestStatus.Withdrawn;
             request.RespondedAt = DateTime.UtcNow;
+            var notifications = new List<RelationshipNotificationSpec>(2);
+            AddFriendRequestPairChanged(
+                notifications, requesterId, targetUserId, "Withdrawn", null);
+            await StageRelationshipNotificationsAsync(
+                    notifications,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ct)
+                .ConfigureAwait(false);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(requesterId, targetUserId).ConfigureAwait(false);
@@ -811,6 +1184,19 @@ public class FriendshipService(
             // P0-6：拉黑时关闭双方已有 pending 请求（blocker 发出的 Withdrawn，收到的 Declined）
             await ClosePendingForBlockAsync(blockerId, targetUserId, ct).ConfigureAwait(false);
 
+            var occurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var notifications = new List<RelationshipNotificationSpec>(5);
+            AddBlockedListChanged(
+                notifications,
+                blockerId,
+                targetUserId,
+                "Blocked",
+                RelationshipProjectionOperation.Upsert);
+            AddFriendRequestPairChanged(
+                notifications, blockerId, targetUserId, "ClosedByBlock", null);
+            AddFriendPairChanged(notifications, blockerId, targetUserId, "Delete");
+            await StageRelationshipNotificationsAsync(notifications, occurredAtMs, ct)
+                .ConfigureAwait(false);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(blockerId, targetUserId, blocked: true).ConfigureAwait(false);
@@ -865,6 +1251,18 @@ public class FriendshipService(
             // 历史若为 Accepted 则保持 Removed 状态，由双方重新发起申请建立关系。
             context.BlockRecords.Remove(blockRecord);
 
+            var notifications = new List<RelationshipNotificationSpec>(1);
+            AddBlockedListChanged(
+                notifications,
+                unblockerId,
+                targetUserId,
+                "Unblocked",
+                RelationshipProjectionOperation.Delete);
+            await StageRelationshipNotificationsAsync(
+                    notifications,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ct)
+                .ConfigureAwait(false);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(unblockerId, targetUserId, blocked: false).ConfigureAwait(false);
@@ -934,6 +1332,13 @@ public class FriendshipService(
                 myRecord.DeletedAt = DateTime.UtcNow;
             }
 
+            var notifications = new List<RelationshipNotificationSpec>(2);
+            AddFriendPairChanged(notifications, userId, friendId, "Delete");
+            await StageRelationshipNotificationsAsync(
+                    notifications,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    ct)
+                .ConfigureAwait(false);
             await context.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             await SafeClearCacheAsync(userId, friendId).ConfigureAwait(false);

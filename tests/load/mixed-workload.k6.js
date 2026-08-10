@@ -67,7 +67,9 @@ const BASE_URL = (__ENV.BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
 const BASE_URL_A = (__ENV.BASE_URL_A || BASE_URL).replace(/\/$/, '');
 const BASE_URL_B = (__ENV.BASE_URL_B || BASE_URL).replace(/\/$/, '');
 const LOGIN_RATIO = Number(__ENV.LOGIN_RATIO || 0.1); // steady/soak: 默认 ≤10% 登录
-const REFRESH_RATIO = Number(__ENV.REFRESH_RATIO || 0.05); // steady/soak: 默认 ≤5% 刷新
+// 注意：真实客户端（Chat_App）从不主动随机刷新——refresh 仅在「启动自动登录」与
+// 「请求遇 401 时刷新一次并重放」两个时机发生（LoginViewModel / AuthInterceptor）。
+// steady/soak 已内置这两个语义，不在此随机触发刷新。
 
 const users = new SharedArray('users', () => {
   if (__ENV.CREDS_FILE) return JSON.parse(open(__ENV.CREDS_FILE));
@@ -259,86 +261,104 @@ function doLogin(headers) {
   };
 }
 
-// 执行已认证读取 + 可选 refresh。
-// refresh 成功时返回新令牌，调用方据此更新 VU 级会话状态。
-function authedReads(headers, accessToken, refreshToken, deviceCredential, userId, installationId, doRefresh) {
-  const auth = Object.assign({}, headers, { Authorization: `Bearer ${accessToken}` });
-  let newAccessToken = accessToken;
-  let newRefreshToken = refreshToken;
-  let newDeviceCredential = deviceCredential;
+// 刷新一次；成功则更新会话令牌，失败则清空 accessToken（会话失效语义）。
+function refreshOnce(session) {
+  if (!session.refreshToken || !session.userId) {
+    session.accessToken = '';
+    return session;
+  }
+  group('refresh', () => {
+    const res = http.post(
+      `${BASE_URL}/api/auth/refresh-token`,
+      `{"userId":${session.userId},"refreshToken":${JSON.stringify(session.refreshToken)}}`,
+      { headers: deviceHeaders(__VU, false, session.deviceCredential, session.installationId), tags: { endpoint: 'refresh' } },
+    );
+    refreshTrend.add(res.timings.duration);
+    const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
+    errorRate.add(!ok);
+    if (res.status === 200) {
+      try {
+        const body = res.json();
+        if (body.accessToken) session.accessToken = body.accessToken;
+        if (body.refreshToken) session.refreshToken = body.refreshToken;
+        if (body.deviceCredential) session.deviceCredential = body.deviceCredential;
+      } catch (e) {
+        session.accessToken = '';
+      }
+    } else {
+      // 刷新失败 → 会话失效（对齐 TokenInfo：清令牌并回登录页）
+      session.accessToken = '';
+    }
+  });
+  return session;
+}
+
+// 执行已认证读取。令牌生命周期语义对齐真实客户端 (AuthInterceptor + TokenInfo)：
+//   请求遇 401/403 → 刷新一次 → 用新令牌重放原请求；
+//   刷新失败 → 会话失效，本迭代后续请求不再发出，下次迭代回登录页重新登录。
+function authedReads(headers, accessToken, refreshToken, deviceCredential, userId, installationId) {
+  const session = { accessToken, refreshToken, deviceCredential, userId, installationId };
+  const authFor = (t) => Object.assign({}, headers, { Authorization: `Bearer ${t}` });
+  let auth = authFor(session.accessToken);
 
   group('me', () => {
-    const res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
+    let res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
     meTrend.add(res.timings.duration);
     const dbCommands = Number(responseHeader(res.headers, 'X-ChatApp-Db-Commands') ?? NaN);
     if (Number.isFinite(dbCommands)) meDbQueriesTrend.add(dbCommands);
     const authDbCommands = Number(
       responseHeader(res.headers, 'X-ChatApp-Auth-Db-Commands') ?? NaN);
     if (Number.isFinite(authDbCommands)) meAuthDbQueriesTrend.add(authDbCommands);
+    // 401 → 刷新一次 → 用新令牌重放（对齐 AuthInterceptor）
+    if (res.status === 401 || res.status === 403) {
+      refreshOnce(session);
+      if (session.accessToken) {
+        auth = authFor(session.accessToken);
+        res = http.get(`${BASE_URL}/api/users/me`, { headers: auth, tags: { endpoint: 'me' } });
+        meTrend.add(res.timings.duration);
+        const db2 = Number(responseHeader(res.headers, 'X-ChatApp-Db-Commands') ?? NaN);
+        if (Number.isFinite(db2)) meDbQueriesTrend.add(db2);
+        const adb2 = Number(
+          responseHeader(res.headers, 'X-ChatApp-Auth-Db-Commands') ?? NaN);
+        if (Number.isFinite(adb2)) meAuthDbQueriesTrend.add(adb2);
+      }
+    }
     const ok = check(res, { 'me 200': (r) => r.status === 200 });
     errorRate.add(!ok);
-    // AT 失效或被撤销：清除会话以触发下次迭代重新登录
-    if (res.status === 401 || res.status === 403) {
-      newAccessToken = '';
-      newRefreshToken = '';
-    }
   });
+
+  // search / notifications / sessions：使用最新令牌；401 时刷新并重放一次，
+  // 刷新失败则跳过后续请求（会话已失效，对齐客户端行为，不产生垃圾 401）。
+  const authedGet = (url, tag, trend) => {
+    if (!session.accessToken) return;
+    let res = http.get(url, { headers: auth, tags: { endpoint: tag } });
+    trend.add(res.timings.duration);
+    if (res.status === 401 || res.status === 403) {
+      refreshOnce(session);
+      if (!session.accessToken) return;
+      auth = authFor(session.accessToken);
+      res = http.get(url, { headers: auth, tags: { endpoint: tag } });
+      trend.add(res.timings.duration);
+    }
+    const ok = check(res, { [`${tag} 200`]: (r) => r.status === 200 });
+    errorRate.add(!ok);
+  };
 
   group('search', () => {
     const user = pickUser();
     const q = encodeURIComponent((user.username || 'a').slice(0, 3));
-    const res = http.get(`${BASE_URL}/api/users/search?q=${q}&limit=10`, {
-      headers: auth,
-      tags: { endpoint: 'search' },
-    });
-    searchTrend.add(res.timings.duration);
-    const ok = check(res, { 'search 200': (r) => r.status === 200 });
-    errorRate.add(!ok);
+    authedGet(`${BASE_URL}/api/users/search?q=${q}&limit=10`, 'search', searchTrend);
   });
 
   group('notifications', () => {
-    const res = http.get(`${BASE_URL}/api/users/me/notifications?limit=20`, {
-      headers: auth,
-      tags: { endpoint: 'notifications' },
-    });
-    notifyTrend.add(res.timings.duration);
-    const ok = check(res, { 'notifications 200': (r) => r.status === 200 });
-    errorRate.add(!ok);
+    authedGet(`${BASE_URL}/api/users/me/notifications?limit=20`, 'notifications', notifyTrend);
   });
 
   group('sessions', () => {
-    const res = http.get(`${BASE_URL}/api/users/me/sessions`, {
-      headers: auth,
-      tags: { endpoint: 'sessions' },
-    });
-    sessionsTrend.add(res.timings.duration);
-    const ok = check(res, { 'sessions 200': (r) => r.status === 200 });
-    errorRate.add(!ok);
+    authedGet(`${BASE_URL}/api/users/me/sessions`, 'sessions', sessionsTrend);
   });
 
-  if (doRefresh && refreshToken && userId) {
-    group('refresh', () => {
-      const res = http.post(
-        `${BASE_URL}/api/auth/refresh-token`,
-        `{"userId":${userId},"refreshToken":${JSON.stringify(refreshToken)}}`,
-      { headers: deviceHeaders(__VU, false, deviceCredential, installationId), tags: { endpoint: 'refresh' } },
-      );
-      refreshTrend.add(res.timings.duration);
-      const ok = check(res, { 'refresh 200': (r) => r.status === 200 });
-      errorRate.add(!ok);
-      // 刷新成功后写回新令牌，避免下次迭代用已消费的旧 refresh token
-      if (res.status === 200) {
-        try {
-          const body = res.json();
-          if (body.accessToken) newAccessToken = body.accessToken;
-          if (body.refreshToken) newRefreshToken = body.refreshToken;
-          if (body.deviceCredential) newDeviceCredential = body.deviceCredential;
-        } catch (e) { /* 解析失败保留旧令牌 */ }
-      }
-    });
-  }
-
-  return { accessToken: newAccessToken, refreshToken: newRefreshToken, deviceCredential: newDeviceCredential, userId, installationId };
+  return session;
 }
 
 export default function () {
@@ -364,18 +384,21 @@ export default function () {
       session = doLogin(headers);
     });
     if (session.accessToken) {
-      authedReads(headers, session.accessToken, session.refreshToken, session.deviceCredential, session.userId, session.installationId, false);
+      authedReads(headers, session.accessToken, session.refreshToken, session.deviceCredential, session.userId, session.installationId);
     }
     sleep(Number(__ENV.THINK || 0.2));
     return;
   }
 
-  // steady / soak：VU 级会话跨迭代保持，refresh 成功后写回新令牌
+  // steady / soak：VU 级会话跨迭代保持。会话恢复语义对齐真实客户端：
+  //   - 启动自动登录：用本地令牌先刷新一次（对应 LoginViewModel 启动时 RefreshTokensAsync）
+  //   - 401 → 刷新一次并重放（对应 AuthInterceptor）；刷新失败 → 回登录页重新登录
+  //   - 无每迭代随机刷新（真实客户端从不主动刷新）
   const forceLogin = Math.random() < LOGIN_RATIO;
-  const doRefresh = Math.random() < REFRESH_RATIO;
 
   // 首次迭代或会话丢失时初始化
   if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
+    let session = null;
     if (!forceLogin) {
       const preset = pickToken();
       if (preset && preset.accessToken) {
@@ -383,21 +406,26 @@ export default function () {
         if (!installationId) {
           throw new Error('TOKENS_FILE entry is missing deviceId/installationId; preset tokens must reuse the login installation ID');
         }
-        vuSessions[__VU] = {
+        session = {
           accessToken: preset.accessToken,
           refreshToken: preset.refreshToken || '',
           deviceCredential: preset.deviceCredential || preset.DeviceCredential || '',
           userId: String(preset.userId || ''),
           installationId,
         };
+        // 启动自动登录：先用本地令牌刷新一次；失败则本迭代回登录页
+        refreshOnce(session);
+        if (!session.accessToken) session = null;
       }
     }
-    // 无预设令牌或强制登录时走 login
-    if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
+    // 无预设令牌、刷新失败或强制登录时走 login（回登录页重新登录）
+    if (!session || !session.accessToken) {
       group('login', () => {
-        vuSessions[__VU] = doLogin(headers);
+        session = doLogin(headers);
       });
+      if (!session.accessToken) session = null;
     }
+    if (session) vuSessions[__VU] = session;
   }
 
   if (!vuSessions[__VU] || !vuSessions[__VU].accessToken) {
@@ -406,10 +434,10 @@ export default function () {
   }
 
   const s = vuSessions[__VU];
-  const sessionHeaders = deviceHeaders(__VU, false, '', s.installationId);
-  const updated = authedReads(sessionHeaders, s.accessToken, s.refreshToken, s.deviceCredential, s.userId, s.installationId, doRefresh);
+  const sessionHeaders = deviceHeaders(__VU, false, s.deviceCredential, s.installationId);
+  const updated = authedReads(sessionHeaders, s.accessToken, s.refreshToken, s.deviceCredential, s.userId, s.installationId);
 
-  // 写回更新后的令牌（refresh 成功时为新令牌，me 401 时为空触发重新登录）
+  // 写回更新后的令牌（refresh 成功时为新令牌，会话失效时为空触发重新登录）
   vuSessions[__VU] = updated;
 
   sleep(Number(__ENV.THINK || 0.2));

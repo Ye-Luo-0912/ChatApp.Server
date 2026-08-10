@@ -2,6 +2,7 @@ using System.Net;
 using ChatApp.Server.Extensions;
 using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
+using ChatApp.Server.Services;
 
 using Core.Settings;
 using Infrastructure.Diagnostics;
@@ -78,7 +79,10 @@ public abstract partial class Program
             config,
             registerApiLocalHostedServices: runsApi,
             registerWorkerHostedServices: runsWorkers);
-        service.AddFriendshipModule();
+        service.AddFriendshipModule(config);
+        service.AddScoped<
+            IRelationshipProjectionSnapshotExportService,
+            RelationshipProjectionSnapshotExportService>();
         service.AddAttachmentModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddNotificationModule(config, registerWorkerHostedServices: runsWorkers);
         service.AddModerationModule(config, registerWorkerHostedServices: runsWorkers);
