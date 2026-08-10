@@ -344,11 +344,16 @@ jobs:
               # 轮换会撤销 tokens.json 中的访问令牌，跨进程复用会命中已撤销令牌。
               TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
                 node generate-preset-tokens.mjs
+              # Presign is intentionally create-only and does not auto-complete
+              # an upload. Keep this route below the default per-user pending
+              # quota; the other read routes remain at 20 req/s.
+              scenario_rate=20
+              if [ "$scenario" = "attachment-ticket" ]; then scenario_rate=5; fi
               k6 run \
                 -e BASE_URL=http://127.0.0.1:5088 \
                 -e TOKENS_FILE=./tokens.json \
                 -e SCENARIO="$scenario" \
-                -e RATE=20 -e DURATION="$PERF_ENDPOINT_DURATION" \
+                -e RATE="$scenario_rate" -e DURATION="$PERF_ENDPOINT_DURATION" \
                 --out json="endpoint-${scenario}-${round}.json" \
                 endpoint-workload.k6.js
               node extract-summary.mjs \
