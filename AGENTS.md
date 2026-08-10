@@ -2,6 +2,8 @@
 
 Guidance for humans and coding agents working in this repository.
 
+接手时先读相关实现、调用方、迁移和测试，确认现有语义与数据不变量后再改。优先级是正确/安全、可维护、可测量的性能、真实复用；只共享所有权清楚、线程安全且生命周期匹配的稳定资源，禁止共享 `DbContext`、可变会话、事务或流。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进，阶段长测和发布 soak 留到功能冻结后。当前路线见 `docs/NEXT-STAGE.md`。
+
 ## Architecture boundaries
 
 | Layer | Path | May depend on | Must not |
@@ -12,35 +14,6 @@ Guidance for humans and coding agents working in this repository.
 | Tests | `tests/` | Public behavior and explicitly exposed internals | Depend on execution order or shared mutable fixtures |
 
 Dependency direction is **Host → Infrastructure → Core**. Realtime contracts, NATS integration, and EF Outbox mapping are consumed from the independently versioned `ChatApp.Realtime.Contracts`, `ChatApp.Realtime.Integration`, and `ChatApp.Realtime.Outbox.EntityFrameworkCore` packages in the repository-local feed; Server restore/build must not require a sibling source checkout. Consumers that do not persist the EF Outbox must not reference the Outbox package.
-
-## Engineering priorities
-
-In descending order:
-
-1. Correctness and data safety.
-2. Stable failure and recovery behavior.
-3. Measured latency, throughput, allocation, and resource use.
-4. Simple code with a small maintenance surface.
-
-Do not trade correctness for a benchmark. Do not add a cache, retry, lock, queue, background worker, abstraction, or service boundary without defining its failure semantics.
-
-## Reuse, performance, and maintainability
-
-These are mandatory development principles for every change:
-
-- Reuse an existing focused component, contract, validation rule, or test helper before adding a parallel implementation. Extract shared behavior only when there are at least two real callers and its ownership is clear.
-- Treat performance as a product requirement: keep request and worker hot paths allocation-aware, avoid unnecessary network round trips, database queries, serialization, and object hydration, and optimize only after measurement.
-- Keep code maintainable: preserve layer boundaries, use small cohesive components and explicit failure semantics, remove superseded paths, and cover behavior with focused tests. Prefer a direct, readable implementation over speculative generality.
-- When reuse, performance, and maintainability conflict, retain correctness and data safety first, then select the smallest measured design with the lowest long-term maintenance cost.
-
-## Simplicity and code growth
-
-- Prefer deleting obsolete paths and consolidating duplicate behavior over adding adapters around adapters.
-- Add an abstraction only for a real architectural boundary or repeated behavior. One speculative caller is not enough.
-- Keep hot-path methods direct. Avoid reflection, repeated JSON parsing, entity hydration, hidden network calls, and per-request high-cardinality objects.
-- Extend an existing focused component before creating another near-duplicate component.
-- Do not grow controllers, middleware, interceptors, or repositories into orchestration containers. Extract only cohesive behavior.
-- New code should normally replace at least as much accidental complexity as it introduces.
 
 ## Cache and distributed-state invariants
 
@@ -75,7 +48,8 @@ These are mandatory development principles for every change:
 
 - Establish a Release baseline before and after a performance change.
 - Record at least p50/p95/p99, throughput, error rate, allocation/request, GC pause, CPU, database-pool wait, query count, and Redis RTT.
-- Short smoke tests validate wiring only. Capacity conclusions require the documented 30-minute run and soak profile.
+- Same-profile short tests drive regression checks and tuning; 30 minutes validates a frozen candidate,
+  and soak is reserved for final release gating and long-lived stability.
 - Optimize measured hot paths first. Preserve a readable, tested fallback when an optimization changes storage or wire format.
 
 ## Build and verification

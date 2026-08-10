@@ -1,6 +1,7 @@
 .idea/
 bin/
 obj/
+**/.artifacts/
 /.nuget/
 /packages/*
 !/packages/ChatApp.Auth.Contracts.0.3.0.nupkg

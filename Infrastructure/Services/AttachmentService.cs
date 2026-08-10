@@ -23,10 +23,12 @@ public sealed class AttachmentService(
         // 秒传去重：客户端声明内容 SHA-256 时，先查本用户已确认/已绑定的内容。
         // 命中则签发去重票（无 PUT URL），客户端跳过上传直接确认；确认时服务端
         // 在存储层复制已扫描验证的对象，内容不再经客户端网络传输。
-        if (IsContentAddress(request.Sha256) && metadata.IsAvailable)
+        if (request.Sha256 is { } sha256Hex
+            && IsContentAddress(sha256Hex)
+            && metadata.IsAvailable)
         {
             var candidate = await metadata.TryFindDedupCandidateAsync(
-                    userId, request.Sha256, cancellationToken)
+                    userId, sha256Hex, cancellationToken)
                 .ConfigureAwait(false);
             if (candidate is not null)
                 return await PresignDeduplicatedAsync(

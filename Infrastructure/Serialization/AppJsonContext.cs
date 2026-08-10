@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using ChatApp.Auth.Contracts;
+using ChatApp.Realtime.Abstractions.Relationships;
 using Core.Models.Auth;
 using Core.Models.Common;
 using Core.Models.Email;
@@ -46,6 +47,13 @@ namespace Infrastructure.Serialization;
 [JsonSerializable(typeof(AttachmentUploadTicket))]
 [JsonSerializable(typeof(LocalAvatarStorage.AvatarTicketInfo))]
 [JsonSerializable(typeof(UserStatus))]
+[JsonSerializable(typeof(RelationshipProjectionStreamSnapshot))]
+[JsonSerializable(typeof(RelationshipProjectionSnapshotItem))]
+[JsonSerializable(typeof(List<RelationshipProjectionSnapshotItem>))]
+[JsonSerializable(typeof(RelationshipProjectionStreamDescriptor))]
+[JsonSerializable(typeof(List<RelationshipProjectionStreamDescriptor>))]
+[JsonSerializable(typeof(RelationshipProjectionStreamPage))]
+[JsonSerializable(typeof(RelationshipProjectionStreamDigest))]
 public partial class AppJsonContext : JsonSerializerContext
 {
 }

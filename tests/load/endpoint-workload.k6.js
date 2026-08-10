@@ -108,7 +108,11 @@ function numberHeader(headers, name) {
 }
 
 function installationId() {
-  return `k6-endpoint-installation-${String(__VU).padStart(6, '0')}`;
+  // 优先复用预设令牌登录时绑定的 deviceId：refresh/鉴权校验要求请求的
+  // X-Installation-Id 与会话绑定的 deviceId 一致，自造 ID 会使 refresh 失败。
+  const preset = tokens.length ? tokens[(__VU - 1) % tokens.length] : null;
+  const presetId = preset ? String(preset.deviceId || preset.installationId || preset.device || '') : '';
+  return presetId || `k6-endpoint-installation-${String(__VU).padStart(6, '0')}`;
 }
 
 function commonHeaders() {
@@ -135,23 +139,30 @@ function loginSession() {
     refreshToken: body.refreshToken || '',
     deviceCredential: body.deviceCredential || '',
     userId,
+    installationId: installationId(),
   };
 }
 
 function sessionForVu() {
   if (sessions[__VU]?.accessToken) return sessions[__VU];
 
-  const preset = tokens.length ? tokens[(__VU - 1) % tokens.length] : null;
-  if (preset?.accessToken) {
-    sessions[__VU] = {
-      accessToken: preset.accessToken,
-      refreshToken: preset.refreshToken || '',
-      deviceCredential: preset.deviceCredential || '',
-      userId: String(preset.userId || ''),
-    };
-  } else {
-    sessions[__VU] = loginSession();
+  // 首次迭代：用预设令牌（可能已被上轮 refresh 轮换撤销，失败则回退登录）。
+  if (sessions[__VU] === undefined) {
+    const preset = tokens.length ? tokens[(__VU - 1) % tokens.length] : null;
+    if (preset?.accessToken) {
+      sessions[__VU] = {
+        accessToken: preset.accessToken,
+        refreshToken: preset.refreshToken || '',
+        deviceCredential: preset.deviceCredential || '',
+        userId: String(preset.userId || ''),
+      };
+      if (sessions[__VU].accessToken) return sessions[__VU];
+    }
   }
+
+  // 会话失效后（401/403 清空会话）：直接重新登录。
+  // 不复用预设令牌——固定分配会把 VU 钉在已撤销令牌上形成 401 死循环。
+  sessions[__VU] = loginSession() || { accessToken: '', refreshToken: '', deviceCredential: '', userId: '' };
   return sessions[__VU];
 }
 

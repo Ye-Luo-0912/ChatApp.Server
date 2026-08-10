@@ -333,16 +333,17 @@ jobs:
           for scenario in auth-read friends-read search notifications sessions refresh attachment-ticket; do
             for round in $(seq 1 "$endpoint_rounds"); do
               echo "=== endpoint ${scenario} round ${round}/${endpoint_rounds} (${PERF_ENDPOINT_DURATION}) ==="
-              if [ "$scenario" = "refresh" ]; then
-                TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
-                  node generate-preset-tokens.mjs
-              elif [ "$scenario" = "attachment-ticket" ]; then
+              if [ "$scenario" = "attachment-ticket" ]; then
                 # Presign is intentionally a create-only endpoint. Reset the
                 # disposable fixture between rounds so its pending-object
                 # quota does not turn a capacity sample into a quota sample.
                 PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d ChatAppDatabase \
                   -v ON_ERROR_STOP=1 -c 'TRUNCATE realtime.attachments' >/dev/null
               fi
+              # 每个场景/每轮使用新鲜预设令牌：上一场景或上一轮的 refresh
+              # 轮换会撤销 tokens.json 中的访问令牌，跨进程复用会命中已撤销令牌。
+              TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
+                node generate-preset-tokens.mjs
               k6 run \
                 -e BASE_URL=http://127.0.0.1:5088 \
                 -e TOKENS_FILE=./tokens.json \
@@ -403,6 +404,10 @@ jobs:
           set -euo pipefail
           for round in 1 2 3; do
             echo "=== API steady round ${round}/3 ==="
+            # 每轮使用新鲜预设令牌：上一轮 VU 的启动刷新/401 刷新会轮换并
+            # 撤销 tokens.json 中的令牌，跨进程复用会命中已撤销令牌。
+            TOKEN_PORT=5088 TOKEN_COUNT=50 TOKEN_MIN_SUCCESS=40 TOKEN_CONCURRENCY=4 \
+              node generate-preset-tokens.mjs
             k6 run -e BASE_URL=http://127.0.0.1:5088 -e TOKENS_FILE=./tokens.json \
               -e PROFILE=steady -e RATE=20 -e DURATION=3m \
               --out json="current-${round}.json" \

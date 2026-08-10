@@ -1097,6 +1097,28 @@ namespace Infrastructure.Migrations
                     b.ToTable("T_FriendRequests", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Models.Friend.RelationshipProjectionVersion", b =>
+                {
+                    b.Property<long>("OwnerUserId")
+                        .HasColumnType("bigint");
+
+                    b.Property<byte>("ListType")
+                        .HasColumnType("smallint");
+
+                    b.Property<long>("UpdatedAtMs")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("Version")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("OwnerUserId", "ListType");
+
+                    b.HasIndex("UpdatedAtMs")
+                        .HasDatabaseName("IX_RelationshipProjectionVersion_UpdatedAtMs");
+
+                    b.ToTable("T_RelationshipProjectionVersion", (string)null);
+                });
+
             modelBuilder.Entity("Core.Models.Friend.UserFriendEntry", b =>
                 {
                     b.Property<long>("FriendshipId")

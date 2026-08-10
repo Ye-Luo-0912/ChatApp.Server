@@ -1,4 +1,7 @@
 using System.Security.Claims;
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.Server.IntegrationTests.Support;
 using ChatApp.Server.RateLimiting;
 using Core.Models.Friend;
@@ -56,6 +59,82 @@ public sealed class FriendshipHardeningTests
 
         Assert.False(result.IsSuccess);
         Assert.Equal(FriendshipOperationResultErrorCode.ValidationFailed, result.ErrorCode);
+    }
+
+    [Fact]
+    public async Task SendRequest_QueuesCorrelatableRealtimeInvalidationsWithTheRelationshipWrite()
+    {
+        await using var db = CreateDb();
+        db.Users.AddRange(
+            new Core.Models.Identity.ApplicationUser
+            {
+                Id = 1,
+                UserName = "requester",
+                NormalizedUserName = "REQUESTER",
+                Email = "requester@example.com",
+                NormalizedEmail = "REQUESTER@EXAMPLE.COM",
+                EmailConfirmed = true
+            },
+            new Core.Models.Identity.ApplicationUser
+            {
+                Id = 2,
+                UserName = "target",
+                NormalizedUserName = "TARGET",
+                Email = "target@example.com",
+                NormalizedEmail = "TARGET@EXAMPLE.COM",
+                EmailConfirmed = true,
+                FriendRequestPolicy = Core.Models.Identity.FriendRequestPolicy.RequireVerification
+            });
+        await db.SaveChangesAsync();
+        var service = CreateService(db);
+
+        var result = await service.SendRequestAsync(1, 2, "hello");
+
+        Assert.True(result.IsSuccess);
+        var outbox = await db.RealtimeOutbox.AsNoTracking()
+            .OrderBy(item => item.TargetUserId)
+            .ToArrayAsync();
+        Assert.Equal(2, outbox.Length);
+        Assert.All(outbox, item => Assert.Equal((short)RealtimeEventType.FriendRequestListChanged, item.EventType));
+        Assert.Equal([1L, 2L], outbox.Select(item => item.TargetUserId));
+
+        foreach (var item in outbox)
+        {
+            var evt = RealtimeWireSerializer.DeserializeEvent(item.PayloadJson);
+            Assert.NotNull(evt);
+            Assert.Equal(item.EventId, evt.EventId);
+            Assert.Equal(item.TargetUserId, evt.TargetUserId);
+            Assert.Equal(1, evt.ActorUserId);
+            Assert.Contains("\"Action\":\"Pending\"", evt.PayloadJson, StringComparison.Ordinal);
+            var notification = RealtimeWireSerializer.DeserializeDomainNotification(evt.PayloadJson!);
+            Assert.NotNull(notification?.Projection);
+            Assert.Equal(item.EventId, notification.Projection.EventId);
+            Assert.Equal(item.TargetUserId, notification.Projection.OwnerUserId);
+            Assert.Equal(RelationshipProjectionListType.FriendRequests, notification.Projection.ListType);
+            Assert.Equal(RelationshipProjectionOperation.Upsert, notification.Projection.Operation);
+            Assert.Equal(1, notification.Projection.Version);
+        }
+
+        var firstVersions = await db.RelationshipProjectionVersions.AsNoTracking()
+            .OrderBy(item => item.OwnerUserId)
+            .Select(item => item.Version)
+            .ToArrayAsync();
+        Assert.Equal([1L, 1L], firstVersions);
+
+        var initialEventIds = outbox.Select(item => item.EventId).ToHashSet(StringComparer.Ordinal);
+        var withdrawn = await service.WithdrawRequestAsync(1, 2);
+        Assert.True(withdrawn.IsSuccess);
+        var withdrawalEvents = (await db.RealtimeOutbox.AsNoTracking().ToArrayAsync())
+            .Where(item => !initialEventIds.Contains(item.EventId))
+            .ToArray();
+        Assert.Equal(2, withdrawalEvents.Length);
+        foreach (var item in withdrawalEvents)
+        {
+            var evt = RealtimeWireSerializer.DeserializeEvent(item.PayloadJson);
+            var notification = RealtimeWireSerializer.DeserializeDomainNotification(evt!.PayloadJson!);
+            Assert.Equal(RelationshipProjectionOperation.Delete, notification!.Projection!.Operation);
+            Assert.Equal(2, notification.Projection.Version);
+        }
     }
 
     [Fact]

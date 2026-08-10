@@ -48,6 +48,7 @@ namespace Infrastructure.Data
         public DbSet<FriendRequest> FriendRequests { get; set; }
         public DbSet<FriendGroup> FriendGroups { get; set; }
         public DbSet<BlockRecord> BlockRecords { get; set; }
+        public DbSet<RelationshipProjectionVersion> RelationshipProjectionVersions { get; set; }
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -508,6 +509,7 @@ namespace Infrastructure.Data
             builder.ApplyConfiguration(new FriendRequestConfig());
             builder.ApplyConfiguration(new FriendGroupConfig());
             builder.ApplyConfiguration(new BlockRecordConfig());
+            builder.ApplyConfiguration(new RelationshipProjectionVersionConfig());
             builder.AddChatAppRealtimeOutbox();
         }
     }
