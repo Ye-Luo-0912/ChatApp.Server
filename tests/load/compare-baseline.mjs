@@ -140,7 +140,9 @@ function percentile(sortedValues, p) {
 const TREND_MAP = {
     login_ms: 'login',
     refresh_ms: 'refresh',
-    friends_ms: 'friends',
+    // The steady mixed workload does not emit a friends trend. Friends is
+    // measured by the independent endpoint stage, so do not require a
+    // permanently missing metric in the steady comparison.
     search_ms: 'search',
     notifications_ms: 'notifications',
     sessions_ms: 'sessions',
