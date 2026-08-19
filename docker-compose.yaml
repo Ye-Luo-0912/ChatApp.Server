@@ -97,6 +97,7 @@ services:
       ConnectionStrings__DefaultConnection: Host=postgres_db;Port=5432;Database=${POSTGRES_DB:-ChatAppDatabase};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD};Pooling=true
       ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
       Security__SecretEncryptionKey: ${Security__SecretEncryptionKey:?Set Security__SecretEncryptionKey}
+      RelationshipProjectionExport__ApiKey: ${RelationshipProjectionExport__ApiKey:-B/+8BUBJ2Shn69+2x+SPH6glcjq9HyXT}
       EmailSettings__Host: ${EmailSettings__Host:?Set EmailSettings__Host}
       EmailSettings__SenderEmail: ${EmailSettings__SenderEmail:?Set EmailSettings__SenderEmail}
       EmailSettings__Password: ${EmailSettings__Password:?Set EmailSettings__Password}

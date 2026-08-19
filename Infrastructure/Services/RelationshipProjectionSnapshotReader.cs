@@ -35,6 +35,7 @@ public sealed class RelationshipProjectionSnapshotReader(UserDbContext db)
         var versionStreams = db.RelationshipProjectionVersions.AsNoTracking()
             .Select(row => new { row.OwnerUserId, row.ListType });
         var friendStreams = db.Friendships.AsNoTracking()
+            .Where(row => !row.IsDeleted)
             .Select(row => new
             {
                 OwnerUserId = row.UserId,
@@ -60,12 +61,33 @@ public sealed class RelationshipProjectionSnapshotReader(UserDbContext db)
                 OwnerUserId = row.BlockerId,
                 ListType = (byte)RelationshipProjectionListType.BlockedUsers
             });
+        // 无任何关系数据的用户同样需要三份流，否则 rebuild 不会为其建立空快照基线，
+        // TCP 读取将永远返回 relationship_read_projection_unavailable 而无法与 HTTP 空列表一致。
+        var users = db.Users.AsNoTracking().Select(row => row.Id);
+        var userFriendStreams = users.Select(id => new
+        {
+            OwnerUserId = id,
+            ListType = (byte)RelationshipProjectionListType.Friends
+        });
+        var userRequestStreams = users.Select(id => new
+        {
+            OwnerUserId = id,
+            ListType = (byte)RelationshipProjectionListType.FriendRequests
+        });
+        var userBlockedStreams = users.Select(id => new
+        {
+            OwnerUserId = id,
+            ListType = (byte)RelationshipProjectionListType.BlockedUsers
+        });
 
         var streams = versionStreams
             .Union(friendStreams)
             .Union(requesters)
             .Union(targets)
-            .Union(blockers);
+            .Union(blockers)
+            .Union(userFriendStreams)
+            .Union(userRequestStreams)
+            .Union(userBlockedStreams);
         if (afterOwnerUserId is { } owner && afterListType is { } listType)
         {
             var numericListType = (byte)listType;
@@ -227,7 +249,7 @@ public sealed class RelationshipProjectionSnapshotReader(UserDbContext db)
         CancellationToken ct)
     {
         var ids = await db.Friendships.AsNoTracking()
-            .Where(row => row.UserId == ownerUserId)
+            .Where(row => row.UserId == ownerUserId && !row.IsDeleted)
             .OrderBy(row => row.FriendId)
             .Take(MaxSnapshotItems + 1)
             .Select(row => row.FriendId)
@@ -274,7 +296,7 @@ public sealed class RelationshipProjectionSnapshotReader(UserDbContext db)
         CancellationToken ct)
     {
         var rows = await db.Friendships.AsNoTracking()
-            .Where(row => row.UserId == ownerUserId)
+            .Where(row => row.UserId == ownerUserId && !row.IsDeleted)
             .OrderBy(row => row.FriendId)
             .Take(MaxSnapshotItems + 1)
             .Select(row => new { row.FriendId, row.CreatedAt })

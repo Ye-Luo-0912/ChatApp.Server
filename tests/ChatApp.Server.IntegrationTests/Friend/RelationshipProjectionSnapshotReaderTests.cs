@@ -145,6 +145,48 @@ public sealed class RelationshipProjectionSnapshotReaderTests(PostgresTestFixtur
         Assert.Equal(0, snapshot.ItemCount);
     }
 
+    [SkippableFact]
+    public async Task ListStreams_EnumeratesEmptyUsersSoRebuildCanBaseline()
+    {
+        Skip.If(!postgres.IsAvailable, postgres.SkipReason);
+
+        var emptyUser = new TsidGeneratorService().GenerateTsid();
+        await using (var seed = postgres.CreateContext())
+        {
+            seed.Users.Add(CreateUser(emptyUser, "snapshot-empty"));
+            await seed.SaveChangesAsync();
+        }
+
+        await using var db = postgres.CreateContext();
+        var reader = new RelationshipProjectionSnapshotReader(db);
+
+        // 无任何关系数据的用户也必须枚举出三份流（version=0），
+        // 否则 Realtime rebuild 不会为其建立空快照基线，TCP 读取永远 Unavailable。
+        var streams = await reader.ListStreamsAsync(
+            emptyUser - 1,
+            RelationshipProjectionListType.BlockedUsers,
+            20);
+        Assert.Contains(streams.Items, item =>
+            item.OwnerUserId == emptyUser
+            && item.ListType == RelationshipProjectionListType.Friends
+            && item.Version == 0);
+        Assert.Contains(streams.Items, item =>
+            item.OwnerUserId == emptyUser
+            && item.ListType == RelationshipProjectionListType.FriendRequests
+            && item.Version == 0);
+        Assert.Contains(streams.Items, item =>
+            item.OwnerUserId == emptyUser
+            && item.ListType == RelationshipProjectionListType.BlockedUsers
+            && item.Version == 0);
+
+        var snapshot = await reader.ReadStreamAsync(
+            emptyUser,
+            RelationshipProjectionListType.Friends);
+        Assert.Equal(0, snapshot.Version);
+        Assert.Equal(0, snapshot.ItemCount);
+        Assert.Empty(snapshot.Items);
+    }
+
     private static ApplicationUser CreateUser(long id, string prefix)
     {
         var suffix = id.ToString();
