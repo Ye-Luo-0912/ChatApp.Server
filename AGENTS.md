@@ -2,7 +2,7 @@
 
 Guidance for humans and coding agents working in this repository.
 
-接手时先读相关实现、调用方、迁移和测试，确认现有语义与数据不变量后再改。优先级是正确/安全、可维护、可测量的性能、真实复用；只共享所有权清楚、线程安全且生命周期匹配的稳定资源，禁止共享 `DbContext`、可变会话、事务或流。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进，阶段长测和发布 soak 留到功能冻结后。当前路线见 `docs/NEXT-STAGE.md`。
+接手时先读相关实现、调用方、迁移和测试，确认现有语义与数据不变量后再改。优先级依次是正确/安全、功能链路完整、可维护、可测量的性能、真实复用；只共享所有权清楚、线程安全且生命周期匹配的稳定资源，禁止共享 `DbContext`、可变会话、事务或流。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进。当前路线见 `docs/NEXT-STAGE.md`。
 
 ## Architecture boundaries
 
@@ -48,8 +48,8 @@ Dependency direction is **Host → Infrastructure → Core**. Realtime contracts
 
 - Establish a Release baseline before and after a performance change.
 - Record at least p50/p95/p99, throughput, error rate, allocation/request, GC pause, CPU, database-pool wait, query count, and Redis RTT.
-- Same-profile short tests drive regression checks and tuning; 30 minutes validates a frozen candidate,
-  and soak is reserved for final release gating and long-lived stability.
+- Same-profile short tests drive regression checks and tuning. Longer stability runs are outside the
+  current feature-development route.
 - Optimize measured hot paths first. Preserve a readable, tested fallback when an optimization changes storage or wire format.
 
 ## Build and verification
