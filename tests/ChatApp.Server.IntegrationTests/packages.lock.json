@@ -661,7 +661,7 @@
         "dependencies": {
           "AspNetCore.HealthChecks.NpgSql": "[9.0.0, )",
           "AspNetCore.HealthChecks.Redis": "[9.0.0, )",
-          "ChatApp.Contracts.Http": "[0.3.0, )",
+          "ChatApp.Contracts.Http": "[0.5.5, )",
           "Core": "[1.0.0, )",
           "Infrastructure": "[1.0.0, )",
           "Microsoft.AspNetCore.OpenApi": "[10.0.5, )",
@@ -739,9 +739,9 @@
       },
       "ChatApp.Contracts.Http": {
         "type": "CentralTransitive",
-        "requested": "[0.3.0, )",
-        "resolved": "0.3.0",
-        "contentHash": "vycL6+N0x/BDaja1O9RA697CNR5CtTMDqNZB9W8PobIC3azZdnqYq8ocMG8Gxzkhmkdv20sYB98nxAVf6dNKhA=="
+        "requested": "[0.5.5, )",
+        "resolved": "0.5.5",
+        "contentHash": "dll0UBe/rMWLTr2yL9xBCvvwhLt3bDQfEJgF40tvvxM7esSNgrYZ7Du0FaZe81UWtTGzr5KMWkmrFamGGi6w2w=="
       },
       "ChatApp.Realtime.Contracts": {
         "type": "CentralTransitive",
@@ -767,7 +767,7 @@
         "resolved": "1.0.1",
         "contentHash": "hFqkQVLO/rFEDH1RD+q0808NRTC3+autAZ6f3u423DK4Har20YvONFJIGzHuTeivXlxUz2JJbCgo+OYMRPz7JQ==",
         "dependencies": {
-          "ChatApp.Realtime.Contracts": "2.3.0",
+          "ChatApp.Realtime.Contracts": "2.5.2",
           "Microsoft.EntityFrameworkCore.Relational": "10.0.5"
         }
       },
