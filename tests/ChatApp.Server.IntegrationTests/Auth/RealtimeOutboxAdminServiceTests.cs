@@ -16,11 +16,17 @@ public sealed class RealtimeOutboxAdminServiceTests(PostgresTestFixture postgres
         Skip.If(!postgres.IsAvailable, postgres.SkipReason);
         await using var db = postgres.CreateContext();
 
+        // EventId 是主键：共享测试库跨轮残留会使固定键撞唯一约束，按每次运行唯一化。
+        var suffix = Guid.NewGuid().ToString("N")[..8];
+        var pendingId = $"ops-pending-1-{suffix}";
+        var deadId = $"ops-dead-1-{suffix}";
+        var publishedId = $"ops-published-1-{suffix}";
+
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         db.RealtimeOutbox.AddRange(
             new RealtimeIntegrationOutboxItem
             {
-                EventId = "ops-pending-1",
+                EventId = pendingId,
                 PayloadJson = """{"type":5}""",
                 TargetUserId = 42,
                 EventType = (short)RealtimeEventType.MessageReceived,
@@ -32,7 +38,7 @@ public sealed class RealtimeOutboxAdminServiceTests(PostgresTestFixture postgres
             },
             new RealtimeIntegrationOutboxItem
             {
-                EventId = "ops-dead-1",
+                EventId = deadId,
                 PayloadJson = """{"type":8}""",
                 TargetUserId = 42,
                 EventType = (short)RealtimeEventType.UserAccountDeleted,
@@ -44,7 +50,7 @@ public sealed class RealtimeOutboxAdminServiceTests(PostgresTestFixture postgres
             },
             new RealtimeIntegrationOutboxItem
             {
-                EventId = "ops-published-1",
+                EventId = publishedId,
                 PayloadJson = """{"type":5}""",
                 TargetUserId = 7,
                 EventType = (short)RealtimeEventType.MessageReceived,
@@ -63,22 +69,22 @@ public sealed class RealtimeOutboxAdminServiceTests(PostgresTestFixture postgres
         Assert.True(summary.OldestPendingAgeMs is > 0);
 
         var dead = await svc.ListAsync(status: "Dead", targetUserId: 42, offset: 0, limit: 20);
-        Assert.Contains(dead.Items, x => x.EventId == "ops-dead-1" && x.LastError == "poison");
+        Assert.Contains(dead.Items, x => x.EventId == deadId && x.LastError == "poison");
 
-        var (pubOk, pubErr) = await svc.ReplayDeadAsync("ops-published-1");
+        var (pubOk, pubErr) = await svc.ReplayDeadAsync(publishedId);
         Assert.False(pubOk);
         Assert.Equal("already_published", pubErr);
 
-        var (pendingOk, pendingErr) = await svc.ReplayDeadAsync("ops-pending-1");
+        var (pendingOk, pendingErr) = await svc.ReplayDeadAsync(pendingId);
         Assert.False(pendingOk);
         Assert.Equal("not_dead", pendingErr);
 
-        var (ok, err) = await svc.ReplayDeadAsync("ops-dead-1");
+        var (ok, err) = await svc.ReplayDeadAsync(deadId);
         Assert.True(ok);
         Assert.Null(err);
 
         db.ChangeTracker.Clear();
-        var replayed = await db.RealtimeOutbox.FindAsync("ops-dead-1");
+        var replayed = await db.RealtimeOutbox.FindAsync(deadId);
         Assert.NotNull(replayed);
         Assert.Equal((short)RealtimeOutboxStatus.Pending, replayed!.Status);
         Assert.Equal(0, replayed.AttemptCount);
