@@ -61,6 +61,15 @@ internal static class HttpContractMapper
                 Host = server.Host,
                 Name = server.Name,
                 Port = server.Port,
+                // 端点安全元数据（ENDPOINT-TLS-1）：加性下发；null 项在 wire 上省略，
+                // 旧客户端跳过未知字段，未配置部署的响应与旧形状逐字节一致。
+                Scheme = server.Scheme is { } scheme
+                    ? (ChatApp.Contracts.Http.Common.EndpointScheme)scheme
+                    : null,
+                MinimumTls = server.MinimumTls is { } minimumTls
+                    ? (ChatApp.Contracts.Http.Common.MinimumTlsPolicy)minimumTls
+                    : null,
+                SniTargetHost = server.SniTargetHost,
             }
             : null,
     };

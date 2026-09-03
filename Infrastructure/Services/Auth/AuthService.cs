@@ -441,7 +441,13 @@ public class AuthService(
         {
             Host = _realtimeGateway.Host,
             Port = _realtimeGateway.Port,
-            Name = _realtimeGateway.Name
+            Name = _realtimeGateway.Name,
+            // 端点安全元数据按部署配置透传；未配置时保持 null，登录响应维持旧 wire 形状。
+            Scheme = _realtimeGateway.Scheme,
+            MinimumTls = _realtimeGateway.MinimumTls,
+            SniTargetHost = string.IsNullOrWhiteSpace(_realtimeGateway.SniTargetHost)
+                ? null
+                : _realtimeGateway.SniTargetHost,
         };
 
         _logger.LogInformation(

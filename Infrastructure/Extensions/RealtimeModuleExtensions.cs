@@ -26,6 +26,9 @@ public static class RealtimeModuleExtensions
             .AddOptions<RealtimeGatewayOptions>()
             .Validate(s => !string.IsNullOrWhiteSpace(s.Host), "RealtimeGateway:Host 必填")
             .Validate(s => s.Port > 0, "RealtimeGateway:Port 必须 > 0")
+            .Validate(
+                s => s.IsEndpointMetadataConsistent(out _),
+                "RealtimeGateway 端点安全元数据无效（未定义的枚举值，或明文 scheme 声明了 TLS policy）")
             .ValidateOnStart();
 
         services.Configure<RealtimeIntegrationHostOptions>(config.GetSection(RealtimeIntegrationHostOptions.SectionName));
