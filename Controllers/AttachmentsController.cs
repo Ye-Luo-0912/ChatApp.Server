@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Timeouts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Logging;
 using AttachmentPresignRequest = ChatApp.Contracts.Http.Attachments.AttachmentPresignRequest;
 using ConfirmAttachmentRequest = ChatApp.Contracts.Http.Attachments.ConfirmAttachmentRequest;
 
@@ -15,9 +16,10 @@ namespace ChatApp.Server.Controllers;
 [Authorize]
 [Route("api/attachments")]
 [EnableRateLimiting("user-sensitive")]
-    public sealed class AttachmentsController(
-        IAttachmentService attachments,
-        IAttachmentConfirmSagaService confirmSagas) : BaseApiController
+public sealed class AttachmentsController(
+    IAttachmentService attachments,
+    IAttachmentConfirmSagaService confirmSagas,
+    ILogger<AttachmentsController> logger) : BaseApiController
 {
     [HttpPost("presign")]
     public async Task<IActionResult> Presign(
@@ -38,19 +40,19 @@ namespace ChatApp.Server.Controllers;
                 AttachmentUploadReservationStatus.Reserved when result.Response is not null =>
                     Ok(result.Response.ToHttpContract()),
                 AttachmentUploadReservationStatus.UnconfirmedObjectLimitExceeded =>
-                    StatusCode(
+                    PresignDenied(userId, "pending_limit", detail: null, StatusCode(
                         StatusCodes.Status429TooManyRequests,
                         new
                         {
                             Message = "未确认附件数量已达上限，请完成、放弃或稍后重试",
                             Code = "AttachmentPendingLimitExceeded",
-                        }),
+                        })),
                 AttachmentUploadReservationStatus.StorageBytesLimitExceeded =>
-                    Conflict(new
+                    PresignDenied(userId, "storage_limit", detail: null, Conflict(new
                     {
                         Message = "附件存储配额不足",
                         Code = "AttachmentStorageQuotaExceeded",
-                    }),
+                    })),
                 AttachmentUploadReservationStatus.MetadataUnavailable =>
                     StatusCode(
                         StatusCodes.Status503ServiceUnavailable,
@@ -66,7 +68,8 @@ namespace ChatApp.Server.Controllers;
         }
         catch (ArgumentException ex)
         {
-            return BadRequest(new { Message = ex.Message });
+            return PresignDenied(
+                userId, "invalid_argument", ex.Message, BadRequest(new { Message = ex.Message }));
         }
     }
 
@@ -105,6 +108,8 @@ namespace ChatApp.Server.Controllers;
             cancellationToken);
         if (!result.Succeeded)
             return BadRequest(result.Errors);
+        AttachmentAuditLog.AttachmentConfirmed(
+            logger, body?.AttachmentId ?? model.AttachmentId ?? string.Empty, userId);
         return Accepted(body?.ToHttpContract());
     }
 
@@ -143,6 +148,8 @@ namespace ChatApp.Server.Controllers;
             return Unauthorized();
 
         var decision = await attachments.AbandonAsync(userId, attachmentId, cancellationToken);
+        if (decision == AttachmentDownloadDecision.Allowed)
+            AttachmentAuditLog.AttachmentAbandoned(logger, attachmentId, userId);
         return decision switch
         {
             AttachmentDownloadDecision.Allowed => Ok(new { Message = "已放弃附件" }),
@@ -165,10 +172,17 @@ namespace ChatApp.Server.Controllers;
         CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
+        {
+            AttachmentAuditLog.DownloadDenied(logger, attachmentId, "anonymous", "ticket", "anonymous");
             return Unauthorized();
+        }
 
         var (decision, body) = await attachments.IssueDownloadTicketAsync(
             userId, attachmentId, cancellationToken);
+        AuditDownloadDenied(attachmentId, userId, "ticket", decision);
+
+        if (decision == AttachmentDownloadDecision.Allowed && body is not null)
+            AttachmentAuditLog.DownloadTicketIssued(logger, attachmentId, userId);
 
         return decision switch
         {
@@ -202,12 +216,16 @@ namespace ChatApp.Server.Controllers;
         CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
+        {
+            AttachmentAuditLog.DownloadDenied(logger, attachmentId, "anonymous", "download", "anonymous");
             return Unauthorized();
+        }
 
         var (decision, access) = string.IsNullOrWhiteSpace(ticket)
             ? await attachments.AuthorizeDownloadAsync(userId, attachmentId, cancellationToken)
             : await attachments.AuthorizeDownloadWithTicketAsync(
                 userId, attachmentId, ticket, cancellationToken);
+        AuditDownloadDenied(attachmentId, userId, "download", decision);
 
         return decision switch
         {
@@ -230,6 +248,34 @@ namespace ChatApp.Server.Controllers;
                 await ServeContentAsync(access, format, cancellationToken),
             _ => NotFound(),
         };
+    }
+
+    /// <summary>预签拒绝审计与响应共用出口：配额类无 attachmentId（上传票已被撤销）。</summary>
+    private IActionResult PresignDenied(long userId, string reason, string? detail, IActionResult response)
+    {
+        AttachmentAuditLog.PresignDenied(logger, userId, reason, detail);
+        return response;
+    }
+
+    /// <summary>
+    /// 4101 只审计隔离边界的否定决策：越权、票据无效、扫描中。
+    /// NotFound/Unavailable 与成员隔离无关，不产生审计噪音。
+    /// </summary>
+    private void AuditDownloadDenied(
+        string attachmentId,
+        long userId,
+        string action,
+        AttachmentDownloadDecision decision)
+    {
+        var code = decision switch
+        {
+            AttachmentDownloadDecision.Forbidden => "forbidden",
+            AttachmentDownloadDecision.InvalidTicket => "invalid_ticket",
+            AttachmentDownloadDecision.NotReady => "not_ready",
+            _ => null,
+        };
+        if (code is not null)
+            AttachmentAuditLog.DownloadDenied(logger, attachmentId, userId.ToString(), action, code);
     }
 
     private async Task<IActionResult> ServeContentAsync(

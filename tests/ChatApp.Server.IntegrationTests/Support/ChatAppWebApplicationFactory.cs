@@ -9,6 +9,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Server.IntegrationTests.Support;
 
@@ -22,13 +23,15 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
     private readonly string _keyPrefix;
     private readonly string _avatarRoot;
     private readonly Dictionary<string, string?> _extra;
+    private readonly ILoggerProvider? _loggerProvider;
 
     public ChatAppWebApplicationFactory(
         string postgresConnection,
         string redisConnection,
         string? cacheKeyPrefix = null,
         string? avatarRoot = null,
-        IReadOnlyDictionary<string, string?>? extraConfig = null)
+        IReadOnlyDictionary<string, string?>? extraConfig = null,
+        ILoggerProvider? loggerProvider = null)
     {
         _postgres = postgresConnection;
         _redis = redisConnection;
@@ -37,6 +40,7 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
         _extra = extraConfig is null
             ? new Dictionary<string, string?>()
             : new Dictionary<string, string?>(extraConfig);
+        _loggerProvider = loggerProvider;
         Directory.CreateDirectory(_avatarRoot);
     }
 
@@ -114,6 +118,10 @@ public sealed class ChatAppWebApplicationFactory : WebApplicationFactory<Program
             // 避免登录安全通知写入 EmailOutbox，污染 Outbox 集成测试。
             services.RemoveAll<ISecurityNotificationService>();
             services.AddSingleton<ISecurityNotificationService, NoopSecurityNotificationService>();
+
+            // 审计断言需要直接检查日志事件；附加 provider 与 NLog 并行接收事件。
+            if (_loggerProvider is not null)
+                services.AddSingleton<ILoggerProvider>(_loggerProvider);
 
             if (_extra.TryGetValue("Tests:ThrowAccessTokenStore", out var throwAccessTokenStore)
                 && bool.TryParse(throwAccessTokenStore, out var enabled)
