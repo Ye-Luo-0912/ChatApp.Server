@@ -1,15 +1,16 @@
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
+using ChatApp.Shared.Protocol.Tcp;
 
 namespace ChatApp.Server.Models.Calls;
 
 /// <summary>
 /// 签发 call grant 的 HMAC-SHA256 签名器。
 /// <para>
-/// 签名覆盖排序后的规范载荷 <c>CallId|CallerUserId|CalleeUserId|ExpiresAtMs|Nonce</c>，
+/// 规范载荷由 Shared <see cref="TcpCallGrantSignature"/> 统一定义（单一权威实现）：
+/// Direct 与既有双人格式逐字节一致 <c>CallId|CallerUserId|CalleeUserId|ExpiresAtMs|Nonce</c>；
+/// 群组（GROUP-CALL-1）载荷追加 <c>|G|升序参与者列表</c>，HMAC 因此覆盖全部参与者，
+/// 且群组 grant（CalleeUserId=0）在旧双人校验端天然 fail-closed。
 /// 以 <c>JwtSettings.Secret</c> 为共享密钥，输出标准 Base64。
-/// Realtime 侧 <c>SignedCallGrantVerifier</c> 使用同一canonical 载荷与同一密钥校验。
+/// Gateway 群组中继 / Realtime 校验端使用同一 canonical 载荷与同一密钥。
 /// </para>
 /// </summary>
 public static class CallGrantSigner
@@ -23,18 +24,36 @@ public static class CallGrantSigner
         ArgumentException.ThrowIfNullOrWhiteSpace(secret);
         ArgumentNullException.ThrowIfNull(grant);
 
-        var payload = BuildCanonicalPayload(grant);
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-        var digest = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-        return Convert.ToBase64String(digest);
+        return TcpCallGrantSignature.Sign(secret, ToWireGrant(grant));
     }
 
-    /// <summary>构造与 Realtime 校验端完全一致的规范载荷。</summary>
+    /// <summary>构造与 Gateway/Realtime 校验端完全一致的规范载荷。</summary>
     public static string BuildCanonicalPayload(CallGrantResponse grant)
-        => string.Concat(
-            grant.CallId, Separator,
-            grant.CallerUserId.ToString(CultureInfo.InvariantCulture), Separator,
-            grant.CalleeUserId.ToString(CultureInfo.InvariantCulture), Separator,
-            grant.ExpiresAtMs.ToString(CultureInfo.InvariantCulture), Separator,
-            grant.Nonce);
+        => TcpCallGrantSignature.BuildCanonicalPayload(ToWireGrant(grant));
+
+    /// <summary>Server DTO → wire grant 映射（CallKind/Participants 参与签名）。</summary>
+    internal static TcpCallGrant ToWireGrant(CallGrantResponse grant)
+    {
+        ArgumentNullException.ThrowIfNull(grant);
+
+        return new TcpCallGrant
+        {
+            CallId = grant.CallId,
+            CallerUserId = grant.CallerUserId,
+            CalleeUserId = grant.CalleeUserId,
+            ExpiresAtMs = grant.ExpiresAtMs,
+            Nonce = grant.Nonce,
+            Signature = grant.Signature,
+            CallKind = ParseCallKind(grant.CallKind),
+            Participants = grant.ParticipantUserIds
+        };
+    }
+
+    private static TcpCallKind? ParseCallKind(string? callKind) => callKind switch
+    {
+        null or "" => null,
+        CallGrantContracts.CallKindDirect => TcpCallKind.Direct,
+        CallGrantContracts.CallKindGroup => TcpCallKind.Group,
+        _ => throw new ArgumentException($"未知 callKind：{callKind}", nameof(callKind)),
+    };
 }

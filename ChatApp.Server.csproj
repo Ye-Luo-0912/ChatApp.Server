@@ -33,6 +33,8 @@
 
   <ItemGroup>
     <PackageReference Include="ChatApp.Contracts.Http" />
+    <!-- GROUP-CALL-1：TcpCallGrantSignature（多人 call grant HMAC 规范载荷，Shared 0.5.7）。 -->
+    <PackageReference Include="ChatApp.Protocol.Tcp" />
     <PackageReference Include="AspNetCore.HealthChecks.NpgSql" />
     <PackageReference Include="AspNetCore.HealthChecks.Redis" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
