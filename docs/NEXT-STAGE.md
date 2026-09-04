@@ -43,6 +43,13 @@ Server 是账户、隐私、好友关系、HTTP 附件和安全策略的业务�
 
 完成标准：合法、过期、篡改、重放、拉黑变化、多设备和频率超限均有测试；关闭通话能力不影响聊天和附件。
 
+> 进展（群组 grant，2026-09-04）：**已交付**。`CallGrantRequest` 支持
+> `callKind=group` + `participantUserIds`（≤4 且互为好友；任一不合格整体拒绝并指明成员）；
+> HMAC 签名覆盖全部参与者（`TcpCallGrantSignature` canonical：Direct 载荷与 0.5.6 双人
+> 格式逐字节一致，Group 追加参与者防替换/重排/重放）；`CalleeUserId` 移除模型级 Range
+> （原会以 400 拒绝文档形状的群组 grant）。群组 grant 真机 curl 验证 HTTP 200；
+> CallsController 群组测试 9 项；Server IntegrationTests 288 过/3 跳。
+
 ### P1：`ACCOUNT-OPS-1` 账户与设备完整性
 
 补齐 Push token 设备归属、轮换和撤销，通知偏好/免打扰、设备会话与安全设置，以及附件隔离/回收的最小审计。仅在关系与语音主链路不被阻塞时并行推进。
