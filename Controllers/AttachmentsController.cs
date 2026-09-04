@@ -73,11 +73,17 @@ public sealed class AttachmentsController(
         }
     }
 
+    /// <summary>
+    /// 上传内容。缺省 offset 为整包上传（一次 PUT 全量）；显式携带 offset 走分块续传追加，
+    /// offset 必须等于服务端权威已接收字节数。响应统一 <c>{ received }</c>（已接收字节数），
+    /// 分块路径额外返回 completed 标记定稿完成。
+    /// </summary>
     [HttpPut("upload")]
     [RequestSizeLimit(30 * 1024 * 1024)]
     [RequestTimeout("attachment-upload")]
     public async Task<IActionResult> Upload(
         [FromQuery] string ticket,
+        [FromQuery] long? offset,
         CancellationToken cancellationToken)
     {
         if (!TryGetCurrentUserId(out var userId))
@@ -86,9 +92,46 @@ public sealed class AttachmentsController(
             return BadRequest(new { Message = "ticket 不能为空" });
 
         var contentType = Request.ContentType ?? "application/octet-stream";
-        var result = await attachments.UploadAsync(
-            userId, ticket, Request.Body, contentType, cancellationToken);
-        return result.Succeeded ? Ok(new { Message = "上传成功" }) : BadRequest(result.Errors);
+
+        if (offset is null)
+        {
+            var (result, received) = await attachments.UploadAsync(
+                userId, ticket, Request.Body, contentType, cancellationToken);
+            return result.Succeeded ? Ok(new { received }) : BadRequest(result.Errors);
+        }
+
+        if (offset.Value < 0)
+            return BadRequest(new { Message = "offset 不能为负" });
+
+        var (ok, completed, chunkReceived, attachmentId, error) = await attachments.AppendUploadAsync(
+            userId, ticket, offset.Value, Request.Body, contentType, cancellationToken);
+        if (!ok)
+            // received 为服务端权威值（错位/超限时客户端据此对齐或终止）。
+            return BadRequest(new { received = chunkReceived, Message = error });
+
+        if (completed)
+            AttachmentAuditLog.ChunkUploadCompleted(logger, attachmentId ?? string.Empty, userId, chunkReceived);
+        else
+            AttachmentAuditLog.ChunkAppended(logger, attachmentId ?? string.Empty, userId, offset.Value, chunkReceived);
+
+        return Ok(new { received = chunkReceived, completed });
+    }
+
+    /// <summary>断点续传进度探针：返回上传票对应对象的服务端权威已接收字节数。</summary>
+    [HttpGet("upload/progress")]
+    public async Task<IActionResult> UploadProgress(
+        [FromQuery] string ticket,
+        CancellationToken cancellationToken)
+    {
+        if (!TryGetCurrentUserId(out var userId))
+            return Unauthorized();
+        if (string.IsNullOrWhiteSpace(ticket))
+            return BadRequest(new { Message = "ticket 不能为空" });
+
+        var (ok, received, error) = await attachments.GetUploadProgressAsync(userId, ticket, cancellationToken);
+        return ok
+            ? Ok(new { received })
+            : BadRequest(new { received = 0, Message = error });
     }
 
     /// <summary>

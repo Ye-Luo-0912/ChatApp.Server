@@ -244,6 +244,223 @@ public sealed class LocalAttachmentStorage(
         return (true, string.Empty, info.ObjectKey, info.AttachmentId, written, shaHex, null);
     }
 
+    public async Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Sha256Hex, string? Error)>
+        AppendUploadChunkAsync(
+            long userId, string ticket, long offset, Stream chunk, string contentType,
+            CancellationToken cancellationToken = default)
+    {
+        var ticketKey = AttachmentUploadTicketKeys.Create(ticket);
+
+        // 续传期间票只 peek 不消费：追加失败后票天然保持有效，无需 RestoreTicketAsync 补偿。
+        var info = await cache.GetAsync<AttachmentUploadTicket>(ticketKey, cancellationToken).ConfigureAwait(false);
+        if (info is null)
+            return (false, false, 0, null, null, "上传票无效或已过期");
+        // GetAsync 与 TTL 删除间存在窄窗口：显式校验绝对截止时间，过期即拒并清理 partial。
+        if (info.ExpiresAtUnixMs <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+        {
+            TryDeleteTicketPartial(info);
+            return (false, false, 0, info.AttachmentId, null, "上传票无效或已过期");
+        }
+        if (info.UserId != userId)
+        {
+            TryDeleteTicketPartial(info);
+            return (false, false, 0, info.AttachmentId, null, "上传票与用户不匹配");
+        }
+        if (!IsAllowedContentType(contentType)
+            && !string.Equals(contentType, info.ContentType, StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, false, 0, info.AttachmentId, null, "不支持的附件格式");
+        }
+
+        if (!TryResolveTicketPaths(info, out var fullPath, out var tempPath, out var pathError))
+            return (false, false, 0, info.AttachmentId, null, pathError);
+
+        // 定稿后的幂等重入：对象已在最终路径，避免对已完成上传重复 finalize。
+        if (File.Exists(fullPath))
+        {
+            var done = new FileInfo(fullPath).Length;
+            return offset == done
+                ? (true, true, done, info.AttachmentId, null, null)
+                : (false, false, done, info.AttachmentId, null, "附件对象已存在");
+        }
+
+        // 服务端权威：offset 必须等于当前 partial 长度，错位即拒绝并回传权威值。
+        var received = File.Exists(tempPath) ? new FileInfo(tempPath).Length : 0;
+        if (offset != received)
+            return (false, false, received, info.AttachmentId, null, "续传偏移与服务端不一致");
+
+        var oversized = false;
+        var overDeclared = false;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            await using (var fs = new FileStream(
+                             tempPath,
+                             offset == 0 ? FileMode.Create : FileMode.Open,
+                             FileAccess.Write, FileShare.None,
+                             bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                if (offset > 0)
+                    fs.Seek(offset, SeekOrigin.Begin);
+
+                var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+                try
+                {
+                    while (true)
+                    {
+                        var read = await chunk.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                            .ConfigureAwait(false);
+                        if (read == 0)
+                            break;
+
+                        received += read;
+                        if (received > MaxBytes)
+                        {
+                            oversized = true;
+                            break;
+                        }
+                        if (info.ContentLength > 0 && received > info.ContentLength)
+                        {
+                            overDeclared = true;
+                            break;
+                        }
+
+                        await fs.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    }
+
+                    if (!oversized && !overDeclared)
+                        await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // 传输/写盘中断：partial 与票均保留，客户端按服务端权威 received 续传。
+            logger.LogWarning(
+                ex, "附件分块追加中断 AttachmentId={Id} Received={Received}", info.AttachmentId, received);
+            return (false, false, received, info.AttachmentId, null, "附件写入失败");
+        }
+
+        if (oversized)
+        {
+            // 累计超上限：partial 不可救，删除防驻留；票未消费无需恢复。
+            TryDeleteFile(tempPath);
+            return (false, false, 0, info.AttachmentId, null, "附件大小超限");
+        }
+        if (overDeclared)
+        {
+            // 超过票声明长度：永远无法满足 == 条件定稿，删除 partial 要求客户端重传。
+            TryDeleteFile(tempPath);
+            return (false, false, 0, info.AttachmentId, null, "附件大小与预签不一致");
+        }
+
+        if (info.ContentLength <= 0 || received != info.ContentLength)
+            return (true, false, received, info.AttachmentId, null, null);
+
+        // 定稿：原子消费票，保证并发/重复 finalize 至多一个赢家。
+        var consumed = await atomicCache.TryGetAndDeleteAsync<AttachmentUploadTicket>(ticketKey, cancellationToken)
+            .ConfigureAwait(false);
+        if (consumed is null)
+        {
+            // 票已消失（过期或被并发 finalize）：对象已落盘视为完成，否则清理 partial。
+            if (File.Exists(fullPath))
+                return (true, true, received, info.AttachmentId, null, null);
+            TryDeleteFile(tempPath);
+            return (false, false, received, info.AttachmentId, null, "上传票无效或已过期");
+        }
+        if (consumed.UserId != userId
+            || !string.Equals(consumed.ObjectKey, info.ObjectKey, StringComparison.Ordinal))
+        {
+            await RestoreTicketAsync(ticketKey, consumed, cancellationToken).ConfigureAwait(false);
+            return (false, false, received, info.AttachmentId, null, "上传票与用户不匹配");
+        }
+
+        string? shaHex;
+        try
+        {
+            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                // 对 temp 文件流式计算 SHA-256，分块哈希语义与整包路径一致。
+                await using (var fs = new FileStream(
+                                 tempPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                                 bufferSize: 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    int read;
+                    while ((read = await fs.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                               .ConfigureAwait(false)) > 0)
+                    {
+                        hasher.AppendData(buffer, 0, read);
+                    }
+                }
+
+                shaHex = GetHashHex(hasher) ?? throw new CryptographicException("附件哈希计算失败");
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            // 原子提升：目标已存在则失败（不覆盖），与整包路径一致。
+            if (File.Exists(fullPath))
+            {
+                TryDeleteFile(tempPath);
+                await RestoreTicketAsync(ticketKey, consumed, cancellationToken).ConfigureAwait(false);
+                return (false, false, received, info.AttachmentId, null, "附件对象已存在");
+            }
+
+            File.Move(tempPath, fullPath);
+        }
+        catch (Exception ex)
+        {
+            TryDeleteFile(tempPath);
+            logger.LogWarning(ex, "附件续传定稿失败 AttachmentId={Id}", info.AttachmentId);
+            await RestoreTicketAsync(ticketKey, consumed, cancellationToken).ConfigureAwait(false);
+            return (false, false, received, info.AttachmentId, null, "附件写入失败");
+        }
+
+        // 与整包路径一致：票写回短 TTL 供 confirm 消费（绑定 attachmentId/objectKey）。
+        var confirmExpires = DateTimeOffset.UtcNow.AddMinutes(Math.Clamp(_options.TicketMinutes, 1, 60));
+        await cache.SetAsync(
+                ticketKey,
+                consumed with
+                {
+                    ContentLength = received,
+                    ExpiresAtUnixMs = confirmExpires.ToUnixTimeMilliseconds(),
+                },
+                TimeSpan.FromMinutes(Math.Clamp(_options.TicketMinutes, 1, 60)),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return (true, true, received, info.AttachmentId, shaHex, null);
+    }
+
+    public async Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+        long userId, string ticket, CancellationToken cancellationToken = default)
+    {
+        var info = await cache.GetAsync<AttachmentUploadTicket>(
+                AttachmentUploadTicketKeys.Create(ticket), cancellationToken)
+            .ConfigureAwait(false);
+        if (info is null)
+            return (false, 0, "上传票无效或已过期");
+        if (info.UserId != userId)
+            return (false, 0, "上传票与用户不匹配");
+        if (!TryResolveTicketPaths(info, out var fullPath, out var tempPath, out var error))
+            return (false, 0, error);
+
+        // 只读探针：无副作用；优先报最终对象长度（定稿后探针仍可用）。
+        if (File.Exists(fullPath))
+            return (true, new FileInfo(fullPath).Length, null);
+        if (File.Exists(tempPath))
+            return (true, new FileInfo(tempPath).Length, null);
+        return (true, 0, null);
+    }
+
     private static void TryDeleteFile(string path)
     {
         try
@@ -255,6 +472,34 @@ public sealed class LocalAttachmentStorage(
         {
             /* best effort */
         }
+    }
+
+    /// <summary>解析票的对象最终路径与 <c>.uploading</c> 临时路径；拒绝越界对象键。</summary>
+    private bool TryResolveTicketPaths(
+        AttachmentUploadTicket info,
+        out string fullPath,
+        out string tempPath,
+        out string? error)
+    {
+        var root = EnsureDirectoryBoundary(_options.LocalRootPath);
+        fullPath = Path.GetFullPath(Path.Combine(root, info.ObjectKey.Replace('/', Path.DirectorySeparatorChar)));
+        tempPath = fullPath + ".uploading";
+        if (!IsUnderRoot(root, fullPath))
+        {
+            error = "非法对象键";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
+
+    /// <summary>票失效/过期时清理其 partial，防止无人认领的临时文件驻留磁盘。</summary>
+    private void TryDeleteTicketPartial(AttachmentUploadTicket info)
+    {
+        if (!TryResolveTicketPaths(info, out _, out var tempPath, out _))
+            return;
+        TryDeleteFile(tempPath);
     }
 
     private static string? GetHashHex(IncrementalHash hasher)

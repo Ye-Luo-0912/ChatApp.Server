@@ -215,6 +215,16 @@ public sealed class AttachmentBlobDeleteTests
             long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Sha256Hex, string? Error)>
+            AppendUploadChunkAsync(
+                long userId, string ticket, long offset, Stream chunk, string contentType,
+                CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+            long userId, string ticket, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
         public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
             ConfirmObjectAsync(
                 long userId, string objectKey, string? ticket = null, string? attachmentId = null,

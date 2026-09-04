@@ -48,6 +48,29 @@ public interface IAttachmentStorage
         string contentType,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// 断点续传原语（仅 Local 实现）：向 <c>.uploading</c> 临时对象追加一个分块。
+    /// <paramref name="offset"/> 必须等于服务端已接收字节数，否则返回错误并附服务端权威
+    /// Received 让调用方对齐。续传期间上传票保持有效（peek 不消费），仅当累计长度等于
+    /// 票声明长度时原子定稿（SHA-256 + Move 到最终路径）并消费票。S3 实现返回不支持错误。
+    /// </summary>
+    Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Sha256Hex, string? Error)> AppendUploadChunkAsync(
+        long userId,
+        string ticket,
+        long offset,
+        Stream chunk,
+        string contentType,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 断点续传进度探针：返回服务端权威已接收字节数（无 partial 时为 0）。
+    /// 只读、无副作用。S3 实现返回不支持错误。
+    /// </summary>
+    Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+        long userId,
+        string ticket,
+        CancellationToken cancellationToken = default);
+
     /// <summary>确认暂存对象存在；扫描通过后存储实现可将其提升到不可变最终键。</summary>
     Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
         ConfirmObjectAsync(

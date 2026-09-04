@@ -187,7 +187,7 @@ public sealed class AttachmentService(
         _ => "unexpected",
     };
 
-    public async Task<AuthOperationResult> UploadAsync(
+    public async Task<(AuthOperationResult Result, long ReceivedBytes)> UploadAsync(
         long userId,
         string ticket,
         Stream content,
@@ -197,7 +197,7 @@ public sealed class AttachmentService(
         var (ok, _, _, attachmentId, sizeBytes, sha256Hex, error) = await storage.StoreAsync(
             userId, ticket, content, contentType, cancellationToken).ConfigureAwait(false);
         if (!ok)
-            return AuthOperationResult.Fail("UploadFailed", error ?? "附件上传失败");
+            return (AuthOperationResult.Fail("UploadFailed", error ?? "附件上传失败"), 0);
 
         if (metadata.IsAvailable && !string.IsNullOrWhiteSpace(attachmentId))
         {
@@ -207,8 +207,39 @@ public sealed class AttachmentService(
             AuthSecurityMetrics.AttachmentScan("uploaded_scanning");
         }
 
-        return AuthOperationResult.Success();
+        return (AuthOperationResult.Success(), sizeBytes);
     }
+
+    public async Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Error)> AppendUploadAsync(
+        long userId,
+        string ticket,
+        long offset,
+        Stream chunk,
+        string contentType,
+        CancellationToken cancellationToken = default)
+    {
+        var (ok, completed, received, attachmentId, sha256Hex, error) = await storage.AppendUploadChunkAsync(
+            userId, ticket, offset, chunk, contentType, cancellationToken).ConfigureAwait(false);
+        if (!ok)
+            return (false, false, received, attachmentId, error ?? "附件分块追加失败");
+
+        if (completed && metadata.IsAvailable && !string.IsNullOrWhiteSpace(attachmentId))
+        {
+            // 与整包路径同语义：定稿即收敛配额预留为实际大小并标记 Uploaded/Scanning。
+            await metadata.MarkUploadedScanningAsync(
+                    attachmentId, userId, received, sha256Hex, cancellationToken)
+                .ConfigureAwait(false);
+            AuthSecurityMetrics.AttachmentScan("uploaded_scanning");
+        }
+
+        return (true, completed, received, attachmentId, null);
+    }
+
+    public Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+        long userId,
+        string ticket,
+        CancellationToken cancellationToken = default)
+        => storage.GetUploadProgressAsync(userId, ticket, cancellationToken);
 
     public async Task<(AuthOperationResult Result, ConfirmAttachmentResponse? Body)> ConfirmAsync(
         long userId,

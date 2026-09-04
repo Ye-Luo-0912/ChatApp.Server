@@ -195,6 +195,19 @@ public sealed class S3AttachmentStorage : IAttachmentStorage, IAttachmentUploadH
         => Task.FromResult<(bool, string?, string?, string?, long, string?, string?)>(
             (false, null, null, null, 0, null, "S3 模式请直传预签名 URL，再调用 confirm"));
 
+    // S3 直传模式下上传走预签名 URL，服务端不接收字节流；分块续传属生产后续（multipart UploadPart）。
+    public Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Sha256Hex, string? Error)>
+        AppendUploadChunkAsync(
+            long userId, string ticket, long offset, Stream chunk, string contentType,
+            CancellationToken cancellationToken = default)
+        => Task.FromResult<(bool, bool, long, string?, string?, string?)>(
+            (false, false, 0, null, null, "S3 直传不支持分块续传，请整包 PUT 预签名 URL"));
+
+    public Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+        long userId, string ticket, CancellationToken cancellationToken = default)
+        => Task.FromResult<(bool, long, string?)>(
+            (false, 0, "S3 直传不支持分块续传，请整包 PUT 预签名 URL"));
+
     public async Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
         ConfirmObjectAsync(
             long userId,

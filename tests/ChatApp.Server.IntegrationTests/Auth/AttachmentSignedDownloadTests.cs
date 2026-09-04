@@ -83,6 +83,18 @@ public sealed class AttachmentSignedDownloadTests
             long userId, string ticket, Stream content, string contentType, CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
 
+        public Task<(bool Ok, bool Completed, long Received, string? AttachmentId, string? Sha256Hex, string? Error)>
+            AppendUploadChunkAsync(
+                long userId, string ticket, long offset, Stream chunk, string contentType,
+                CancellationToken cancellationToken = default)
+            => Task.FromResult<(bool, bool, long, string?, string?, string?)>(
+                (false, false, 0, null, null, "S3 直传不支持分块续传，请整包 PUT 预签名 URL"));
+
+        public Task<(bool Ok, long Received, string? Error)> GetUploadProgressAsync(
+            long userId, string ticket, CancellationToken cancellationToken = default)
+            => Task.FromResult<(bool, long, string?)>(
+                (false, 0, "S3 直传不支持分块续传，请整包 PUT 预签名 URL"));
+
         public Task<(bool Ok, string? PublicUrl, string? ObjectKey, string? AttachmentId, string? ContentType, long SizeBytes, string? OriginalName, string? Error)>
             ConfirmObjectAsync(
                 long userId, string objectKey, string? ticket = null, string? attachmentId = null,

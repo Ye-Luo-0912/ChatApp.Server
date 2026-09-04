@@ -51,4 +51,23 @@ internal static partial class AttachmentAuditLog
         ILogger logger,
         string attachmentId,
         long userId);
+
+    /// <summary>断点续传分块追加成功（状态转换，供续传链路对账）。</summary>
+    [LoggerMessage(EventId = 4113, Level = LogLevel.Information,
+        Message = "附件分块已追加 AttachmentId={AttachmentId} UserId={UserId} Offset={Offset} Received={Received}")]
+    public static partial void ChunkAppended(
+        ILogger logger,
+        string attachmentId,
+        long userId,
+        long offset,
+        long received);
+
+    /// <summary>断点续传定稿完成（对象原子提升到最终路径，票转入 confirm 窗口）。</summary>
+    [LoggerMessage(EventId = 4114, Level = LogLevel.Information,
+        Message = "附件分块上传完成 AttachmentId={AttachmentId} UserId={UserId} SizeBytes={SizeBytes}")]
+    public static partial void ChunkUploadCompleted(
+        ILogger logger,
+        string attachmentId,
+        long userId,
+        long sizeBytes);
 }
