@@ -46,7 +46,11 @@ public static class CallGrantErrorCode
 /// </summary>
 public sealed class CallGrantRequest
 {
-    [Range(1, long.MaxValue)]
+    /// <summary>
+    /// 双人通话的被叫。群组通话（callKind="group"）不使用该字段（成员以
+    /// participantUserIds 为准），可为缺省/0——模型级 Range 校验因此不能加在
+    /// 本字段上（会拒绝合法群组形状），双人语义校验在控制器内按 kind 分支执行。
+    /// </summary>
     public long CalleeUserId { get; set; }
 
     /// <summary>通话种类：null/"direct" = 双人（缺省）；"group" = 群组。</summary>

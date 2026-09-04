@@ -80,7 +80,7 @@ public class CallsController(
         }
         else
         {
-            if (request.CalleeUserId <= 0 || request.CalleeUserId == callerUserId)
+            if ((!isGroupCall && request.CalleeUserId <= 0) || request.CalleeUserId == callerUserId)
                 return BadRequest(new { error = CallGrantErrorCode.InvalidTargetUser });
 
             var relationship = await friendshipService.CheckRelationshipAsync(
