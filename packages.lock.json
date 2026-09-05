@@ -28,9 +28,9 @@
       },
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
-        "requested": "[0.5.7, )",
-        "resolved": "0.5.7",
-        "contentHash": "oSYZHNF3m0Jr4UIfuTm0tZMjOPZ5WWkjeFXkil9hFO9/vuZZeWZW9UQnXX3ZVU/u/juVQbLp3cCdd2/5807DFw=="
+        "requested": "[0.5.8, )",
+        "resolved": "0.5.8",
+        "contentHash": "UvlQEWespnuJxaRjKZuuKwBUd/N96zWI4qfLcrapUIrT7EiN61Ki1oST10/apnl1+sw834RlWqeN50d2I5YD6w=="
       },
       "Microsoft.AspNetCore.OpenApi": {
         "type": "Direct",

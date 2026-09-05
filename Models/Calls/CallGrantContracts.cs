@@ -20,6 +20,9 @@ public static class CallGrantContracts
 
     /// <summary>CallKind wire 值：多人通话（Mesh ≤4 人）。</summary>
     public const string CallKindGroup = "group";
+
+    /// <summary>群组重签 callId 的合法字符集（Server 签发端为 Guid "N"，兼容测试/harness 形态）。</summary>
+    public const string ValidCallIdChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_";
 }
 
 /// <summary>签发 call grant 的失败分类。字符串值即 wire 值，生产端原样输出，消费端按表匹配。</summary>
@@ -35,6 +38,9 @@ public static class CallGrantErrorCode
 
     /// <summary>未知 callKind（仅支持 direct / group）。</summary>
     public const string InvalidCallKind = "call_grant_invalid_call_kind";
+
+    /// <summary>群组重签请求携带的 callId 非法（空白形态、超 64 字节或含受限字符集外字符）。</summary>
+    public const string InvalidCallId = "call_grant_invalid_call_id";
 }
 
 /// <summary>
@@ -42,6 +48,11 @@ public static class CallGrantErrorCode
 /// <para>
 /// 群组通话（Mesh 阶段一）：<c>callKind="group"</c> + <c>participantUserIds</c>（被邀请人列表，
 /// 不含主叫，1..MaxGroupCallParticipants-1 人）。旧请求（不带这两个字段）= 双人通话，行为不变。
+/// </para>
+/// <para>
+/// 群组重签（GROUP-CALL-MIDJOIN-1）：可选 <c>callId</c> 存在且格式合法时原样采用（同 CallId
+/// 换发新批次——成员变更不迁移房间）；缺省/空白则新生成。HMAC 覆盖 callId，完整性不受影响；
+/// nonce 每次新发，防重放语义不变。双人通话不读取该字段。
 /// </para>
 /// </summary>
 public sealed class CallGrantRequest
@@ -58,6 +69,12 @@ public sealed class CallGrantRequest
 
     /// <summary>群组被邀请人列表（不含主叫）。仅 callKind="group" 时允许携带。</summary>
     public IReadOnlyList<long>? ParticipantUserIds { get; set; }
+
+    /// <summary>
+    /// 群组重签的通话 Id（可选）。存在且格式合法 → 原样采用（同 CallId 重签，更新参与者名单）；
+    /// 缺省/空白 → 新生成。双人通话忽略该字段（恒为新 CallId）。
+    /// </summary>
+    public string? CallId { get; set; }
 }
 
 /// <summary>Server 签发的短期 call grant。</summary>

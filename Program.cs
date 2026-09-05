@@ -3,6 +3,7 @@ using ChatApp.Server.Extensions;
 using ChatApp.Server.Middlewares;
 using ChatApp.Server.RateLimiting;
 using ChatApp.Server.Services;
+using ChatApp.Server.Models.Calls;
 
 using Core.Settings;
 using Infrastructure.Diagnostics;
@@ -80,6 +81,12 @@ public abstract partial class Program
             registerApiLocalHostedServices: runsApi,
             registerWorkerHostedServices: runsWorkers);
         service.AddFriendshipModule(config);
+        // call grant 签发配置（GROUP-CALL-MIDJOIN-1）：群组 grant 有效期可配（缺省 4 小时），
+        // 双人 grant 恒为 60s（既有语义零改动）。
+        service.AddOptions<CallGrantOptions>()
+            .BindConfiguration(CallGrantOptions.SectionName)
+            .Validate(g => g.GroupGrantLifetimeSeconds > 0, "CallGrant:GroupGrantLifetimeSeconds 必须为正数。")
+            .ValidateOnStart();
         service.AddScoped<
             IRelationshipProjectionSnapshotExportService,
             RelationshipProjectionSnapshotExportService>();

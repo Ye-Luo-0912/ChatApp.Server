@@ -63,12 +63,15 @@ public sealed class CallsControllerGroupGrantTests
         public Task<CursorPage<BlockedUserDto>> GetBlockedUsersAsync(long userId, string? cursor = null, int limit = 50, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
-    private static (CallsController Controller, StubFriendshipService Friendship) CreateController(string secret = Secret)
+    private static (CallsController Controller, StubFriendshipService Friendship) CreateController(
+        string secret = Secret,
+        int groupLifetimeSeconds = CallGrantOptions.DefaultGroupGrantLifetimeSeconds)
     {
         var friendship = new StubFriendshipService();
         var controller = new CallsController(
             friendship,
-            Options.Create(new JwtSettings { Secret = secret }));
+            Options.Create(new JwtSettings { Secret = secret }),
+            Options.Create(new CallGrantOptions { GroupGrantLifetimeSeconds = groupLifetimeSeconds }));
         var user = new ClaimsPrincipal(
             new ClaimsIdentity(
             [
@@ -244,5 +247,138 @@ public sealed class CallsControllerGroupGrantTests
 
         var statusCode = Assert.IsType<ObjectResult>(result);
         Assert.Equal(StatusCodes.Status503ServiceUnavailable, statusCode.StatusCode);
+    }
+
+    // ---- GROUP-CALL-MIDJOIN-1：群组重签（同 CallId 换发新批次）与可配 TTL ----
+
+    [Fact]
+    public async Task GroupGrant_ResignWithExplicitCallId_ReusesCallId_UpdatesParticipants()
+    {
+        var (controller, _) = CreateController();
+        const string existingCallId = "0123456789abcdef0123456789abcdef";
+
+        var request = GroupRequest(2002, 2003, 2004);
+        request.CallId = existingCallId;
+        var result = await controller.CreateGrant(request, CancellationToken.None);
+
+        var grant = ExtractGrant(result);
+        // 同 CallId 重签：原样采用（中期加人不迁移房间）。
+        Assert.Equal(existingCallId, grant.CallId);
+        Assert.Equal([CallerId, 2002, 2003, 2004], grant.ParticipantUserIds);
+        Assert.Equal(CallGrantContracts.CallKindGroup, grant.CallKind);
+
+        // 重签的签名经 Shared 校验器 round-trip（HMAC 覆盖重签后的 callId 与新名单）。
+        var wire = CallGrantSigner.ToWireGrant(grant);
+        Assert.True(TcpCallGrantSignature.TryVerify(wire, Secret, wire.ExpiresAtMs + 1, out var errorCode));
+        Assert.Null(errorCode);
+
+        // canonical 载荷确实覆盖重签 callId（篡改 callId 即签名失效）。
+        Assert.Contains(existingCallId, TcpCallGrantSignature.BuildCanonicalPayload(wire));
+        var tampered = CallGrantSigner.ToWireGrant(grant);
+        tampered.CallId = new string('f', 32);
+        Assert.False(TcpCallGrantSignature.TryVerify(tampered, Secret, wire.ExpiresAtMs, out _));
+    }
+
+    [Fact]
+    public async Task GroupGrant_ResignIssuesNewNonce_AndExpiresLaterThanDirect()
+    {
+        var (controller, _) = CreateController();
+        const string existingCallId = "resign-call-1";
+
+        var first = ExtractGrant(await controller.CreateGrant(
+            GroupRequestWithCallId(existingCallId, 2002), CancellationToken.None));
+        var second = ExtractGrant(await controller.CreateGrant(
+            GroupRequestWithCallId(existingCallId, 2002, 2003), CancellationToken.None));
+
+        // 同 CallId 两次重签：nonce 每次新发（防重放语义不变），名单随重签更新。
+        Assert.Equal(existingCallId, first.CallId);
+        Assert.Equal(existingCallId, second.CallId);
+        Assert.NotEqual(first.Nonce, second.Nonce);
+        Assert.Equal([CallerId, 2002], first.ParticipantUserIds);
+        Assert.Equal([CallerId, 2002, 2003], second.ParticipantUserIds);
+    }
+
+    [Fact]
+    public async Task GroupGrant_DefaultTtlIsFourHours_DirectStaysSixtySeconds()
+    {
+        var (controller, _) = CreateController();
+        var beforeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var group = ExtractGrant(await controller.CreateGrant(GroupRequest(2002), CancellationToken.None));
+        var direct = ExtractGrant(await controller.CreateGrant(
+            new CallGrantRequest { CalleeUserId = 2002 }, CancellationToken.None));
+
+        // 群组：缺省 4 小时；双人：恒为 60s（既有语义零改动）。
+        AssertInLifetime(group.ExpiresAtMs - beforeMs, CallGrantOptions.DefaultGroupGrantLifetimeSeconds);
+        AssertInLifetime(direct.ExpiresAtMs - beforeMs, CallGrantContracts.MaxGrantLifetimeSeconds);
+    }
+
+    [Fact]
+    public async Task GroupGrant_ConfigurableTtl_IsHonored()
+    {
+        var (controller, _) = CreateController(groupLifetimeSeconds: 7200);
+        var beforeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var grant = ExtractGrant(await controller.CreateGrant(GroupRequest(2002), CancellationToken.None));
+
+        AssertInLifetime(grant.ExpiresAtMs - beforeMs, 7200);
+    }
+
+    [Fact]
+    public async Task DirectGrant_IgnoresClientCallId_AlwaysIssuesNewCallId()
+    {
+        var (controller, _) = CreateController();
+
+        var request = new CallGrantRequest { CalleeUserId = 2002, CallId = "should-be-ignored" };
+        var grant = ExtractGrant(await controller.CreateGrant(request, CancellationToken.None));
+
+        // 双人通话不重签：恒为新 CallId、60s 有效期、wire 形态不变（CallKind/名单缺省）。
+        Assert.NotEqual("should-be-ignored", grant.CallId);
+        Assert.Null(grant.CallKind);
+        Assert.Null(grant.ParticipantUserIds);
+        var beforeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        AssertInLifetime(grant.ExpiresAtMs - beforeMs, CallGrantContracts.MaxGrantLifetimeSeconds);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("bad id with spaces")]
+    [InlineData("pipe|injection")]
+    [InlineData("非ASCII字符")]
+    public async Task GroupGrant_MalformedResignCallId_RejectedWithStableCode(string badCallId)
+    {
+        var (controller, _) = CreateController();
+
+        var request = GroupRequest(2002);
+        request.CallId = badCallId;
+        var result = await controller.CreateGrant(request, CancellationToken.None);
+
+        Assert.Equal(CallGrantErrorCode.InvalidCallId, ExtractError(result));
+    }
+
+    [Fact]
+    public async Task GroupGrant_OverlongResignCallId_Rejected()
+    {
+        var (controller, _) = CreateController();
+
+        var request = GroupRequest(2002);
+        request.CallId = new string('a', TcpCallConstants.MaxCallIdBytes + 1);
+        var result = await controller.CreateGrant(request, CancellationToken.None);
+
+        Assert.Equal(CallGrantErrorCode.InvalidCallId, ExtractError(result));
+    }
+
+    private static CallGrantRequest GroupRequestWithCallId(string callId, params long[] invitees)
+    {
+        var request = GroupRequest(invitees);
+        request.CallId = callId;
+        return request;
+    }
+
+    private static void AssertInLifetime(long actualLifetimeMs, int expectedSeconds)
+    {
+        // 容忍时钟推进：预期寿命与实际差值落在 [0, 2s) 窗口内。
+        Assert.InRange(actualLifetimeMs, (expectedSeconds - 2) * 1000L, expectedSeconds * 1000L + 100);
     }
 }

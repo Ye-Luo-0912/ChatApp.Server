@@ -7,7 +7,7 @@
     <!-- ChatApp shared contracts -->
     <PackageVersion Include="ChatApp.Auth.Contracts" Version="0.3.0" />
     <!-- GROUP-CALL-1：群通话 grant 多人化签名（TcpCallGrantSignature，本地 feed packages/）。 -->
-    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.7" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.8" />
     <!-- 0.5.5：ENDPOINT-TLS-1 端点安全契约（EndpointDescriptor/EndpointPolicy + LoginResponse.Server 加性字段）。 -->
     <PackageVersion Include="ChatApp.Contracts.Http" Version="0.5.5" />
     <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.5.2" />

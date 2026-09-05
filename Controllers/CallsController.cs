@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using ChatApp.Server.Models.Calls;
+using ChatApp.Shared.Protocol.Tcp;
 using Core.Interfaces;
 using Core.Models.Friend;
 using Microsoft.AspNetCore.Authorization;
@@ -18,13 +19,20 @@ namespace ChatApp.Server.Controllers;
 /// <c>JwtSettings.Secret</c> 对规范载荷做 HMAC-SHA256 签名——群组签名覆盖全部参与者。
 /// Gateway 群组中继 / Realtime <c>SignedCallGrantVerifier</c> 用同一密钥校验。
 /// </para>
+/// <para>
+/// 群组重签（GROUP-CALL-MIDJOIN-1）：请求可选 <c>callId</c> 存在且格式合法时原样采用
+/// （同 CallId 换发新批次，更新参与者名单——中期加人不再迁移房间）；缺省则新生成。
+/// 双人 grant 有效期恒为 60s；群组 grant 有效期由 <see cref="CallGrantOptions"/> 配置
+/// （缺省 4 小时），使群组会话在整场通话内可持续换发新批次。
+/// </para>
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
 [Authorize]
 public class CallsController(
     IFriendshipService friendshipService,
-    IOptions<CoreSettings> jwtOptions) : ControllerBase
+    IOptions<CoreSettings> jwtOptions,
+    IOptions<CallGrantOptions> grantOptions) : ControllerBase
 {
     /// <summary>
     /// 为当前登录用户签发短期 call grant（双人被叫 = calleeUserId；群组 = callKind="group" +
@@ -95,6 +103,17 @@ public class CallsController(
                 return BadRequest(new { error = CallGrantErrorCode.NotFriends });
         }
 
+        // 群组重签（GROUP-CALL-MIDJOIN-1）：可选 callId 存在且格式合法 → 原样采用
+        // （同 CallId 换发新批次，更新参与者名单）；缺省（null）→ 新生成；显式空白/非法
+        // 形态 fail-closed（存在但格式不合法）。
+        var requestedCallId = request.CallId?.Trim();
+        if (isGroupCall
+            && request.CallId is not null
+            && (requestedCallId is null || !IsValidCallId(requestedCallId)))
+        {
+            return BadRequest(new { error = CallGrantErrorCode.InvalidCallId });
+        }
+
         var secret = jwtOptions.Value.Secret;
         if (string.IsNullOrWhiteSpace(secret))
         {
@@ -104,8 +123,16 @@ public class CallsController(
         }
 
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var callId = Guid.NewGuid().ToString("N");
+        var callId = isGroupCall
+            ? (string.IsNullOrEmpty(requestedCallId) ? Guid.NewGuid().ToString("N") : requestedCallId)
+            : Guid.NewGuid().ToString("N");
         var nonce = Guid.NewGuid().ToString("N");
+
+        // 有效期：双人恒为 60s（既有语义零改动）；群组可配（缺省 4 小时）——无状态中继按
+        // grant 过期时间放行成员信令，整场群组通话可持续换发新批次（End/重连/中途加人）。
+        var lifetimeSeconds = isGroupCall
+            ? grantOptions.Value.GroupGrantLifetimeSeconds
+            : CallGrantContracts.MaxGrantLifetimeSeconds;
 
         // 群组：成员集合 = grant 签发名单（含主叫、升序）；CalleeUserId=0 使群组 grant 在
         // 旧双人校验端 fail-closed，绝不误入 1:1 状态机。
@@ -114,7 +141,7 @@ public class CallsController(
             CallId = callId,
             CallerUserId = callerUserId,
             CalleeUserId = isGroupCall ? 0 : request.CalleeUserId,
-            ExpiresAtMs = nowMs + CallGrantContracts.MaxGrantLifetimeSeconds * 1000L,
+            ExpiresAtMs = nowMs + lifetimeSeconds * 1000L,
             Nonce = nonce,
             CallKind = isGroupCall ? CallGrantContracts.CallKindGroup : null,
             ParticipantUserIds = isGroupCall
@@ -126,6 +153,17 @@ public class CallsController(
 
         return Ok(new { data = grant });
     }
+
+    /// <summary>
+    /// 群组重签 callId 格式校验：非空白、UTF-8 ≤ <see cref="TcpCallConstants.MaxCallIdBytes"/> 字节
+    /// （与 Gateway 命令校验一致）、且仅含受限字符集（<see cref="CallGrantContracts.ValidCallIdChars"/>，
+    /// 不含 canonical 载荷分隔符 <c>|</c>，防签名载荷注入）。
+    /// </summary>
+    private static bool IsValidCallId(string callId)
+        => callId.Length > 0
+           && callId.Length <= TcpCallConstants.MaxCallIdBytes
+           && System.Text.Encoding.UTF8.GetByteCount(callId) <= TcpCallConstants.MaxCallIdBytes
+           && callId.All(CallGrantContracts.ValidCallIdChars.Contains);
 
     private bool TryGetCurrentUserId(out long userId)
     {
